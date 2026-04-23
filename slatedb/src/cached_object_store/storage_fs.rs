@@ -2,7 +2,7 @@ use crate::cached_object_store::stats::CachedObjectStoreStats;
 use crate::rand::DbRand;
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
-use log::{debug, warn};
+use log::{debug, info, warn};
 use object_store::path::Path;
 use object_store::{Attributes, ObjectMeta};
 use rand::{distr::Alphanumeric, Rng};
@@ -45,6 +45,7 @@ impl FileHandleCache {
         &self,
         path: &std::path::Path,
     ) -> Result<Option<Arc<std::fs::File>>, std::io::Error> {
+        info!("Opening file: {}", path.display());
         // Fast path: shared read lock
         {
             let cache = self.handles.read().unwrap();
