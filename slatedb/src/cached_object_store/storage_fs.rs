@@ -2,14 +2,16 @@ use crate::cached_object_store::stats::CachedObjectStoreStats;
 use crate::rand::DbRand;
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
-use log::{debug, info, warn};
+use log::{debug, warn};
+use lru::LruCache;
 use object_store::path::Path;
 use object_store::{Attributes, ObjectMeta};
 use rand::{distr::Alphanumeric, Rng};
 use slatedb_common::clock::SystemClock;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::fmt::Display;
 use std::io::Write;
+use std::num::NonZeroUsize;
 use std::ops::Range;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -20,12 +22,10 @@ use walkdir::WalkDir;
 use crate::cached_object_store::storage::{LocalCacheEntry, LocalCacheHead, LocalCacheStorage};
 use crate::utils::format_bytes_si;
 
-/// A cached file handle node. Wrapped in `Arc` so it can live in both the
-/// lookup map and the LRU deque simultaneously. Callers that obtain an `Arc`
+/// A cached file handle node. Callers that obtain an `Arc<CachedFileHandle>`
 /// keep the underlying fd alive even after the entry is evicted from the cache.
 #[derive(Debug)]
 pub(crate) struct CachedFileHandle {
-    path: std::path::PathBuf,
     file: std::fs::File,
 }
 
@@ -35,33 +35,34 @@ impl CachedFileHandle {
     }
 }
 
-#[derive(Debug)]
-struct FileHandleCacheInner {
-    handles: HashMap<std::path::PathBuf, Arc<CachedFileHandle>>,
-    /// Front is LRU (evict first), back is MRU.
-    lru: VecDeque<Arc<CachedFileHandle>>,
-    max_handles: usize,
-}
-
 /// A cache of open file descriptors, keyed by filesystem path.
 ///
-/// Uses a `Mutex` protecting a HashMap + LRU deque. Individual file reads use
-/// positional I/O (`pread` / `read_exact_at`) which does not touch the file
-/// cursor, so multiple threads can read from the same `Arc<CachedFileHandle>`
-/// concurrently without any per-file locking.
-#[derive(Debug, Clone)]
+/// Uses a `Mutex` protecting an `LruCache` for O(1) lookup, promotion, and
+/// eviction. Individual file reads use positional I/O (`pread` /
+/// `read_exact_at`) which does not touch the file cursor, so multiple threads
+/// can read from the same `Arc<CachedFileHandle>` concurrently without any
+/// per-file locking.
+#[derive(Clone)]
 pub(crate) struct FileHandleCache {
-    inner: Arc<std::sync::Mutex<FileHandleCacheInner>>,
+    inner: Arc<std::sync::Mutex<LruCache<std::path::PathBuf, Arc<CachedFileHandle>>>>,
+}
+
+impl std::fmt::Debug for FileHandleCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let inner = self.inner.lock().unwrap();
+        f.debug_struct("FileHandleCache")
+            .field("len", &inner.len())
+            .field("cap", &inner.cap())
+            .finish()
+    }
 }
 
 impl FileHandleCache {
     fn new(max_handles: usize) -> Self {
         Self {
-            inner: Arc::new(std::sync::Mutex::new(FileHandleCacheInner {
-                handles: HashMap::new(),
-                lru: VecDeque::new(),
-                max_handles,
-            })),
+            inner: Arc::new(std::sync::Mutex::new(LruCache::new(
+                NonZeroUsize::new(max_handles).expect("max_handles must be > 0"),
+            ))),
         }
     }
 
@@ -71,26 +72,18 @@ impl FileHandleCache {
         &self,
         path: &std::path::Path,
     ) -> Result<Option<Arc<CachedFileHandle>>, std::io::Error> {
-        info!("Opening file: {}", path.display());
-
-        // Lock and check the cache.
-        let mut inner = self.inner.lock().unwrap();
-
-        if let Some(handle) = inner.handles.get(path).cloned() {
-            if Self::is_valid(&handle) {
-                // Promote in LRU: find by Arc::ptr_eq, remove, push_back.
-                if let Some(pos) = inner.lru.iter().position(|e| Arc::ptr_eq(e, &handle)) {
-                    let entry = inner.lru.remove(pos).unwrap();
-                    inner.lru.push_back(entry);
+        // Fast path: lock, look up, promote to MRU, clone Arc, unlock.
+        {
+            let mut cache = self.inner.lock().unwrap();
+            if let Some(handle) = cache.get(path) {
+                if Self::is_valid(handle) {
+                    return Ok(Some(handle.clone()));
                 }
-                return Ok(Some(handle));
-            }
-            // Stale entry — remove from both structures.
-            inner.handles.remove(path);
-            if let Some(pos) = inner.lru.iter().position(|e| Arc::ptr_eq(e, &handle)) {
-                inner.lru.remove(pos);
+                // Stale entry — remove it so we reopen below.
+                cache.pop(path);
             }
         }
+        // Lock is dropped — perform file I/O outside the lock.
 
         let file = match std::fs::File::open(path) {
             Ok(f) => f,
@@ -98,40 +91,24 @@ impl FileHandleCache {
             Err(err) => return Err(err),
         };
 
-        let new_handle = Arc::new(CachedFileHandle {
-            path: path.to_path_buf(),
-            file,
-        });
+        let handle = Arc::new(CachedFileHandle { file });
 
-        // Double-check: another thread may have inserted the same path while
-        // we were unlocked.
-        if let Some(existing) = inner.handles.get(path).cloned() {
-            if Self::is_valid(&existing) {
-                // Promote the existing entry.
-                if let Some(pos) = inner.lru.iter().position(|e| Arc::ptr_eq(e, &existing)) {
-                    let entry = inner.lru.remove(pos).unwrap();
-                    inner.lru.push_back(entry);
-                }
-                return Ok(Some(existing));
+        // Re-lock to insert. `push` handles eviction automatically when at
+        // capacity and also promotes if the key already exists (race with
+        // another thread).
+        let mut cache = self.inner.lock().unwrap();
+
+        // Another thread may have inserted while we were unlocked — use
+        // whatever is in the cache if it's valid.
+        if let Some(existing) = cache.get(path) {
+            if Self::is_valid(existing) {
+                return Ok(Some(existing.clone()));
             }
-            // Stale — remove before reinserting.
-            inner.handles.remove(path);
-            if let Some(pos) = inner.lru.iter().position(|e| Arc::ptr_eq(e, &existing)) {
-                inner.lru.remove(pos);
-            }
+            cache.pop(path);
         }
 
-        // Evict LRU entry if at capacity.
-        if inner.lru.len() >= inner.max_handles {
-            if let Some(evicted) = inner.lru.pop_front() {
-                inner.handles.remove(&evicted.path);
-            }
-        }
-
-        inner.handles.insert(path.to_path_buf(), new_handle.clone());
-        inner.lru.push_back(new_handle.clone());
-
-        Ok(Some(new_handle))
+        cache.push(path.to_path_buf(), handle.clone());
+        Ok(Some(handle))
     }
 
     /// Check whether a cached file descriptor still refers to a live file.
@@ -154,12 +131,8 @@ impl FileHandleCache {
     /// Remove a cached handle, e.g. after eviction or after a write replaces
     /// the file (since the cached fd would still reference the old inode).
     fn invalidate(&self, path: &std::path::Path) {
-        let mut inner = self.inner.lock().unwrap();
-        if let Some(removed) = inner.handles.remove(path) {
-            if let Some(pos) = inner.lru.iter().position(|e| Arc::ptr_eq(e, &removed)) {
-                inner.lru.remove(pos);
-            }
-        }
+        let mut cache = self.inner.lock().unwrap();
+        cache.pop(path);
     }
 }
 
