@@ -7,12 +7,12 @@ use object_store::path::Path;
 use object_store::{Attributes, ObjectMeta};
 use rand::{distr::Alphanumeric, Rng};
 use slatedb_common::clock::SystemClock;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt::Display;
 use std::io::Write;
 use std::ops::Range;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Mutex, OnceCell};
 use walkdir::WalkDir;
@@ -20,22 +20,48 @@ use walkdir::WalkDir;
 use crate::cached_object_store::storage::{LocalCacheEntry, LocalCacheHead, LocalCacheStorage};
 use crate::utils::format_bytes_si;
 
+/// A cached file handle node. Wrapped in `Arc` so it can live in both the
+/// lookup map and the LRU deque simultaneously. Callers that obtain an `Arc`
+/// keep the underlying fd alive even after the entry is evicted from the cache.
+#[derive(Debug)]
+pub(crate) struct CachedFileHandle {
+    path: std::path::PathBuf,
+    file: std::fs::File,
+}
+
+impl CachedFileHandle {
+    pub(crate) fn file(&self) -> &std::fs::File {
+        &self.file
+    }
+}
+
+#[derive(Debug)]
+struct FileHandleCacheInner {
+    handles: HashMap<std::path::PathBuf, Arc<CachedFileHandle>>,
+    /// Front is LRU (evict first), back is MRU.
+    lru: VecDeque<Arc<CachedFileHandle>>,
+    max_handles: usize,
+}
+
 /// A cache of open file descriptors, keyed by filesystem path.
 ///
-/// Uses a `RwLock` so reads (cache hits) only need a shared lock. Only cache
-/// misses acquire an exclusive lock to insert a new handle. Individual file
-/// reads use positional I/O (`pread` / `read_exact_at`) which does not touch
-/// the file cursor, so multiple threads can read from the same `Arc<File>`
+/// Uses a `Mutex` protecting a HashMap + LRU deque. Individual file reads use
+/// positional I/O (`pread` / `read_exact_at`) which does not touch the file
+/// cursor, so multiple threads can read from the same `Arc<CachedFileHandle>`
 /// concurrently without any per-file locking.
 #[derive(Debug, Clone)]
 pub(crate) struct FileHandleCache {
-    handles: Arc<RwLock<HashMap<std::path::PathBuf, Arc<std::fs::File>>>>,
+    inner: Arc<std::sync::Mutex<FileHandleCacheInner>>,
 }
 
 impl FileHandleCache {
-    fn new() -> Self {
+    fn new(max_handles: usize) -> Self {
         Self {
-            handles: Arc::new(RwLock::new(HashMap::new())),
+            inner: Arc::new(std::sync::Mutex::new(FileHandleCacheInner {
+                handles: HashMap::new(),
+                lru: VecDeque::new(),
+                max_handles,
+            })),
         }
     }
 
@@ -44,40 +70,68 @@ impl FileHandleCache {
     fn get_or_open(
         &self,
         path: &std::path::Path,
-    ) -> Result<Option<Arc<std::fs::File>>, std::io::Error> {
+    ) -> Result<Option<Arc<CachedFileHandle>>, std::io::Error> {
         info!("Opening file: {}", path.display());
-        // Fast path: shared read lock
-        {
-            let cache = self.handles.read().unwrap();
-            if let Some(file) = cache.get(path) {
-                if Self::is_valid(file) {
-                    return Ok(Some(file.clone()));
+
+        // Lock and check the cache.
+        let mut inner = self.inner.lock().unwrap();
+
+        if let Some(handle) = inner.handles.get(path).cloned() {
+            if Self::is_valid(&handle) {
+                // Promote in LRU: find by Arc::ptr_eq, remove, push_back.
+                if let Some(pos) = inner.lru.iter().position(|e| Arc::ptr_eq(e, &handle)) {
+                    let entry = inner.lru.remove(pos).unwrap();
+                    inner.lru.push_back(entry);
                 }
-                // Stale entry (e.g. file was deleted or replaced) — fall
-                // through to reopen under a write lock.
+                return Ok(Some(handle));
             }
-        }
-
-        // Slow path: acquire an exclusive write lock.
-        let mut cache = self.handles.write().unwrap();
-
-        // Double-check: another thread may have refreshed the entry.
-        if let Some(file) = cache.get(path) {
-            if Self::is_valid(file) {
-                return Ok(Some(file.clone()));
+            // Stale entry — remove from both structures.
+            inner.handles.remove(path);
+            if let Some(pos) = inner.lru.iter().position(|e| Arc::ptr_eq(e, &handle)) {
+                inner.lru.remove(pos);
             }
-            // Still stale — remove it before we try to reopen.
-            cache.remove(path);
         }
 
         let file = match std::fs::File::open(path) {
-            Ok(f) => Arc::new(f),
+            Ok(f) => f,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(err) => return Err(err),
         };
 
-        cache.insert(path.to_path_buf(), file.clone());
-        Ok(Some(file))
+        let new_handle = Arc::new(CachedFileHandle {
+            path: path.to_path_buf(),
+            file,
+        });
+
+        // Double-check: another thread may have inserted the same path while
+        // we were unlocked.
+        if let Some(existing) = inner.handles.get(path).cloned() {
+            if Self::is_valid(&existing) {
+                // Promote the existing entry.
+                if let Some(pos) = inner.lru.iter().position(|e| Arc::ptr_eq(e, &existing)) {
+                    let entry = inner.lru.remove(pos).unwrap();
+                    inner.lru.push_back(entry);
+                }
+                return Ok(Some(existing));
+            }
+            // Stale — remove before reinserting.
+            inner.handles.remove(path);
+            if let Some(pos) = inner.lru.iter().position(|e| Arc::ptr_eq(e, &existing)) {
+                inner.lru.remove(pos);
+            }
+        }
+
+        // Evict LRU entry if at capacity.
+        if inner.lru.len() >= inner.max_handles {
+            if let Some(evicted) = inner.lru.pop_front() {
+                inner.handles.remove(&evicted.path);
+            }
+        }
+
+        inner.handles.insert(path.to_path_buf(), new_handle.clone());
+        inner.lru.push_back(new_handle.clone());
+
+        Ok(Some(new_handle))
     }
 
     /// Check whether a cached file descriptor still refers to a live file.
@@ -87,21 +141,25 @@ impl FileHandleCache {
     /// much cheaper than a full `open` and lets us detect deleted or replaced
     /// files without a TOCTOU-prone path `stat`.
     #[cfg(unix)]
-    fn is_valid(file: &std::fs::File) -> bool {
+    fn is_valid(handle: &CachedFileHandle) -> bool {
         use std::os::unix::fs::MetadataExt;
-        file.metadata().map_or(false, |m| m.nlink() > 0)
+        handle.file().metadata().map_or(false, |m| m.nlink() > 0)
     }
 
     #[cfg(not(unix))]
-    fn is_valid(_file: &std::fs::File) -> bool {
+    fn is_valid(_handle: &CachedFileHandle) -> bool {
         true
     }
 
     /// Remove a cached handle, e.g. after eviction or after a write replaces
     /// the file (since the cached fd would still reference the old inode).
     fn invalidate(&self, path: &std::path::Path) {
-        let mut cache = self.handles.write().unwrap();
-        cache.remove(path);
+        let mut inner = self.inner.lock().unwrap();
+        if let Some(removed) = inner.handles.remove(path) {
+            if let Some(pos) = inner.lru.iter().position(|e| Arc::ptr_eq(e, &removed)) {
+                inner.lru.remove(pos);
+            }
+        }
     }
 }
 
@@ -147,8 +205,9 @@ impl FsCacheStorage {
         stats: Arc<CachedObjectStoreStats>,
         system_clock: Arc<dyn SystemClock>,
         rand: Arc<DbRand>,
+        max_open_file_handles: usize,
     ) -> Self {
-        let file_handle_cache = FileHandleCache::new();
+        let file_handle_cache = FileHandleCache::new(max_open_file_handles);
         let evictor = max_cache_size_bytes.map(|max_cache_size_bytes| {
             Arc::new(FsCacheEvictor::new(
                 root_folder.clone(),
@@ -341,7 +400,7 @@ impl LocalCacheEntry for FsCacheEntry {
             // Use positional I/O (pread) — no seek required, and safe for
             // concurrent readers sharing the same Arc<File>.
             let mut buffer = vec![0; range_in_part.len()];
-            read_exact_at_offset(&file, &mut buffer, range_in_part.start as u64)
+            read_exact_at_offset(file.file(), &mut buffer, range_in_part.start as u64)
                 .map_err(wrap_io_err)?;
             Ok(Some(Bytes::from(buffer)))
         })
@@ -456,12 +515,12 @@ impl LocalCacheEntry for FsCacheEntry {
                 Err(err) => return Err(wrap_io_err(err)),
             };
 
-            let metadata = file.metadata().map_err(wrap_io_err)?;
+            let metadata = file.file().metadata().map_err(wrap_io_err)?;
             let head_size_bytes = metadata.len() as usize;
 
             // Use positional read from offset 0 to read the entire file.
             let mut buffer = vec![0u8; head_size_bytes];
-            read_exact_at_offset(&file, &mut buffer, 0).map_err(wrap_io_err)?;
+            read_exact_at_offset(file.file(), &mut buffer, 0).map_err(wrap_io_err)?;
 
             let content = String::from_utf8(buffer).map_err(|e| {
                 wrap_io_err(std::io::Error::new(std::io::ErrorKind::InvalidData, e))
@@ -1043,7 +1102,7 @@ mod tests {
             1024 * 2,
             Arc::new(CachedObjectStoreStats::new(&recorder)),
             Arc::new(DbRand::default()),
-            FileHandleCache::new(),
+            FileHandleCache::new(1000),
         );
 
         let path0 = gen_rand_file(temp_dir.path(), "file0", 1024);
@@ -1086,7 +1145,7 @@ mod tests {
             Arc::new(CachedObjectStoreStats::new(&recorder)),
             Arc::new(DefaultSystemClock::new()),
             Arc::new(DbRand::default()),
-            FileHandleCache::new(),
+            FileHandleCache::new(1000),
         );
 
         // Simulate started state without a running receiver so the channel can fill.
@@ -1117,7 +1176,7 @@ mod tests {
             1024 * 2,
             Arc::new(CachedObjectStoreStats::new(&recorder)),
             Arc::new(DbRand::default()),
-            FileHandleCache::new(),
+            FileHandleCache::new(1000),
         ));
 
         let path0 = gen_rand_file(temp_dir.path(), "file0", 1024);
@@ -1149,7 +1208,7 @@ mod tests {
             1024 * 2,
             Arc::new(CachedObjectStoreStats::new(&recorder)),
             Arc::new(DbRand::default()),
-            FileHandleCache::new(),
+            FileHandleCache::new(1000),
         ));
 
         gen_rand_file(temp_dir.path(), "file0", 1024);
@@ -1200,7 +1259,7 @@ mod tests {
             1024,
             Arc::new(CachedObjectStoreStats::new(&recorder)),
             Arc::new(DbRand::default()),
-            FileHandleCache::new(),
+            FileHandleCache::new(1000),
         );
 
         let keys: Vec<std::path::PathBuf> = key_indices
@@ -1248,7 +1307,7 @@ mod tests {
             1024 * 2,
             Arc::new(CachedObjectStoreStats::new(&helper)),
             Arc::new(DbRand::default()),
-            FileHandleCache::new(),
+            FileHandleCache::new(1000),
         );
 
         // when: add two entries (within capacity)
