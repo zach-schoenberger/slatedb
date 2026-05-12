@@ -214,12 +214,11 @@ impl<P: Into<Path>> DbBuilder<P> {
         }
     }
 
-    /// Set the segment extractor (RFC-0024). Internal-only for now —
-    /// public API surface lands once the read/write paths are wired up.
-    // TODO(rfc-24): remove allow(dead_code) and lift to public API once
-    // the full segment write/read path is integrated.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) fn with_segment_extractor(
+    /// Set the segment extractor (RFC-0024). When configured, every
+    /// write is routed through the extractor and the database tracks
+    /// per-segment LSM state. The extractor must be configured at
+    /// database creation time and cannot be changed thereafter.
+    pub fn with_segment_extractor(
         mut self,
         extractor: Arc<dyn crate::prefix_extractor::PrefixExtractor>,
     ) -> Self {
@@ -500,11 +499,21 @@ impl<P: Into<Path>> DbBuilder<P> {
         let latest_manifest =
             StoredManifest::try_load(manifest_store.clone(), system_clock.clone()).await?;
 
-        // Validate WAL object store configuration
         if let Some(latest_manifest) = &latest_manifest {
-            if latest_manifest.db_state().wal_object_store_uri != wal_object_store_uri {
-                return Err(SlateDBError::WalStoreReconfigurationError.into());
-            }
+            latest_manifest
+                .db_state()
+                .validate_wal_object_store_uri(wal_object_store_uri.as_deref())?;
+        }
+
+        // RFC-0024: when the database already exists, the configured
+        // extractor must match what is persisted in the manifest, and
+        // the persisted segment prefixes must still be claimed by the
+        // current extractor. For a fresh database the extractor name
+        // (if any) is stamped onto the new manifest below.
+        if let Some(latest_manifest) = &latest_manifest {
+            latest_manifest
+                .db_state()
+                .validate_extractor_configuration(self.segment_extractor.as_deref())?;
         }
 
         // Extract external SSTs from manifest if available
@@ -543,7 +552,15 @@ impl<P: Into<Path>> DbBuilder<P> {
         let stored_manifest = match latest_manifest {
             Some(manifest) => manifest,
             None => {
-                let state = ManifestCore::new_with_wal_object_store(wal_object_store_uri);
+                let mut state = ManifestCore::new_with_wal_object_store(wal_object_store_uri);
+                // RFC-0024 lazy V2 bump: when the user configures an
+                // extractor at creation time, persist its name on the
+                // initial manifest so reopens can detect any later
+                // reconfiguration. Databases without an extractor keep
+                // writing V1 manifests.
+                if let Some(extractor) = &self.segment_extractor {
+                    state.segment_extractor_name = Some(extractor.name().to_string());
+                }
                 StoredManifest::create_new_db(manifest_store.clone(), state, system_clock.clone())
                     .await?
             }
@@ -1416,14 +1433,13 @@ impl<P: Into<Path>> DbReaderBuilder<P> {
             None => retrying_object_store,
         };
 
-        // Validate WAL object store configuration.
         let manifest_store = Arc::new(ManifestStore::new(&path, object_store.clone()));
         let latest_manifest =
             StoredManifest::try_load(manifest_store, self.system_clock.clone()).await?;
         if let Some(latest_manifest) = &latest_manifest {
-            if latest_manifest.db_state().wal_object_store_uri != wal_object_store_uri {
-                return Err(SlateDBError::WalStoreReconfigurationError.into());
-            }
+            latest_manifest
+                .db_state()
+                .validate_wal_object_store_uri(wal_object_store_uri.as_deref())?;
         }
 
         let store_provider = DefaultStoreProvider {
