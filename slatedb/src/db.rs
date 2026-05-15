@@ -23,7 +23,7 @@
 pub use crate::db_status::DbStatus;
 
 use crate::db_cache_manager::{self, CacheTarget};
-use crate::write_buffer_manager::WriteBufferManager;
+use crate::write_buffer_manager::{WriteBufferManager, WriteBufferPermit};
 use std::ops::RangeBounds;
 use std::sync::Arc;
 
@@ -357,15 +357,10 @@ impl DbInner {
             options: options.clone(),
             done: tx,
         };
+        let write_buffer_size = batch_msg.batch.estimated_size();
 
-        self.maybe_apply_backpressure().await?;
-        // Reserve write-buffer budget for this batch. Backpressure above
-        // ensures the budget is not fully exhausted, but this call may
-        // still block briefly if concurrent writers are contending.
-        batch_msg
-            .batch
-            .reserve_write_buffer(&self.write_buffer_manager)
-            .await;
+        let write_buffer = self.maybe_apply_backpressure(write_buffer_size).await?;
+        batch_msg.batch.set_write_buffer(write_buffer);
         self.write_notifier.send(batch_msg)?;
 
         // TODO: this can be modified as awaiting the last_durable_seq watermark & fatal error.
@@ -380,7 +375,10 @@ impl DbInner {
     }
 
     #[inline]
-    pub(crate) async fn maybe_apply_backpressure(&self) -> Result<(), SlateDBError> {
+    pub(crate) async fn maybe_apply_backpressure(
+        &self,
+        write_buffer_size: usize,
+    ) -> Result<Arc<WriteBufferPermit>, SlateDBError> {
         loop {
             self.check_closed()?;
 
@@ -441,15 +439,7 @@ impl DbInner {
                 let watcher_for_oldest_unflushed_wal =
                     self.wal_buffer.watcher_for_oldest_unflushed_wal();
 
-                // There is a window of time after mem_size_bytes is larger than max_unflushed_bytes
-                // but before we get the memtable and wal table. During that time, if the memtable and/or
-                // wal table are fully flushed out, we should short circuit since the select! will always
-                // time out.
-                if maybe_oldest_unflushed_memtable.is_none()
-                    && watcher_for_oldest_unflushed_wal.is_none()
-                {
-                    continue;
-                }
+                let await_write_buffer = self.write_buffer_manager.acquire(write_buffer_size);
 
                 let await_memtable_uploaded = async {
                     if let Some(oldest_unflushed_memtable) = maybe_oldest_unflushed_memtable {
@@ -479,16 +469,19 @@ impl DbInner {
                 tokio::select! {
                     result = await_memtable_uploaded => result?,
                     result = await_flush_wal => result?,
+                    permit = await_write_buffer => {
+                        return Ok(Arc::new(permit));
+                    }
                     result = await_closed => result?,
                     _ = timeout_fut => {
                         warn!("backpressure timeout: waited 30s, no memtable/WAL flushed yet");
                     }
                 };
             } else {
-                break;
+                let permit = self.write_buffer_manager.acquire(write_buffer_size).await;
+                return Ok(Arc::new(permit));
             }
         }
-        Ok(())
     }
 
     pub(crate) async fn flush_wals(&self) -> Result<u64, SlateDBError> {
@@ -610,20 +603,14 @@ impl DbInner {
             // last seq in the memtable to fail. By updating `last_remote_persisted_seq` here, we
             // ensure the assertion holds true.
 
-            // Account for the replayed memtable's memory in the write-buffer
-            // budget. We use force_acquire (non-blocking) because the replay
-            // loop must make forward progress before maybe_apply_backpressure
-            // can wait for flushes to drain the budget. The permit is released
-            // when the memtable is flushed to L0.
             let metadata = replayed_table.table.metadata();
-            let permit = self
-                .write_buffer_manager
-                .force_acquire(metadata.entries_size_in_bytes);
-            replayed_table.table.add_write_permit(Arc::new(permit));
 
             assert!(self.oracle.last_remote_persisted_seq() <= replayed_table.last_seq);
             self.oracle.advance_durable_seq(replayed_table.last_seq);
-            self.maybe_apply_backpressure().await?;
+            let permit = self
+                .maybe_apply_backpressure(metadata.entries_size_in_bytes)
+                .await?;
+            replayed_table.table.add_write_permit(permit);
             self.replay_memtable(replayed_table)?;
         }
 
@@ -5065,7 +5052,7 @@ mod tests {
         // the same wait path used by writers before they enqueue a batch.
         let inner = db.inner.clone();
         let mut backpressure_task =
-            tokio::spawn(async move { inner.maybe_apply_backpressure().await });
+            tokio::spawn(async move { inner.maybe_apply_backpressure(1).await });
 
         // Wait until the task has observed the buffered WAL bytes and incremented
         // the backpressure counter, proving it is inside the wait path.

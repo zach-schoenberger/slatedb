@@ -12,7 +12,6 @@ use crate::merge_operator::{MergeOperatorIterator, MergeOperatorType};
 use crate::prefix_extractor::{PrefixExtractor, PrefixTarget};
 use crate::types::{RowEntry, ValueDeletable};
 use crate::write_buffer_manager::WriteBufferPermit;
-use crate::WriteBufferManager;
 use async_trait::async_trait;
 use bytes::Bytes;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
@@ -401,18 +400,8 @@ impl WriteBatch {
         Ok((entries, touched_segments))
     }
 
-    /// Acquires a write-buffer budget permit sized to the estimated
-    /// in-memory footprint of this batch. If a permit was already
-    /// acquired for this batch, this is a no-op.
-    pub(crate) async fn reserve_write_buffer(&mut self, write_buffer_manager: &WriteBufferManager) {
-        match self.write_buffer_permit {
-            // buffer permit already allocated for this batch
-            Some(_) => {}
-            None => {
-                let permit = write_buffer_manager.acquire(self.estimated_size()).await;
-                self.write_buffer_permit = Some(Arc::new(permit));
-            }
-        }
+    pub(crate) fn set_write_buffer(&mut self, permit: Arc<WriteBufferPermit>) {
+        self.write_buffer_permit = Some(permit);
     }
 
     /// Returns a conservative estimate of the in-memory byte footprint
