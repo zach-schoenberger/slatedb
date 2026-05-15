@@ -58,26 +58,11 @@ impl LsmTreeState {
         Self::merge_writer_and_compactor(self, compactor)
     }
 
-    /// True iff this tree is a "drain marker": no L0, no compacted runs, but
-    /// the watermark is set. Drain markers are produced when the compactor
-    /// drains a segment (advances `last_compacted_l0_*` to cover all observed
-    /// L0s and clears `compacted`). They persist on the compactor's side and
-    /// propagate to the writer; the writer's side prunes them at merge time
-    /// once it has observed the marker and has no new data to add.
-    pub(crate) fn is_drained(&self) -> bool {
-        self.l0.is_empty()
-            && self.compacted.is_empty()
-            && (self.last_compacted_l0_sst_view_id.is_some()
-                || self.last_compacted_l0_sst_id.is_some())
-    }
-
-    /// True iff this tree carries no state at all — no L0, no compacted runs,
-    /// and no watermark. Truly-empty trees should not appear in the manifest.
+    /// True iff this tree has no L0 SSTs and no compacted runs. The watermark
+    /// (`last_compacted_l0_sst_view_id`) may or may not be set; an empty tree
+    /// with a set watermark is a drain marker.
     pub(crate) fn is_empty(&self) -> bool {
-        self.l0.is_empty()
-            && self.compacted.is_empty()
-            && self.last_compacted_l0_sst_view_id.is_none()
-            && self.last_compacted_l0_sst_id.is_none()
+        self.l0.is_empty() && self.compacted.is_empty()
     }
 
     /// Total number of SST views referenced by this tree — L0 plus every
@@ -143,12 +128,39 @@ impl LsmTreeState {
 /// LSM tree. Segments share the manifest-level WAL state and SST identity
 /// counter with the unsegmented tree.
 #[derive(Clone, PartialEq, Serialize, Debug)]
-pub(crate) struct Segment {
+pub struct Segment {
     /// The segment's key prefix.
-    pub prefix: Bytes,
+    pub(crate) prefix: Bytes,
 
     /// LSM state for this segment.
-    pub tree: LsmTreeState,
+    pub(crate) tree: LsmTreeState,
+}
+
+impl Segment {
+    /// The segment's key prefix.
+    pub fn prefix(&self) -> &Bytes {
+        &self.prefix
+    }
+
+    /// The L0 SST views in this segment.
+    pub fn l0(&self) -> &VecDeque<SsTableView> {
+        &self.tree.l0
+    }
+
+    /// The compacted sorted runs in this segment.
+    pub fn compacted(&self) -> &Vec<SortedRun> {
+        &self.tree.compacted
+    }
+
+    /// The last compacted L0 SST view ID, if any.
+    pub fn last_compacted_l0_sst_view_id(&self) -> Option<ulid::Ulid> {
+        self.tree.last_compacted_l0_sst_view_id
+    }
+
+    /// The last compacted L0 SST ID, if any.
+    pub fn last_compacted_l0_sst_id(&self) -> Option<ulid::Ulid> {
+        self.tree.last_compacted_l0_sst_id
+    }
 }
 
 /// Compactor-side segment merge: combine the writer's segments (`writer`)
@@ -177,17 +189,16 @@ pub(crate) fn merge_segments_from_writer(local: &[Segment], writer: &[Segment]) 
             MergeStep::WriterOnly(w) => {
                 // Compactor hasn't seen this prefix yet (newly-flushed).
                 let tree = LsmTreeState::merge_writer_and_compactor(&w.tree, &empty);
-                if !tree.is_empty() {
-                    merged.push(Segment {
-                        prefix: w.prefix.clone(),
-                        tree,
-                    });
-                }
+                merged.push(Segment {
+                    prefix: w.prefix.clone(),
+                    tree,
+                });
             }
             MergeStep::CompactorOnly(c) => {
-                // Expected: writer has pruned a drain marker — drop to
-                // follow. Anything else is a protocol violation.
-                if !c.tree.is_drained() {
+                // Expected: writer has pruned this prefix — drop to follow.
+                // Any tree with data here is a protocol violation: the
+                // compactor never produces data the writer hasn't seen.
+                if !c.tree.is_empty() {
                     unreachable!(
                         "compactor-only segment with data: prefix={:?} tree={:?}",
                         c.prefix, c.tree
@@ -195,15 +206,14 @@ pub(crate) fn merge_segments_from_writer(local: &[Segment], writer: &[Segment]) 
                 }
             }
             MergeStep::Both(w, c) => {
-                // Kernel merge. The compactor keeps markers in this
-                // branch — only the writer prunes.
+                // Kernel merge. The compactor never prunes — any empty
+                // result (drain marker or otherwise) flows through and is
+                // pruned by the writer.
                 let tree = LsmTreeState::merge_writer_and_compactor(&w.tree, &c.tree);
-                if !tree.is_empty() {
-                    merged.push(Segment {
-                        prefix: w.prefix.clone(),
-                        tree,
-                    });
-                }
+                merged.push(Segment {
+                    prefix: w.prefix.clone(),
+                    tree,
+                });
             }
         }
     }
@@ -246,9 +256,10 @@ pub(crate) fn merge_segments_from_compactor(
                 LsmTreeState::merge_writer_and_compactor(&w.tree, &c.tree),
             ),
         };
-        // Writer prune: drop drain markers (and truly-empty results, which
-        // arise after the compactor has already pruned).
-        if !tree.is_drained() && !tree.is_empty() {
+        // Writer is the sole pruner: drop any tree with no L0 and no SR.
+        // The watermark signal, if any, has already been applied by the
+        // `merge_writer_and_compactor` call above.
+        if !tree.is_empty() {
             merged.push(Segment { prefix, tree });
         }
     }
@@ -813,8 +824,37 @@ impl VersionedManifest {
         self.manifest.core.wal_object_store_uri.as_deref()
     }
 
+    /// Returns the persisted segment extractor name (RFC-0024), if any.
+    /// `None` means the database was created without a segment extractor.
+    pub fn segment_extractor_name(&self) -> Option<&str> {
+        self.manifest.core.segment_extractor_name.as_deref()
+    }
+
     pub(crate) fn core(&self) -> &ManifestCore {
         &self.manifest.core
+    }
+
+    /// The named segments configured in this manifest (RFC-0024), in prefix
+    /// order. Empty when no segment extractor is configured. The unsegmented
+    /// default tree is accessed via [`Self::l0`] / [`Self::compacted`] /
+    /// [`Self::last_compacted_l0_sst_view_id`] / [`Self::last_compacted_l0_sst_id`];
+    /// when segments are configured the default tree is empty by construction
+    /// (writes route only to segments, and the extractor cannot return an
+    /// empty prefix).
+    pub fn segments(&self) -> &[Segment] {
+        &self.manifest.core.segments
+    }
+
+    /// Look up a single named segment by exact prefix match. Returns `None`
+    /// if no segment with that prefix exists.
+    pub fn segment(&self, prefix: &[u8]) -> Option<&Segment> {
+        let idx = self
+            .manifest
+            .core
+            .segments
+            .binary_search_by(|s| s.prefix.as_ref().cmp(prefix))
+            .ok()?;
+        Some(&self.manifest.core.segments[idx])
     }
 }
 
@@ -1041,11 +1081,11 @@ impl Manifest {
 
     /// Extractor-configured case. Build a per-prefix accumulator from
     /// every source's `core.segments`, validate the antichain, and write
-    /// the result into `core.segments`. Drain-marker (empty) entries
-    /// produced by the loop are dropped to preserve
-    /// `LsmTreeState::is_empty`'s invariant. Watermarks are intentionally
-    /// not carried over: the unioned manifest is a fresh DB that begins
-    /// compaction tracking from scratch.
+    /// the result into `core.segments`. Empty entries (no L0, no compacted
+    /// runs) are dropped — the unioned manifest should not carry
+    /// placeholders. Watermarks are intentionally not carried over: the
+    /// unioned manifest is a fresh DB that begins compaction tracking from
+    /// scratch.
     fn build_segmented_lsm_state(
         core: &mut ManifestCore,
         sources: &[&CloneSource],
@@ -3501,8 +3541,7 @@ mod tests {
         // A source whose `core.segments` mixes a data-bearing segment
         // with a drain-marker segment (no L0, no compacted, watermark
         // set). The drain marker carries no meaning in the resulting
-        // clone and must not produce an empty entry in `core.segments`
-        // (which would violate `LsmTreeState::is_empty`'s invariant).
+        // clone and must not produce an empty entry in `core.segments`.
         let (mut m1, _, _) = manifest_with_segment(
             b"hour=11/",
             Some("hour"),
@@ -3521,7 +3560,6 @@ mod tests {
         });
         // `manifest.core.segments` invariant: sorted by prefix.
         m1.core.segments.sort_by(|a, b| a.prefix.cmp(&b.prefix));
-        debug_assert!(m1.core.segments[1].tree.is_drained());
 
         let (m2, _, _) =
             manifest_with_segment(b"hour=12/", Some("hour"), b"m", BytesRange::from_ref("m"..));
@@ -4151,5 +4189,49 @@ mod tests {
                 .any(|db| db.sst_ids.contains(&l0_sst)),
             "external_db with segment-resident SST must be retained after projection"
         );
+    }
+
+    fn manifest_with_segments(prefixes: &[&[u8]]) -> super::VersionedManifest {
+        let mut core = ManifestCore::new();
+        if !prefixes.is_empty() {
+            core.segment_extractor_name = Some("hour-bucket".to_string());
+            core.segments = prefixes
+                .iter()
+                .map(|p| Segment {
+                    prefix: Bytes::copy_from_slice(p),
+                    tree: LsmTreeState::default(),
+                })
+                .collect();
+        }
+        super::VersionedManifest::from_manifest(1, Manifest::initial(core))
+    }
+
+    #[test]
+    fn test_versioned_manifest_segments_empty_when_unconfigured() {
+        let manifest = manifest_with_segments(&[]);
+        assert!(manifest.segments().is_empty());
+        assert!(manifest.segment(b"anything").is_none());
+    }
+
+    #[test]
+    fn test_versioned_manifest_segments_returns_in_prefix_order() {
+        let manifest = manifest_with_segments(&[b"ts/2026-03-09/14/", b"ts/2026-03-09/15/"]);
+        let segments = manifest.segments();
+        assert_eq!(segments.len(), 2);
+        assert_eq!(segments[0].prefix().as_ref(), b"ts/2026-03-09/14/");
+        assert_eq!(segments[1].prefix().as_ref(), b"ts/2026-03-09/15/");
+    }
+
+    #[test]
+    fn test_versioned_manifest_segment_lookup_requires_exact_match() {
+        let manifest = manifest_with_segments(&[b"ts/2026-03-09/14/"]);
+        // Exact match resolves.
+        assert!(manifest.segment(b"ts/2026-03-09/14/").is_some());
+        // Strict prefix of the segment must not match.
+        assert!(manifest.segment(b"ts/2026-").is_none());
+        // Key extending the segment's prefix must not match either.
+        assert!(manifest.segment(b"ts/2026-03-09/14/series-7").is_none());
+        // Empty prefix is not a wildcard.
+        assert!(manifest.segment(b"").is_none());
     }
 }
