@@ -11,11 +11,14 @@ use crate::mem_table::{KVTableInternalKeyRange, SequencedKey};
 use crate::merge_operator::{MergeOperatorIterator, MergeOperatorType};
 use crate::prefix_extractor::{PrefixExtractor, PrefixTarget};
 use crate::types::{RowEntry, ValueDeletable};
+use crate::write_buffer_manager::WriteBufferPermit;
+use crate::WriteBufferManager;
 use async_trait::async_trait;
 use bytes::Bytes;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::iter::Peekable;
 use std::ops::RangeBounds;
+use std::sync::Arc;
 use uuid::Uuid;
 
 /// A batch of write operations (puts and/or deletes). All operations in the
@@ -58,6 +61,7 @@ pub struct WriteBatch {
     /// atomically by the oracle when the batch is committed).
     pub(crate) write_idx: u64,
     pub(crate) merge_op_count: usize,
+    pub(crate) wbm_permit: Option<Arc<WriteBufferPermit>>,
 }
 
 impl Default for WriteBatch {
@@ -140,6 +144,14 @@ impl WriteOp {
             ),
         }
     }
+
+    pub(crate) fn value_size(&self) -> usize {
+        match self {
+            WriteOp::Put(_key, value, _options) => value.len(),
+            WriteOp::Delete(_key) => 0,
+            WriteOp::Merge(_key, value, _options) => value.len(),
+        }
+    }
 }
 
 impl WriteBatch {
@@ -149,6 +161,7 @@ impl WriteBatch {
             txn_id: None,
             write_idx: 0,
             merge_op_count: 0,
+            wbm_permit: None,
         }
     }
 
@@ -179,6 +192,7 @@ impl WriteBatch {
             txn_id: Some(txn_id),
             write_idx: self.write_idx,
             merge_op_count: self.merge_op_count,
+            wbm_permit: self.wbm_permit,
         }
     }
 
@@ -383,6 +397,37 @@ impl WriteBatch {
             entries.push(entry);
         }
         Ok((entries, touched_segments))
+    }
+
+    pub(crate) async fn request_buffer(&mut self, wbm: &WriteBufferManager) {
+        match self.wbm_permit {
+            // buffer permit already allocated for this batch
+            Some(_) => {}
+            None => {
+                let permit = wbm.acquire_buffer(self.estimated_size()).await;
+                self.wbm_permit = Some(Arc::new(permit));
+            }
+        }
+    }
+
+    pub(crate) fn estimated_size(&self) -> usize {
+        let mut size = 0;
+        for entry in self.ops.iter() {
+            size += entry.0.user_key.len() + entry.1.value_size();
+            // Add size for sequence number
+            size += std::mem::size_of::<u64>();
+
+            // Add size for timestamps. Optimistically assume they are used
+            // for create_ts in RowEntry
+            size += std::mem::size_of::<i64>();
+            // for expire_ts in RowEntry
+            size += std::mem::size_of::<i64>();
+        }
+        size
+    }
+
+    pub(crate) fn current_buffer(&self) -> Option<Arc<WriteBufferPermit>> {
+        self.wbm_permit.as_ref().map(Arc::clone)
     }
 }
 

@@ -18,11 +18,31 @@ impl WriteBufferManager {
     }
 
     pub async fn acquire_buffer(&self, buffer_size: usize) -> WriteBufferPermit {
-        // acquire_many_owned translates back to usize. i do not know why they used u32 here.
-        self.buffer_permits
-            .clone()
+        if buffer_size == 0 {
+            return WriteBufferPermit {
+                permits: AtomicUsize::new(0),
+                semaphore: Arc::clone(&self.buffer_permits),
+            };
+        }
+
+        Arc::clone(&self.buffer_permits)
             .acquire_permit(buffer_size)
             .await
+    }
+
+    /// Unconditionally acquires `buffer_size` bytes without waiting.
+    /// The bytes are tracked by the budget (so `available()` reflects them)
+    /// but the call never blocks, even if the budget is fully exhausted.
+    ///
+    /// Use this for paths like WAL replay where the data is already in
+    /// memory and must be accounted for, but blocking would deadlock
+    /// because forward progress is needed to free the budget.
+    pub fn force_acquire_buffer(&self, buffer_size: usize) -> WriteBufferPermit {
+        self.buffer_permits.force_acquire(buffer_size);
+        WriteBufferPermit {
+            permits: AtomicUsize::new(buffer_size),
+            semaphore: Arc::clone(&self.buffer_permits),
+        }
     }
 
     pub fn available(&self) -> usize {
@@ -30,6 +50,7 @@ impl WriteBufferManager {
     }
 }
 
+#[derive(Debug)]
 pub struct WriteBufferPermit {
     semaphore: Arc<WBMSemaphore>,
     permits: AtomicUsize,
@@ -48,54 +69,30 @@ impl WriteBufferPermit {
     ///
     /// Panics if `self` and `other` were acquired from different
     /// `WriteBufferManager` instances.
-    pub fn merge(&self, other: Self) {
+    pub fn merge(&self, other: &Self) {
         assert!(
             Arc::ptr_eq(&self.semaphore, &other.semaphore),
             "merging permits from different semaphore instances"
         );
-        self.permits
-            .fetch_add(other.permits.load(Ordering::Relaxed), Ordering::Relaxed);
-        other.permits.store(0, Ordering::Relaxed);
-    }
 
-    /// Releases `n` bytes back to the buffer budget, shrinking this permit.
-    /// After this call, `self.size()` is reduced by `n`.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `n` is greater than the number of bytes currently held.
-    pub fn release(&self, n: usize) {
-        let size = self.size();
-        assert!(
-            n <= size,
-            "cannot release {n} bytes when only {size} are held"
-        );
-        self.semaphore.release(n);
-        self.permits.fetch_sub(n, Ordering::Relaxed);
-    }
-
-    /// Acquires `n` additional bytes from the buffer budget, growing this
-    /// permit. Waits asynchronously until enough budget is available.
-    /// After this call, `self.size()` is increased by `n`.
-    pub async fn acquire(&self, n: usize) {
-        self.semaphore.acquire(n).await;
-        self.permits.fetch_add(n, Ordering::Relaxed);
-    }
-
-    /// Resizes this permit to track exactly `new` bytes, acquiring or
-    /// releasing bytes as needed. If `new` equals the current size,
-    /// this is a no-op.
-    ///
-    /// When growing, waits asynchronously until enough buffer budget is
-    /// available. When shrinking, bytes are released back to the budget
-    /// immediately.
-    pub async fn resize(&self, new: usize) {
-        let size = self.size();
-        match new.cmp(&size) {
-            std::cmp::Ordering::Less => self.release(size - new),
-            std::cmp::Ordering::Equal => {}
-            std::cmp::Ordering::Greater => self.acquire(new - size).await,
+        let mut allocated = other.permits.load(Ordering::Relaxed);
+        loop {
+            match other.permits.compare_exchange_weak(
+                allocated,
+                0,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => {
+                    break;
+                }
+                Err(cur) => {
+                    allocated = cur;
+                }
+            }
         }
+
+        self.permits.fetch_add(allocated, Ordering::Relaxed);
     }
 }
 
@@ -108,6 +105,7 @@ impl Drop for WriteBufferPermit {
     }
 }
 
+#[derive(Debug)]
 struct WBMSemaphore {
     notify: Notify,
     permits: AtomicUsize,
@@ -152,10 +150,36 @@ impl WBMSemaphore {
         }
     }
 
+    /// Unconditionally adds `permits` to the allocated count without
+    /// waiting. This can push `allocated` above `max_permits`.
+    fn force_acquire(&self, permits: usize) {
+        self.permits.fetch_add(permits, Ordering::Relaxed);
+    }
+
     fn release(&self, permits: usize) {
-        let allocated = self.permits.fetch_sub(permits, Ordering::Relaxed);
+        let mut allocated = self.permits.load(Ordering::Relaxed);
+        loop {
+            assert!(
+                allocated >= permits,
+                "cannot release more permits than were requested"
+            );
+            match self.permits.compare_exchange_weak(
+                allocated,
+                allocated - permits,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => {
+                    break;
+                }
+                Err(cur) => {
+                    allocated = cur;
+                }
+            }
+        }
+
         if (allocated - permits) < self.max_permits {
-            self.notify.notify_one();
+            self.notify.notify_waiters();
         }
     }
 
@@ -279,7 +303,7 @@ mod tests {
         let p1 = mgr.acquire_buffer(100).await;
         let p2 = mgr.acquire_buffer(200).await;
 
-        p1.merge(p2);
+        p1.merge(&p2);
         assert_eq!(p1.size(), 300);
         assert_eq!(mgr.available(), 724);
     }
@@ -290,7 +314,8 @@ mod tests {
         let p1 = mgr.acquire_buffer(100).await;
         let p2 = mgr.acquire_buffer(200).await;
 
-        p1.merge(p2);
+        p1.merge(&p2);
+        drop(p2);
         drop(p1);
         assert_eq!(mgr.available(), 1024);
     }
@@ -302,8 +327,9 @@ mod tests {
         let p2 = mgr.acquire_buffer(200).await;
 
         // After merge, dropping the consumed permit should not double-release.
-        p1.merge(p2);
-        // p2 was consumed by merge; only p1 exists. Its size should be 300.
+        p1.merge(&p2);
+        // p2's permits are zeroed; dropping it won't release anything.
+        drop(p2);
         assert_eq!(p1.size(), 300);
         assert_eq!(mgr.available(), 724);
     }
@@ -316,129 +342,7 @@ mod tests {
         let p1 = mgr1.acquire_buffer(10).await;
         let p2 = mgr2.acquire_buffer(10).await;
 
-        p1.merge(p2);
-    }
-
-    // ---------------------------------------------------------------
-    // WriteBufferPermit::release
-    // ---------------------------------------------------------------
-
-    #[tokio::test]
-    async fn test_release_returns_bytes_to_budget() {
-        let mgr = WriteBufferManager::new(1024);
-        let permit = mgr.acquire_buffer(500).await;
-
-        permit.release(200);
-        assert_eq!(permit.size(), 300);
-        assert_eq!(mgr.available(), 724);
-    }
-
-    #[tokio::test]
-    async fn test_release_all_bytes() {
-        let mgr = WriteBufferManager::new(1024);
-        let permit = mgr.acquire_buffer(500).await;
-
-        permit.release(500);
-        assert_eq!(permit.size(), 0);
-        assert_eq!(mgr.available(), 1024);
-    }
-
-    #[tokio::test]
-    async fn test_release_zero_is_noop() {
-        let mgr = WriteBufferManager::new(1024);
-        let permit = mgr.acquire_buffer(500).await;
-
-        permit.release(0);
-        assert_eq!(permit.size(), 500);
-        assert_eq!(mgr.available(), 524);
-    }
-
-    #[tokio::test]
-    #[should_panic(expected = "cannot release 600 bytes when only 500 are held")]
-    async fn test_release_more_than_held_panics() {
-        let mgr = WriteBufferManager::new(1024);
-        let permit = mgr.acquire_buffer(500).await;
-
-        permit.release(600);
-    }
-
-    // ---------------------------------------------------------------
-    // WriteBufferPermit::acquire
-    // ---------------------------------------------------------------
-
-    #[tokio::test]
-    async fn test_acquire_grows_permit() {
-        let mgr = WriteBufferManager::new(1024);
-        let permit = mgr.acquire_buffer(100).await;
-
-        permit.acquire(200).await;
-        assert_eq!(permit.size(), 300);
-        assert_eq!(mgr.available(), 724);
-    }
-
-    #[tokio::test]
-    async fn test_acquire_blocks_until_budget_available() {
-        let mgr = WriteBufferManager::new(100);
-        let p1 = mgr.acquire_buffer(80).await;
-        let p2 = mgr.acquire_buffer(20).await;
-
-        // p2 wants 50 more but only 0 are available — should block.
-        let p2_ref = &p2;
-        let result = timeout(Duration::from_millis(50), p2_ref.acquire(50)).await;
-        assert!(result.is_err(), "acquire should have timed out");
-
-        // Release some bytes from p1.
-        p1.release(50);
-
-        // Now the acquire should succeed.
-        timeout(Duration::from_millis(100), p2.acquire(50))
-            .await
-            .expect("acquire should have completed");
-        assert_eq!(p2.size(), 70);
-    }
-
-    // ---------------------------------------------------------------
-    // WriteBufferPermit::resize
-    // ---------------------------------------------------------------
-
-    #[tokio::test]
-    async fn test_resize_grow() {
-        let mgr = WriteBufferManager::new(1024);
-        let permit = mgr.acquire_buffer(100).await;
-
-        permit.resize(400).await;
-        assert_eq!(permit.size(), 400);
-        assert_eq!(mgr.available(), 624);
-    }
-
-    #[tokio::test]
-    async fn test_resize_shrink() {
-        let mgr = WriteBufferManager::new(1024);
-        let permit = mgr.acquire_buffer(400).await;
-
-        permit.resize(100).await;
-        assert_eq!(permit.size(), 100);
-        assert_eq!(mgr.available(), 924);
-    }
-
-    #[tokio::test]
-    async fn test_resize_same_size_is_noop() {
-        let mgr = WriteBufferManager::new(1024);
-        let permit = mgr.acquire_buffer(400).await;
-
-        permit.resize(400).await;
-        assert_eq!(permit.size(), 400);
-        assert_eq!(mgr.available(), 624);
-    }
-
-    #[tokio::test]
-    async fn test_resize_to_zero() {
-        let mgr = WriteBufferManager::new(1024);
-        let permit = mgr.acquire_buffer(400).await;
-
-        permit.resize(0).await;
-        assert_eq!(permit.size(), 0);
-        assert_eq!(mgr.available(), 1024);
+        p1.merge(&p2);
     }
 
     // ---------------------------------------------------------------
@@ -448,10 +352,18 @@ mod tests {
     #[tokio::test]
     async fn test_drop_zero_sized_permit_is_safe() {
         let mgr = WriteBufferManager::new(1024);
-        let permit = mgr.acquire_buffer(100).await;
-        permit.release(100);
-        assert_eq!(permit.size(), 0);
-        drop(permit);
+        let p1 = mgr.acquire_buffer(100).await;
+        let p2 = mgr.acquire_buffer(100).await;
+
+        // Merge p1 into p2, zeroing p1.
+        p2.merge(&p1);
+        assert_eq!(p1.size(), 0);
+
+        // Dropping a zeroed permit should not affect the budget.
+        drop(p1);
+        assert_eq!(mgr.available(), 824);
+
+        drop(p2);
         assert_eq!(mgr.available(), 1024);
     }
 
@@ -462,10 +374,12 @@ mod tests {
         let p2 = mgr.acquire_buffer(200).await;
         let p3 = mgr.acquire_buffer(300).await;
 
-        p1.merge(p2);
-        p1.merge(p3);
+        p1.merge(&p2);
+        p1.merge(&p3);
         assert_eq!(p1.size(), 600);
 
+        drop(p2);
+        drop(p3);
         drop(p1);
         assert_eq!(mgr.available(), 1024);
     }

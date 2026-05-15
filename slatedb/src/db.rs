@@ -340,13 +340,19 @@ impl DbInner {
         }
 
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let batch_msg = WriteBatchMessage {
+        let mut batch_msg = WriteBatchMessage {
             batch,
             options: options.clone(),
             done: tx,
         };
 
         self.maybe_apply_backpressure().await?;
+        // This will wait until there is buffer available.
+        // The call to maybe_apply_backpressure returns only when there is room to request a buffer but that does not mean this will not wait.
+        batch_msg
+            .batch
+            .request_buffer(&self.write_buffer_manager)
+            .await;
         self.write_notifier.send(batch_msg)?;
 
         // TODO: this can be modified as awaiting the last_durable_seq watermark & fatal error.
@@ -364,7 +370,9 @@ impl DbInner {
     pub(crate) async fn maybe_apply_backpressure(&self) -> Result<(), SlateDBError> {
         loop {
             self.check_closed()?;
-            let write_buffer_size = self.write_buffer_manager.available();
+
+            // Check if the overall cache size is full
+            let write_buffer_remaining = self.write_buffer_manager.available();
 
             let (wal_size_bytes, imm_memtable_size_bytes) = {
                 let wal_size_bytes = self.wal_buffer.estimated_bytes()?;
@@ -392,22 +400,25 @@ impl DbInner {
                 .set(total_mem_size_bytes as i64);
 
             trace!(
-                "checking backpressure [total_mem_size_bytes={}, wal_size_bytes={}, imm_memtable_size_bytes={}, max_unflushed_bytes={}, write_buffer_size={}]",
+                "checking backpressure [total_mem_size_bytes={}, wal_size_bytes={}, imm_memtable_size_bytes={}, max_unflushed_bytes={}, write_buffer_remaining={}]",
                 format_bytes_si(total_mem_size_bytes as u64),
                 format_bytes_si(wal_size_bytes as u64),
                 format_bytes_si(imm_memtable_size_bytes as u64),
                 format_bytes_si(self.settings.max_unflushed_bytes as u64),
-                format_bytes_si(write_buffer_size as u64)
+                format_bytes_si(write_buffer_remaining as u64)
             );
 
-            if total_mem_size_bytes >= self.settings.max_unflushed_bytes {
+            if total_mem_size_bytes >= self.settings.max_unflushed_bytes
+                || write_buffer_remaining == 0
+            {
                 self.db_stats.backpressure_count.increment(1);
                 warn!(
-                    "unflushed memtable size exceeds max_unflushed_bytes. applying backpressure. [total_mem_size_bytes={}, wal_size_bytes={}, imm_memtable_size_bytes={}, max_unflushed_bytes={}]",
+                    "unflushed memtable size exceeds max_unflushed_bytes. applying backpressure. [total_mem_size_bytes={}, wal_size_bytes={}, imm_memtable_size_bytes={}, max_unflushed_bytes={}, write_buffer_remaining={}]",
                     format_bytes_si(total_mem_size_bytes as u64),
                     format_bytes_si(wal_size_bytes as u64),
                     format_bytes_si(imm_memtable_size_bytes as u64),
                     format_bytes_si(self.settings.max_unflushed_bytes as u64),
+                    format_bytes_si(write_buffer_remaining as u64)
                 );
 
                 let maybe_oldest_unflushed_memtable = {
@@ -586,6 +597,18 @@ impl DbInner {
             // would cause the flusher's assertion that the remote persisted seq is always >= the
             // last seq in the memtable to fail. By updating `last_remote_persisted_seq` here, we
             // ensure the assertion holds true.
+            // Force-acquire a buffer permit for the replayed memtable so
+            // the write_buffer_manager tracks memory from replayed WAL data.
+            // We use force_acquire (non-blocking) because the replay loop
+            // must make forward progress to reach maybe_apply_backpressure,
+            // which is what actually waits for flushes to drain the budget.
+            // The permit is released when the memtable is flushed to L0.
+            let metadata = replayed_table.table.metadata();
+            let permit = self
+                .write_buffer_manager
+                .force_acquire_buffer(metadata.entries_size_in_bytes);
+            replayed_table.table.add_write_permits(Arc::new(permit));
+
             assert!(self.oracle.last_remote_persisted_seq() <= replayed_table.last_seq);
             self.oracle.advance_durable_seq(replayed_table.last_seq);
             self.maybe_apply_backpressure().await?;
