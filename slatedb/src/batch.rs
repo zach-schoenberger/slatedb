@@ -61,7 +61,7 @@ pub struct WriteBatch {
     /// atomically by the oracle when the batch is committed).
     pub(crate) write_idx: u64,
     pub(crate) merge_op_count: usize,
-    pub(crate) wbm_permit: Option<Arc<WriteBufferPermit>>,
+    pub(crate) write_buffer_permit: Option<Arc<WriteBufferPermit>>,
 }
 
 impl Default for WriteBatch {
@@ -145,6 +145,8 @@ impl WriteOp {
         }
     }
 
+    /// Returns the byte length of this operation's value payload,
+    /// or zero for deletes.
     pub(crate) fn value_size(&self) -> usize {
         match self {
             WriteOp::Put(_key, value, _options) => value.len(),
@@ -161,7 +163,7 @@ impl WriteBatch {
             txn_id: None,
             write_idx: 0,
             merge_op_count: 0,
-            wbm_permit: None,
+            write_buffer_permit: None,
         }
     }
 
@@ -192,7 +194,7 @@ impl WriteBatch {
             txn_id: Some(txn_id),
             write_idx: self.write_idx,
             merge_op_count: self.merge_op_count,
-            wbm_permit: self.wbm_permit,
+            write_buffer_permit: self.write_buffer_permit,
         }
     }
 
@@ -399,17 +401,23 @@ impl WriteBatch {
         Ok((entries, touched_segments))
     }
 
-    pub(crate) async fn request_buffer(&mut self, wbm: &WriteBufferManager) {
-        match self.wbm_permit {
+    /// Acquires a write-buffer budget permit sized to the estimated
+    /// in-memory footprint of this batch. If a permit was already
+    /// acquired for this batch, this is a no-op.
+    pub(crate) async fn reserve_write_buffer(&mut self, write_buffer_manager: &WriteBufferManager) {
+        match self.write_buffer_permit {
             // buffer permit already allocated for this batch
             Some(_) => {}
             None => {
-                let permit = wbm.acquire_buffer(self.estimated_size()).await;
-                self.wbm_permit = Some(Arc::new(permit));
+                let permit = write_buffer_manager.acquire(self.estimated_size()).await;
+                self.write_buffer_permit = Some(Arc::new(permit));
             }
         }
     }
 
+    /// Returns a conservative estimate of the in-memory byte footprint
+    /// this batch will occupy once written to the memtable. Includes
+    /// key bytes, value bytes, sequence numbers, and timestamps.
     pub(crate) fn estimated_size(&self) -> usize {
         let mut size = 0;
         for entry in self.ops.iter() {
@@ -417,7 +425,7 @@ impl WriteBatch {
             // Add size for sequence number
             size += std::mem::size_of::<u64>();
 
-            // Add size for timestamps. Optimistically assume they are used
+            // Add size for timestamps. Conservatively assume they are present
             // for create_ts in RowEntry
             size += std::mem::size_of::<i64>();
             // for expire_ts in RowEntry
@@ -426,8 +434,10 @@ impl WriteBatch {
         size
     }
 
-    pub(crate) fn current_buffer(&self) -> Option<Arc<WriteBufferPermit>> {
-        self.wbm_permit.as_ref().map(Arc::clone)
+    /// Returns a clone of this batch's write-buffer permit, if one
+    /// has been acquired.
+    pub(crate) fn write_buffer_permit(&self) -> Option<Arc<WriteBufferPermit>> {
+        self.write_buffer_permit.as_ref().map(Arc::clone)
     }
 }
 

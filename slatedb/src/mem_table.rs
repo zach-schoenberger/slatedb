@@ -161,8 +161,10 @@ impl WritableKVTable {
         self.table.record_touched_segments(prefixes);
     }
 
-    pub(crate) fn add_write_permits(&self, permit: Arc<WriteBufferPermit>) {
-        self.table.add_write_permits(permit);
+    /// Attaches a write-buffer budget permit to the underlying table.
+    /// When the table is dropped, the permit releases its reserved bytes.
+    pub(crate) fn add_write_permit(&self, permit: Arc<WriteBufferPermit>) {
+        self.table.add_write_permit(permit);
     }
 }
 
@@ -565,7 +567,10 @@ impl KVTable {
         self.sequence_tracker.lock().clone()
     }
 
-    pub(crate) fn add_write_permits(&self, permit: Arc<WriteBufferPermit>) {
+    /// Attaches a write-buffer budget permit to this table. If a permit
+    /// is already present, the new permit is merged into the existing one
+    /// so that a single drop releases the combined reservation.
+    pub(crate) fn add_write_permit(&self, permit: Arc<WriteBufferPermit>) {
         if let Err(permit) = self.write_buffer_permit.set(permit) {
             self.write_buffer_permit.get().unwrap().merge(&permit);
         }

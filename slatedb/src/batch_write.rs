@@ -171,7 +171,7 @@ impl DbInner {
                 self.segment_extractor.as_deref(),
             )
             .await?;
-        let write_buffer = batch.current_buffer();
+        let write_buffer_permit = batch.write_buffer_permit();
 
         // RFC-0024 route-consistency: when a segment extractor is
         // configured, every write must extract a prefix that does
@@ -190,11 +190,11 @@ impl DbInner {
             self.wal_buffer.maybe_trigger_flush()?;
             // TODO: handle sync here, if sync is enabled, we can call `flush` here. let's put this
             // in another Pull Request.
-            self.write_entries_to_memtable(entries, touched_segments, write_buffer);
+            self.write_entries_to_memtable(entries, touched_segments, write_buffer_permit);
             wal_watcher
         } else {
             // if WAL is disabled, we just write the entries to memtable.
-            self.write_entries_to_memtable(entries, touched_segments, write_buffer)
+            self.write_entries_to_memtable(entries, touched_segments, write_buffer_permit)
         };
 
         // update the last_applied_seq to wal buffer. if a chunk of WAL entries are applied to the memtable
@@ -293,13 +293,13 @@ impl DbInner {
         &self,
         entries: Vec<RowEntry>,
         touched_segments: BTreeSet<Bytes>,
-        write_buffer: Option<Arc<WriteBufferPermit>>,
+        write_buffer_permit: Option<Arc<WriteBufferPermit>>,
     ) -> WatchableOnceCellReader<Result<(), SlateDBError>> {
         let guard = self.state.read();
         let memtable = guard.memtable();
         memtable.record_touched_segments(touched_segments);
         entries.into_iter().for_each(|entry| memtable.put(entry));
-        write_buffer.map(|wb| memtable.add_write_permits(wb));
+        write_buffer_permit.map(|permit| memtable.add_write_permit(permit));
         memtable.table().durable_watcher()
     }
 

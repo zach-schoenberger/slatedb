@@ -229,6 +229,9 @@ impl<P: Into<Path>> DbBuilder<P> {
         self
     }
 
+    /// Sets a custom [`WriteBufferManager`] for controlling the memory
+    /// budget of in-flight writes. If not set, a default manager is
+    /// created with a budget equal to `max_unflushed_bytes`.
     pub fn with_write_buffer_manager(mut self, write_buffer_manager: WriteBufferManager) -> Self {
         self.write_buffer_manager = Some(write_buffer_manager);
         self

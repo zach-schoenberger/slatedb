@@ -5,60 +5,76 @@ use std::sync::{
 
 use tokio::sync::Notify;
 
+/// Tracks and enforces a global memory budget for in-flight write data.
+///
+/// Writers must acquire a [`WriteBufferPermit`] before submitting a batch.
+/// The permit is attached to the active memtable and released when that
+/// memtable is dropped after being flushed to L0, thereby freeing the
+/// budget for new writes.
 #[derive(Clone)]
 pub struct WriteBufferManager {
-    buffer_permits: Arc<WBMSemaphore>,
+    inner: Arc<ByteBudgetSemaphore>,
 }
 
 impl WriteBufferManager {
-    pub fn new(buffer_size: usize) -> Self {
+    /// Creates a new write-buffer manager with the given byte budget.
+    pub fn new(capacity: usize) -> Self {
         Self {
-            buffer_permits: Arc::new(WBMSemaphore::new(buffer_size)),
+            inner: Arc::new(ByteBudgetSemaphore::new(capacity)),
         }
     }
 
-    pub async fn acquire_buffer(&self, buffer_size: usize) -> WriteBufferPermit {
-        if buffer_size == 0 {
+    /// Reserves `num_bytes` from the write-buffer budget, blocking until
+    /// capacity is available. Returns a permit that releases the reservation
+    /// on drop.
+    pub async fn acquire(&self, num_bytes: usize) -> WriteBufferPermit {
+        if num_bytes == 0 {
             return WriteBufferPermit {
-                permits: AtomicUsize::new(0),
-                semaphore: Arc::clone(&self.buffer_permits),
+                reserved_bytes: AtomicUsize::new(0),
+                semaphore: Arc::clone(&self.inner),
             };
         }
 
-        Arc::clone(&self.buffer_permits)
-            .acquire_permit(buffer_size)
-            .await
+        Arc::clone(&self.inner).acquire_permit(num_bytes).await
     }
 
-    /// Unconditionally acquires `buffer_size` bytes without waiting.
+    /// Unconditionally reserves `num_bytes` without waiting.
     /// The bytes are tracked by the budget (so `available()` reflects them)
     /// but the call never blocks, even if the budget is fully exhausted.
     ///
     /// Use this for paths like WAL replay where the data is already in
     /// memory and must be accounted for, but blocking would deadlock
     /// because forward progress is needed to free the budget.
-    pub fn force_acquire_buffer(&self, buffer_size: usize) -> WriteBufferPermit {
-        self.buffer_permits.force_acquire(buffer_size);
+    pub fn force_acquire(&self, num_bytes: usize) -> WriteBufferPermit {
+        self.inner.force_acquire(num_bytes);
         WriteBufferPermit {
-            permits: AtomicUsize::new(buffer_size),
-            semaphore: Arc::clone(&self.buffer_permits),
+            reserved_bytes: AtomicUsize::new(num_bytes),
+            semaphore: Arc::clone(&self.inner),
         }
     }
 
+    /// Returns the number of unreserved bytes remaining in the budget.
     pub fn available(&self) -> usize {
-        self.buffer_permits.available()
+        self.inner.available()
     }
 }
 
+/// An RAII guard representing a reserved portion of the write-buffer budget.
+///
+/// Dropping the permit returns its reserved bytes to the parent
+/// [`WriteBufferManager`]. Multiple permits can be consolidated via
+/// [`merge`](Self::merge) so that a single drop releases the combined
+/// reservation.
 #[derive(Debug)]
 pub struct WriteBufferPermit {
-    semaphore: Arc<WBMSemaphore>,
-    permits: AtomicUsize,
+    semaphore: Arc<ByteBudgetSemaphore>,
+    reserved_bytes: AtomicUsize,
 }
 
 impl WriteBufferPermit {
+    /// Returns the number of bytes currently reserved by this permit.
     pub fn size(&self) -> usize {
-        self.permits.load(Ordering::Relaxed)
+        self.reserved_bytes.load(Ordering::Relaxed)
     }
 
     /// Merges another permit into this one, consuming `other` without
@@ -75,10 +91,10 @@ impl WriteBufferPermit {
             "merging permits from different semaphore instances"
         );
 
-        let mut allocated = other.permits.load(Ordering::Relaxed);
+        let mut other_bytes = other.reserved_bytes.load(Ordering::Relaxed);
         loop {
-            match other.permits.compare_exchange_weak(
-                allocated,
+            match other.reserved_bytes.compare_exchange_weak(
+                other_bytes,
                 0,
                 Ordering::Relaxed,
                 Ordering::Relaxed,
@@ -87,51 +103,52 @@ impl WriteBufferPermit {
                     break;
                 }
                 Err(cur) => {
-                    allocated = cur;
+                    other_bytes = cur;
                 }
             }
         }
 
-        self.permits.fetch_add(allocated, Ordering::Relaxed);
+        self.reserved_bytes
+            .fetch_add(other_bytes, Ordering::Relaxed);
     }
 }
 
 impl Drop for WriteBufferPermit {
     fn drop(&mut self) {
-        let permits = self.permits.load(Ordering::Relaxed);
-        if permits > 0 {
-            self.semaphore.release(permits);
+        let reserved = self.reserved_bytes.load(Ordering::Relaxed);
+        if reserved > 0 {
+            self.semaphore.release(reserved);
         }
     }
 }
 
 #[derive(Debug)]
-struct WBMSemaphore {
+struct ByteBudgetSemaphore {
     notify: Notify,
-    permits: AtomicUsize,
-    max_permits: usize,
+    allocated_bytes: AtomicUsize,
+    capacity: usize,
 }
 
-impl WBMSemaphore {
-    fn new(permits: usize) -> Self {
+impl ByteBudgetSemaphore {
+    fn new(capacity: usize) -> Self {
         Self {
             notify: Notify::new(),
-            permits: AtomicUsize::new(0),
-            max_permits: permits,
+            allocated_bytes: AtomicUsize::new(0),
+            capacity,
         }
     }
 
-    async fn acquire(&self, permits: usize) {
-        let mut allocated = self.permits.load(Ordering::Relaxed);
+    async fn acquire(&self, num_bytes: usize) {
+        let mut current = self.allocated_bytes.load(Ordering::Relaxed);
         let notify_fut = self.notify.notified();
         tokio::pin!(notify_fut);
         notify_fut.as_mut().enable();
 
         loop {
-            if allocated < self.max_permits {
-                match self.permits.compare_exchange_weak(
-                    allocated,
-                    allocated + permits,
+            if current < self.capacity {
+                match self.allocated_bytes.compare_exchange_weak(
+                    current,
+                    current + num_bytes,
                     Ordering::Relaxed,
                     Ordering::Relaxed,
                 ) {
@@ -139,33 +156,33 @@ impl WBMSemaphore {
                         break;
                     }
                     Err(cur) => {
-                        allocated = cur;
+                        current = cur;
                     }
                 }
             } else {
                 notify_fut.as_mut().await;
                 notify_fut.set(self.notify.notified());
-                allocated = self.permits.load(Ordering::Relaxed);
+                current = self.allocated_bytes.load(Ordering::Relaxed);
             }
         }
     }
 
-    /// Unconditionally adds `permits` to the allocated count without
-    /// waiting. This can push `allocated` above `max_permits`.
-    fn force_acquire(&self, permits: usize) {
-        self.permits.fetch_add(permits, Ordering::Relaxed);
+    /// Unconditionally adds `num_bytes` to the allocated count without
+    /// waiting. This can push `allocated_bytes` above `capacity`.
+    fn force_acquire(&self, num_bytes: usize) {
+        self.allocated_bytes.fetch_add(num_bytes, Ordering::Relaxed);
     }
 
-    fn release(&self, permits: usize) {
-        let mut allocated = self.permits.load(Ordering::Relaxed);
+    fn release(&self, num_bytes: usize) {
+        let mut current = self.allocated_bytes.load(Ordering::Relaxed);
         loop {
             assert!(
-                allocated >= permits,
-                "cannot release more permits than were requested"
+                current >= num_bytes,
+                "cannot release more bytes than were reserved"
             );
-            match self.permits.compare_exchange_weak(
-                allocated,
-                allocated - permits,
+            match self.allocated_bytes.compare_exchange_weak(
+                current,
+                current - num_bytes,
                 Ordering::Relaxed,
                 Ordering::Relaxed,
             ) {
@@ -173,29 +190,29 @@ impl WBMSemaphore {
                     break;
                 }
                 Err(cur) => {
-                    allocated = cur;
+                    current = cur;
                 }
             }
         }
 
-        if (allocated - permits) < self.max_permits {
+        if (current - num_bytes) < self.capacity {
             self.notify.notify_waiters();
         }
     }
 
     fn available(&self) -> usize {
-        let allocated = self.permits.load(Ordering::Relaxed);
-        if allocated < self.max_permits {
-            self.max_permits - allocated
+        let current = self.allocated_bytes.load(Ordering::Relaxed);
+        if current < self.capacity {
+            self.capacity - current
         } else {
             0
         }
     }
 
-    async fn acquire_permit(self: Arc<Self>, permits: usize) -> WriteBufferPermit {
-        self.acquire(permits).await;
+    async fn acquire_permit(self: Arc<Self>, num_bytes: usize) -> WriteBufferPermit {
+        self.acquire(num_bytes).await;
         WriteBufferPermit {
-            permits: AtomicUsize::new(permits),
+            reserved_bytes: AtomicUsize::new(num_bytes),
             semaphore: self,
         }
     }
@@ -220,14 +237,14 @@ mod tests {
     #[tokio::test]
     async fn test_acquire_reduces_available() {
         let mgr = WriteBufferManager::new(1024);
-        let _permit = mgr.acquire_buffer(100).await;
+        let _permit = mgr.acquire(100).await;
         assert_eq!(mgr.available(), 924);
     }
 
     #[tokio::test]
     async fn test_acquire_entire_budget() {
         let mgr = WriteBufferManager::new(256);
-        let permit = mgr.acquire_buffer(256).await;
+        let permit = mgr.acquire(256).await;
         assert_eq!(mgr.available(), 0);
         assert_eq!(permit.size(), 256);
     }
@@ -235,7 +252,7 @@ mod tests {
     #[tokio::test]
     async fn test_drop_permit_restores_budget() {
         let mgr = WriteBufferManager::new(1024);
-        let permit = mgr.acquire_buffer(300).await;
+        let permit = mgr.acquire(300).await;
         assert_eq!(mgr.available(), 724);
         drop(permit);
         assert_eq!(mgr.available(), 1024);
@@ -244,8 +261,8 @@ mod tests {
     #[tokio::test]
     async fn test_multiple_acquires() {
         let mgr = WriteBufferManager::new(1024);
-        let p1 = mgr.acquire_buffer(200).await;
-        let p2 = mgr.acquire_buffer(300).await;
+        let p1 = mgr.acquire(200).await;
+        let p2 = mgr.acquire(300).await;
         assert_eq!(mgr.available(), 524);
         assert_eq!(p1.size(), 200);
         assert_eq!(p2.size(), 300);
@@ -254,20 +271,20 @@ mod tests {
     #[tokio::test]
     async fn test_acquire_blocks_when_budget_exhausted() {
         let mgr = WriteBufferManager::new(100);
-        let _permit = mgr.acquire_buffer(100).await;
+        let _permit = mgr.acquire(100).await;
 
         // A second acquire should block because the budget is exhausted.
-        let result = timeout(Duration::from_millis(50), mgr.acquire_buffer(1)).await;
+        let result = timeout(Duration::from_millis(50), mgr.acquire(1)).await;
         assert!(result.is_err(), "acquire should have timed out");
     }
 
     #[tokio::test]
     async fn test_acquire_unblocks_after_drop() {
         let mgr = WriteBufferManager::new(100);
-        let permit = mgr.acquire_buffer(100).await;
+        let permit = mgr.acquire(100).await;
 
         let mgr_clone = mgr.clone();
-        let handle = tokio::spawn(async move { mgr_clone.acquire_buffer(50).await });
+        let handle = tokio::spawn(async move { mgr_clone.acquire(50).await });
 
         // Give the spawned task a moment to park on the semaphore.
         tokio::time::sleep(Duration::from_millis(10)).await;
@@ -289,7 +306,7 @@ mod tests {
     #[tokio::test]
     async fn test_permit_size() {
         let mgr = WriteBufferManager::new(1024);
-        let permit = mgr.acquire_buffer(42).await;
+        let permit = mgr.acquire(42).await;
         assert_eq!(permit.size(), 42);
     }
 
@@ -300,8 +317,8 @@ mod tests {
     #[tokio::test]
     async fn test_merge_combines_sizes() {
         let mgr = WriteBufferManager::new(1024);
-        let p1 = mgr.acquire_buffer(100).await;
-        let p2 = mgr.acquire_buffer(200).await;
+        let p1 = mgr.acquire(100).await;
+        let p2 = mgr.acquire(200).await;
 
         p1.merge(&p2);
         assert_eq!(p1.size(), 300);
@@ -311,8 +328,8 @@ mod tests {
     #[tokio::test]
     async fn test_merge_drops_release_combined() {
         let mgr = WriteBufferManager::new(1024);
-        let p1 = mgr.acquire_buffer(100).await;
-        let p2 = mgr.acquire_buffer(200).await;
+        let p1 = mgr.acquire(100).await;
+        let p2 = mgr.acquire(200).await;
 
         p1.merge(&p2);
         drop(p2);
@@ -323,12 +340,12 @@ mod tests {
     #[tokio::test]
     async fn test_merge_other_drops_without_releasing() {
         let mgr = WriteBufferManager::new(1024);
-        let p1 = mgr.acquire_buffer(100).await;
-        let p2 = mgr.acquire_buffer(200).await;
+        let p1 = mgr.acquire(100).await;
+        let p2 = mgr.acquire(200).await;
 
         // After merge, dropping the consumed permit should not double-release.
         p1.merge(&p2);
-        // p2's permits are zeroed; dropping it won't release anything.
+        // p2's reserved_bytes are zeroed; dropping it won't release anything.
         drop(p2);
         assert_eq!(p1.size(), 300);
         assert_eq!(mgr.available(), 724);
@@ -339,8 +356,8 @@ mod tests {
     async fn test_merge_different_managers_panics() {
         let mgr1 = WriteBufferManager::new(1024);
         let mgr2 = WriteBufferManager::new(1024);
-        let p1 = mgr1.acquire_buffer(10).await;
-        let p2 = mgr2.acquire_buffer(10).await;
+        let p1 = mgr1.acquire(10).await;
+        let p2 = mgr2.acquire(10).await;
 
         p1.merge(&p2);
     }
@@ -352,8 +369,8 @@ mod tests {
     #[tokio::test]
     async fn test_drop_zero_sized_permit_is_safe() {
         let mgr = WriteBufferManager::new(1024);
-        let p1 = mgr.acquire_buffer(100).await;
-        let p2 = mgr.acquire_buffer(100).await;
+        let p1 = mgr.acquire(100).await;
+        let p2 = mgr.acquire(100).await;
 
         // Merge p1 into p2, zeroing p1.
         p2.merge(&p1);
@@ -370,9 +387,9 @@ mod tests {
     #[tokio::test]
     async fn test_drop_after_merge_releases_all() {
         let mgr = WriteBufferManager::new(1024);
-        let p1 = mgr.acquire_buffer(100).await;
-        let p2 = mgr.acquire_buffer(200).await;
-        let p3 = mgr.acquire_buffer(300).await;
+        let p1 = mgr.acquire(100).await;
+        let p2 = mgr.acquire(200).await;
+        let p3 = mgr.acquire(300).await;
 
         p1.merge(&p2);
         p1.merge(&p3);

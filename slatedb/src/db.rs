@@ -347,11 +347,12 @@ impl DbInner {
         };
 
         self.maybe_apply_backpressure().await?;
-        // This will wait until there is buffer available.
-        // The call to maybe_apply_backpressure returns only when there is room to request a buffer but that does not mean this will not wait.
+        // Reserve write-buffer budget for this batch. Backpressure above
+        // ensures the budget is not fully exhausted, but this call may
+        // still block briefly if concurrent writers are contending.
         batch_msg
             .batch
-            .request_buffer(&self.write_buffer_manager)
+            .reserve_write_buffer(&self.write_buffer_manager)
             .await;
         self.write_notifier.send(batch_msg)?;
 
@@ -371,7 +372,6 @@ impl DbInner {
         loop {
             self.check_closed()?;
 
-            // Check if the overall cache size is full
             let write_buffer_remaining = self.write_buffer_manager.available();
 
             let (wal_size_bytes, imm_memtable_size_bytes) = {
@@ -597,17 +597,17 @@ impl DbInner {
             // would cause the flusher's assertion that the remote persisted seq is always >= the
             // last seq in the memtable to fail. By updating `last_remote_persisted_seq` here, we
             // ensure the assertion holds true.
-            // Force-acquire a buffer permit for the replayed memtable so
-            // the write_buffer_manager tracks memory from replayed WAL data.
-            // We use force_acquire (non-blocking) because the replay loop
-            // must make forward progress to reach maybe_apply_backpressure,
-            // which is what actually waits for flushes to drain the budget.
-            // The permit is released when the memtable is flushed to L0.
+
+            // Account for the replayed memtable's memory in the write-buffer
+            // budget. We use force_acquire (non-blocking) because the replay
+            // loop must make forward progress before maybe_apply_backpressure
+            // can wait for flushes to drain the budget. The permit is released
+            // when the memtable is flushed to L0.
             let metadata = replayed_table.table.metadata();
             let permit = self
                 .write_buffer_manager
-                .force_acquire_buffer(metadata.entries_size_in_bytes);
-            replayed_table.table.add_write_permits(Arc::new(permit));
+                .force_acquire(metadata.entries_size_in_bytes);
+            replayed_table.table.add_write_permit(Arc::new(permit));
 
             assert!(self.oracle.last_remote_persisted_seq() <= replayed_table.last_seq);
             self.oracle.advance_durable_seq(replayed_table.last_seq);
