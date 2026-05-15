@@ -299,6 +299,7 @@ mod tests {
     use crate::test_utils::FixedThreeBytePrefixExtractor;
     use crate::types::{RowEntry, ValueDeletable};
     use crate::utils::WatchableOnceCell;
+    use crate::write_buffer_manager::WriteBufferManager;
     use bytes::Bytes;
     use fail_parallel::FailPointRegistry;
     use object_store::memory::InMemory;
@@ -346,6 +347,7 @@ mod tests {
         let status_manager = DbStatusManager::new(0);
         let (write_tx, _) =
             crate::utils::SafeSender::unbounded_channel(status_manager.result_reader());
+        let write_buffer_manager = WriteBufferManager::new(settings.max_unflushed_bytes);
         Arc::new(
             DbInner::new(
                 settings,
@@ -362,6 +364,7 @@ mod tests {
                 None,
                 status_manager,
                 segment_extractor,
+                write_buffer_manager,
             )
             .await
             .unwrap(),

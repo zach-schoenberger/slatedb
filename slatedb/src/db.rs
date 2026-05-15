@@ -23,6 +23,7 @@
 pub use crate::db_status::DbStatus;
 
 use crate::db_cache_manager::{self, CacheTarget};
+use crate::write_buffer_manager::WriteBufferManager;
 use std::ops::RangeBounds;
 use std::sync::Arc;
 
@@ -107,6 +108,7 @@ pub(crate) struct DbInner {
     pub(crate) oracle: Arc<DbOracle>,
     pub(crate) flush_merge_operator: Option<MergeOperatorType>,
     pub(crate) reader: Reader,
+    pub(crate) write_buffer_manager: WriteBufferManager,
     /// [`wal_buffer`] manages the in-memory WAL buffer, it manages the flushing
     /// of the WAL buffer to the remote storage.
     pub(crate) wal_buffer: Arc<WalBufferManager>,
@@ -136,6 +138,7 @@ impl DbInner {
         merge_operator: Option<crate::merge_operator::MergeOperatorType>,
         status_manager: DbStatusManager,
         segment_extractor: Option<Arc<dyn PrefixExtractor>>,
+        write_buffer_manager: WriteBufferManager,
     ) -> Result<Self, SlateDBError> {
         // both last_seq and last_committed_seq will be updated after WAL replay.
         let last_l0_seq = manifest.value.core.last_l0_seq;
@@ -209,6 +212,7 @@ impl DbInner {
             snapshot_manager,
             status_manager,
             segment_extractor,
+            write_buffer_manager,
         };
         Ok(db_inner)
     }
@@ -360,6 +364,8 @@ impl DbInner {
     pub(crate) async fn maybe_apply_backpressure(&self) -> Result<(), SlateDBError> {
         loop {
             self.check_closed()?;
+            let write_buffer_size = self.write_buffer_manager.available();
+
             let (wal_size_bytes, imm_memtable_size_bytes) = {
                 let wal_size_bytes = self.wal_buffer.estimated_bytes()?;
                 let imm_memtable_size_bytes = {
@@ -386,11 +392,12 @@ impl DbInner {
                 .set(total_mem_size_bytes as i64);
 
             trace!(
-                "checking backpressure [total_mem_size_bytes={}, wal_size_bytes={}, imm_memtable_size_bytes={}, max_unflushed_bytes={}]",
+                "checking backpressure [total_mem_size_bytes={}, wal_size_bytes={}, imm_memtable_size_bytes={}, max_unflushed_bytes={}, write_buffer_size={}]",
                 format_bytes_si(total_mem_size_bytes as u64),
                 format_bytes_si(wal_size_bytes as u64),
                 format_bytes_si(imm_memtable_size_bytes as u64),
                 format_bytes_si(self.settings.max_unflushed_bytes as u64),
+                format_bytes_si(write_buffer_size as u64)
             );
 
             if total_mem_size_bytes >= self.settings.max_unflushed_bytes {

@@ -817,6 +817,7 @@ mod tests {
     use crate::tablestore::TableStore;
     use crate::types::RowEntry;
     use crate::utils::WatchableOnceCell;
+    use crate::write_buffer_manager::WriteBufferManager;
     use bytes::Bytes;
     use fail_parallel::FailPointRegistry;
     use object_store::memory::InMemory;
@@ -979,6 +980,7 @@ mod tests {
                 None,
                 status_manager,
                 segment_extractor,
+                WriteBufferManager::new(settings.max_unflushed_bytes),
             )
             .await
             .unwrap(),

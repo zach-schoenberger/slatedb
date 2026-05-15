@@ -162,6 +162,8 @@ mod test_utils;
 mod transaction_manager;
 mod types;
 mod utils;
+mod write_buffer_manager;
+pub use write_buffer_manager::WriteBufferManager;
 
 mod wal;
 mod wal_buffer;
