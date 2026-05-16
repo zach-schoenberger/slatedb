@@ -158,6 +158,7 @@ use crate::store_provider::DefaultStoreProvider;
 use crate::tablestore::TableStore;
 use crate::utils::SafeSender;
 use crate::utils::WatchableOnceCell;
+use crate::write_buffer_manager::WriteBufferManager;
 use slatedb_common::clock::DefaultSystemClock;
 use slatedb_common::clock::SystemClock;
 use slatedb_common::metrics::MetricLevel;
@@ -188,6 +189,7 @@ pub struct DbBuilder<P: Into<Path>> {
     filter_policies: Vec<Arc<dyn FilterPolicy>>,
     metrics_recorder: Arc<dyn MetricsRecorder>,
     segment_extractor: Option<Arc<dyn crate::prefix_extractor::PrefixExtractor>>,
+    write_buffer_manager: Option<WriteBufferManager>,
 }
 
 impl<P: Into<Path>> DbBuilder<P> {
@@ -211,6 +213,7 @@ impl<P: Into<Path>> DbBuilder<P> {
             filter_policies: default_filter_policies(),
             metrics_recorder: Arc::new(NoopMetricsRecorder::new()),
             segment_extractor: None,
+            write_buffer_manager: None,
         }
     }
 
@@ -223,6 +226,14 @@ impl<P: Into<Path>> DbBuilder<P> {
         extractor: Arc<dyn crate::prefix_extractor::PrefixExtractor>,
     ) -> Self {
         self.segment_extractor = Some(extractor);
+        self
+    }
+
+    /// Sets a custom [`WriteBufferManager`] for controlling the memory
+    /// budget of in-flight writes. If not set, a default manager is
+    /// created with a budget equal to `max_unflushed_bytes`.
+    pub fn with_write_buffer_manager(mut self, write_buffer_manager: WriteBufferManager) -> Self {
+        self.write_buffer_manager = Some(write_buffer_manager);
         self
     }
 
@@ -586,6 +597,9 @@ impl<P: Into<Path>> DbBuilder<P> {
         let (write_tx, write_rx) = SafeSender::unbounded_channel(reader);
 
         // Create the database inner state
+        let write_buffer_manager = self
+            .write_buffer_manager
+            .unwrap_or_else(|| WriteBufferManager::new(self.settings.max_unflushed_bytes));
         let memtable_flusher = Arc::new(MemtableFlusher::new(&status_manager));
         let inner = Arc::new(
             DbInner::new(
@@ -601,6 +615,7 @@ impl<P: Into<Path>> DbBuilder<P> {
                 self.merge_operator.clone(),
                 status_manager.clone(),
                 self.segment_extractor.clone(),
+                write_buffer_manager,
             )
             .await?,
         );

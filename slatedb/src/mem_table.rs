@@ -7,6 +7,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use crossbeam_skiplist::map::Range;
 use crossbeam_skiplist::SkipMap;
+use once_cell::sync::OnceCell;
 use ouroboros::self_referencing;
 use std::sync::atomic::AtomicI64;
 use std::sync::atomic::Ordering::SeqCst;
@@ -19,6 +20,7 @@ use crate::iter::{IterationOrder, RowEntryIterator};
 use crate::seq_tracker::{SequenceTracker, TrackedSeq};
 use crate::types::RowEntry;
 use crate::utils::{WatchableOnceCell, WatchableOnceCellReader};
+use crate::write_buffer_manager::WriteBufferPermit;
 
 /// Memtable may contains multiple versions of a single user key, with a monotonically increasing sequence number.
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -107,6 +109,7 @@ pub(crate) struct KVTable {
     /// paths after the antichain check. Empty when no extractor is
     /// configured.
     touched_segments: Mutex<std::collections::BTreeSet<Bytes>>,
+    write_buffer_permit: OnceCell<Arc<WriteBufferPermit>>,
 }
 
 pub(crate) struct KVTableMetadata {
@@ -156,6 +159,12 @@ impl WritableKVTable {
     /// Delegate to [`KVTable::record_touched_segments`].
     pub(crate) fn record_touched_segments(&self, prefixes: std::collections::BTreeSet<Bytes>) {
         self.table.record_touched_segments(prefixes);
+    }
+
+    /// Attaches a write-buffer budget permit to the underlying table.
+    /// When the table is dropped, the permit releases its reserved bytes.
+    pub(crate) fn add_write_permit(&self, permit: Arc<WriteBufferPermit>) {
+        self.table.add_write_permit(permit);
     }
 }
 
@@ -355,6 +364,7 @@ impl KVTable {
             first_seq: AtomicU64::new(u64::MAX),
             sequence_tracker: Mutex::new(SequenceTracker::new()),
             touched_segments: Mutex::new(std::collections::BTreeSet::new()),
+            write_buffer_permit: OnceCell::new(),
         }
     }
 
@@ -555,6 +565,15 @@ impl KVTable {
 
     pub(crate) fn sequence_tracker_snapshot(&self) -> SequenceTracker {
         self.sequence_tracker.lock().clone()
+    }
+
+    /// Attaches a write-buffer budget permit to this table. If a permit
+    /// is already present, the new permit is merged into the existing one
+    /// so that a single drop releases the combined reservation.
+    pub(crate) fn add_write_permit(&self, permit: Arc<WriteBufferPermit>) {
+        if let Err(permit) = self.write_buffer_permit.set(permit) {
+            self.write_buffer_permit.get().unwrap().merge(&permit);
+        }
     }
 }
 
