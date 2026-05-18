@@ -1,6 +1,9 @@
 use crate::args::{parse_args, CliArgs, CliCommands, GcResource, GcSchedule};
+use bytes::BytesMut;
 use chrono::{TimeZone, Utc};
+use object_store::memory::InMemory;
 use object_store::path::Path;
+use object_store::{ObjectStore, PutPayload};
 use slatedb::admin::{self, Admin, AdminBuilder};
 use slatedb::compactor::{
     CompactionRequest, CompactionSchedulerSupplier, SizeTieredCompactionSchedulerSupplier,
@@ -9,7 +12,10 @@ use slatedb::config::{
     CheckpointOptions, CompactorOptions, GarbageCollectorDirectoryOptions, GarbageCollectorOptions,
 };
 use slatedb::seq_tracker::FindOption;
+use slatedb::SstReader;
 use std::error::Error;
+use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use tracing::debug;
@@ -85,6 +91,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
         CliCommands::TsToSeq { ts_secs, round } => {
             exec_ts_to_seq(&admin, ts_secs, matches!(round, FindOption::RoundUp)).await?
         }
+        CliCommands::ReadLocalSst {
+            cache_dir,
+            sst_id,
+            part_size,
+        } => exec_read_local_sst(&args.path, &cache_dir, &sst_id, part_size).await?,
     }
 
     Ok(())
@@ -324,5 +335,107 @@ async fn exec_ts_to_seq(admin: &Admin, ts_secs: i64, round_up: bool) -> Result<(
         Some(seq) => println!("{}", seq),
         None => println!("not found"),
     }
+    Ok(())
+}
+
+async fn exec_read_local_sst(
+    db_path: &str,
+    cache_dir: &str,
+    sst_id: &str,
+    part_size: usize,
+) -> Result<(), Box<dyn Error>> {
+    let ulid = Ulid::from_string(sst_id)?;
+
+    // Construct the path to the SST's cache folder
+    let sst_relative_path = format!("{}/compacted/{}.sst", db_path, ulid);
+    let sst_cache_folder = PathBuf::from(cache_dir).join(&sst_relative_path);
+
+    // Determine part size name for filenames
+    let part_size_name = if part_size.is_multiple_of(1024 * 1024) {
+        format!("{}mb", part_size / (1024 * 1024))
+    } else {
+        format!("{}kb", part_size / 1024)
+    };
+
+    // Read the _head file to determine total size
+    let head_path = sst_cache_folder.join("_head");
+    let head_content = std::fs::read_to_string(&head_path)?;
+    let head: serde_json::Value = serde_json::from_str(&head_content)?;
+    let total_size = head["size"].as_u64().ok_or("missing size in head")? as usize;
+
+    println!("SST ID: {}", ulid);
+    println!("Total size: {} bytes", total_size);
+    println!("Part size: {} bytes", part_size);
+
+    // Read all parts in order
+    let mut assembled = BytesMut::with_capacity(total_size);
+    let mut part_number = 0u64;
+    loop {
+        let part_filename = format!("_part{}-{:09}", part_size_name, part_number);
+        let part_path = sst_cache_folder.join(&part_filename);
+        match std::fs::read(&part_path) {
+            Ok(data) => {
+                assembled.extend_from_slice(&data);
+                part_number += 1;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
+            Err(e) => return Err(Box::new(e)),
+        }
+    }
+
+    if assembled.len() < total_size {
+        eprintln!(
+            "Warning: assembled {} bytes but expected {}. Some parts may be missing.",
+            assembled.len(),
+            total_size
+        );
+    }
+
+    // Truncate to actual SST size (last part may be padded/larger)
+    let actual_len = total_size.min(assembled.len());
+    let sst_bytes = assembled.freeze().slice(..actual_len);
+
+    // Create an in-memory object store and put the SST data at the right path
+    let mem_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let obj_path = Path::from(format!("{}/compacted/{}.sst", db_path, ulid));
+    mem_store
+        .put(&obj_path, PutPayload::from(sst_bytes))
+        .await?;
+
+    // Use SstReader to open and inspect the SST
+    let reader = SstReader::new(db_path, mem_store, None, None);
+    let sst_file = reader.open(ulid).await?;
+
+    // Print SST info
+    let info = sst_file.info();
+    println!("\n=== SST Info ===");
+    println!("{:?}", info);
+
+    // Print stats
+    match sst_file.stats().await? {
+        Some(stats) => {
+            println!("\n=== SST Stats ===");
+            println!("{:#?}", stats);
+        }
+        None => println!("\n=== No stats available ==="),
+    }
+
+    // Print index
+    let index = sst_file.index().await?;
+    println!("\n=== SST Index ({} blocks) ===", index.len());
+    for (i, (offset, first_key)) in index.iter().enumerate() {
+        let key_str = String::from_utf8_lossy(first_key);
+        println!("  Block {}: offset={}, first_key={:?}", i, offset, key_str);
+    }
+
+    // Print all row entries from all blocks
+    println!("\n=== Row Entries ===");
+    for block_idx in 0..index.len() {
+        let rows = sst_file.read_block(block_idx).await?;
+        for row in &rows {
+            println!("{:?}", row);
+        }
+    }
+
     Ok(())
 }

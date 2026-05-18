@@ -3133,6 +3133,7 @@ dependencies = [
 name = "slatedb-cli"
 version = "0.13.0"
 dependencies = [
+ "bytes",
  "chrono",
  "clap",
  "humantime",

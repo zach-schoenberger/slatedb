@@ -165,6 +165,21 @@ pub(crate) enum CliCommands {
         round: FindOption,
     },
 
+    /// Reads a locally-cached SST file (from the cached_object_store disk cache) and dumps its contents.
+    ReadLocalSst {
+        /// Path to the cached object store root folder on the local filesystem
+        #[arg(long)]
+        cache_dir: String,
+
+        /// The ULID of the compacted SST to read (e.g. "01J79C21YKR31J2BS1EFXJZ7MR")
+        #[arg(long)]
+        sst_id: String,
+
+        /// Part size in bytes used by the cache (default: 4194304 = 4MB)
+        #[arg(long, default_value = "4194304")]
+        part_size: usize,
+    },
+
     /// Submit a compaction request.
     #[command(group(
         ArgGroup::new("compaction_request")
