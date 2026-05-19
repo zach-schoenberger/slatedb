@@ -6386,6 +6386,7 @@ mod tests {
         );
         let (write_tx, _write_rx) = SafeSender::unbounded_channel(status_manager.result_reader());
         let memtable_flusher = Arc::new(MemtableFlusher::new(&status_manager));
+        let write_buffer_manager = WriteBufferManager::new(settings.max_unflushed_bytes);
         let inner = DbInner::new(
             settings,
             system_clock,
@@ -6399,6 +6400,7 @@ mod tests {
             None,
             status_manager,
             None,
+            write_buffer_manager,
         )
         .await
         .unwrap();

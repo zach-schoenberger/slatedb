@@ -3,7 +3,7 @@ use bytes::Buf;
 use chrono::{TimeZone, Utc};
 use object_store::memory::InMemory;
 use object_store::path::Path;
-use object_store::{ObjectStore, PutPayload};
+use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
 use slatedb::admin::{self, Admin, AdminBuilder};
 use slatedb::compactor::{
     CompactionRequest, CompactionSchedulerSupplier, SizeTieredCompactionSchedulerSupplier,
