@@ -165,17 +165,17 @@ pub(crate) enum CliCommands {
         round: FindOption,
     },
 
-    /// Reads a locally-cached SST file (from the cached_object_store disk cache) and dumps its contents.
+    /// Reads a locally-cached SST file (from the cached_object_store disk cache) and
+    /// validates all checksums, reporting which part file and byte offset is corrupted.
     ReadLocalSst {
-        /// Path to the cached object store root folder on the local filesystem
+        /// Direct path to the SST cache folder on the local filesystem.
+        /// This is the directory containing `_head` and `_part*` files.
+        /// Example: /mnt/cache/my-db/compacted/01KRTAT2C8QPNR6D01PF2CQKM0.sst
         #[arg(long)]
-        cache_dir: String,
+        sst_dir: String,
 
-        /// The ULID of the compacted SST to read (e.g. "01J79C21YKR31J2BS1EFXJZ7MR")
-        #[arg(long)]
-        sst_id: String,
-
-        /// Part size in bytes used by the cache (default: 4194304 = 4MB)
+        /// Part size in bytes used by the cache (default: 4194304 = 4MB).
+        /// Must match what the DB was configured with (ObjectStoreCacheOptions.part_size_bytes).
         #[arg(long, default_value = "4194304")]
         part_size: usize,
     },

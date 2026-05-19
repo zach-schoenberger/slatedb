@@ -36,6 +36,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .init();
 
     let args: CliArgs = parse_args();
+
+    // Handle commands that don't need a remote object store connection
+    if let CliCommands::ReadLocalSst { sst_dir, part_size } = &args.command {
+        return exec_read_local_sst(sst_dir, *part_size)
+            .await
+            .map_err(Into::into);
+    }
+
     let path = Path::from(args.path.as_str());
     let object_store = admin::load_object_store_from_env(args.env_file)?;
     let cancellation_token = CancellationToken::new();
@@ -91,11 +99,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         CliCommands::TsToSeq { ts_secs, round } => {
             exec_ts_to_seq(&admin, ts_secs, matches!(round, FindOption::RoundUp)).await?
         }
-        CliCommands::ReadLocalSst {
-            cache_dir,
-            sst_id,
-            part_size,
-        } => exec_read_local_sst(&args.path, &cache_dir, &sst_id, part_size).await?,
+        CliCommands::ReadLocalSst { .. } => unreachable!("handled above"),
     }
 
     Ok(())
@@ -399,17 +403,18 @@ fn offset_to_part_info(
     (part_number, filename, offset_within_part)
 }
 
-async fn exec_read_local_sst(
-    db_path: &str,
-    cache_dir: &str,
-    sst_id: &str,
-    part_size: usize,
-) -> Result<(), Box<dyn Error>> {
-    let ulid = Ulid::from_string(sst_id)?;
+async fn exec_read_local_sst(sst_dir: &str, part_size: usize) -> Result<(), Box<dyn Error>> {
+    let sst_cache_folder = PathBuf::from(sst_dir);
 
-    // Construct the path to the SST's cache folder
-    let sst_relative_path = format!("{}/compacted/{}.sst", db_path, ulid);
-    let sst_cache_folder = PathBuf::from(cache_dir).join(&sst_relative_path);
+    // Validate the directory exists
+    if !sst_cache_folder.is_dir() {
+        return Err(format!(
+            "SST directory does not exist or is not a directory: {}\n\
+             This should be the folder containing _head and _part* files.",
+            sst_cache_folder.display()
+        )
+        .into());
+    }
 
     // Determine part size name for filenames
     let part_size_name = if part_size.is_multiple_of(1024 * 1024) {
@@ -418,23 +423,68 @@ async fn exec_read_local_sst(
         format!("{}kb", part_size / 1024)
     };
 
-    // Read the _head file to determine total size
+    // Read the _head file to determine total size and object store location
     let head_path = sst_cache_folder.join("_head");
     let head_content = std::fs::read_to_string(&head_path).map_err(|e| {
         format!(
-            "Failed to read _head file at {}: {}",
+            "Failed to read _head file at {}:\n  {}\n\
+             The _head file should be inside the SST cache folder.\n\
+             Directory contents: {}",
             head_path.display(),
-            e
+            e,
+            list_dir_contents(&sst_cache_folder),
         )
     })?;
-    let head: serde_json::Value = serde_json::from_str(&head_content)?;
-    let total_size = head["size"]
-        .as_u64()
-        .ok_or("missing 'size' in _head JSON")? as usize;
+    let head: serde_json::Value = serde_json::from_str(&head_content).map_err(|e| {
+        format!(
+            "Failed to parse _head JSON at {}:\n  {}\n\
+             Content (first 200 chars): {:?}",
+            head_path.display(),
+            e,
+            &head_content[..head_content.len().min(200)]
+        )
+    })?;
+    let total_size = head["size"].as_u64().ok_or_else(|| {
+        format!(
+            "Missing 'size' field in _head JSON.\n  Full content: {}",
+            head_content
+        )
+    })? as usize;
+    let location = head["location"]
+        .as_str()
+        .ok_or_else(|| {
+            format!(
+                "Missing 'location' field in _head JSON.\n  Full content: {}",
+                head_content
+            )
+        })?
+        .to_string();
+
+    // Derive the ULID from the location path (e.g. "my-db/compacted/01KRTAT2C8QPNR6D01PF2CQKM0.sst")
+    let sst_filename = location
+        .rsplit('/')
+        .next()
+        .ok_or_else(|| format!("Cannot parse SST filename from location: {:?}", location))?;
+    let ulid_str = sst_filename.strip_suffix(".sst").unwrap_or(sst_filename);
+    let ulid = Ulid::from_string(ulid_str).map_err(|e| {
+        format!(
+            "Cannot parse ULID from SST filename {:?} (extracted {:?}): {}\n\
+             Location from _head: {:?}",
+            sst_filename, ulid_str, e, location
+        )
+    })?;
+
+    // Derive the db_path (the root path prefix before "compacted/<id>.sst")
+    let db_path = location
+        .strip_suffix(&format!("compacted/{}.sst", ulid))
+        .map(|p| p.trim_end_matches('/'))
+        .unwrap_or("");
 
     println!("=== Local SST Reader (Corruption Debugger) ===");
-    println!("SST ID: {}", ulid);
-    println!("Cache folder: {}", sst_cache_folder.display());
+    println!("SST directory: {}", sst_cache_folder.display());
+    println!("SST ID (ULID): {}", ulid);
+    println!("Object store location: {:?}", location);
+    println!("Derived DB path: {:?}", db_path);
     println!("Expected total size: {} bytes", total_size);
     println!("Part size: {} bytes ({})", part_size, part_size_name);
     println!();
@@ -460,8 +510,29 @@ async fn exec_read_local_sst(
                 part_number += 1;
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
-            Err(e) => return Err(Box::new(e)),
+            Err(e) => {
+                return Err(format!(
+                    "Error reading part file {}:\n  {}",
+                    sst_cache_folder
+                        .join(&format!("_part{}-{:09}", part_size_name, part_number))
+                        .display(),
+                    e
+                )
+                .into());
+            }
         }
+    }
+
+    if part_mappings.is_empty() {
+        return Err(format!(
+            "No part files found in {}\n\
+             Expected files matching pattern: _part{}-*\n\
+             Directory contents: {}",
+            sst_cache_folder.display(),
+            part_size_name,
+            list_dir_contents(&sst_cache_folder),
+        )
+        .into());
     }
 
     println!("=== Part File Mapping ===");
@@ -478,16 +549,18 @@ async fn exec_read_local_sst(
 
     if assembled.len() < total_size {
         eprintln!(
-            "ERROR: assembled {} bytes but _head says size is {}. Parts are MISSING.",
+            "ERROR: Assembled {} bytes from {} part files, but _head says size is {} bytes.",
             assembled.len(),
+            part_mappings.len(),
             total_size
         );
         eprintln!(
-            "  Expected {} parts, found {}.",
+            "  Expected at least {} parts of {} bytes each.",
             (total_size + part_size - 1) / part_size,
-            part_mappings.len()
+            part_size
         );
-        // Continue with what we have for partial analysis
+        eprintln!("  PARTS ARE MISSING. Continuing with partial data...");
+        eprintln!();
     }
 
     // Truncate to actual SST size
@@ -497,11 +570,13 @@ async fn exec_read_local_sst(
     // --- Parse the SST footer (last 10 bytes) ---
     const NUM_FOOTER_BYTES: usize = 10;
     if sst_bytes.len() <= NUM_FOOTER_BYTES {
-        eprintln!(
-            "ERROR: SST data is too small ({} bytes) to contain a valid footer.",
-            sst_bytes.len()
-        );
-        return Ok(());
+        return Err(format!(
+            "SST data is too small ({} bytes) to contain a valid footer (need > {} bytes).\n\
+             The file is either truncated or not a valid SST.",
+            sst_bytes.len(),
+            NUM_FOOTER_BYTES
+        )
+        .into());
     }
 
     let footer_start = sst_bytes.len() - NUM_FOOTER_BYTES;
@@ -521,18 +596,19 @@ async fn exec_read_local_sst(
     {
         let (_pn, pf, off_in_part) = offset_to_part_info(footer_start, part_size, &part_size_name);
         println!(
-            "  Footer located in: {} at offset {} within part",
+            "  Footer located in: {} at byte {} within that part",
             pf, off_in_part
         );
     }
     println!();
 
     if metadata_offset >= footer_start {
-        eprintln!(
-            "ERROR: metadata_offset ({}) >= footer_start ({}). SST is corrupted or truncated.",
+        return Err(format!(
+            "CORRUPTION: metadata_offset ({}) >= footer_start ({}).\n\
+             The footer is invalid — the file may be truncated or completely corrupted.",
             metadata_offset, footer_start
-        );
-        return Ok(());
+        )
+        .into());
     }
 
     // --- Validate info/metadata block ---
@@ -546,7 +622,10 @@ async fn exec_read_local_sst(
     {
         let (_pn, pf, off_in_part) =
             offset_to_part_info(metadata_offset, part_size, &part_size_name);
-        println!("  Starts in: {} at offset {} within part", pf, off_in_part);
+        println!(
+            "  Starts in: {} at byte {} within that part",
+            pf, off_in_part
+        );
     }
     match validate_checksum_at(info_region, "Info/Metadata", metadata_offset) {
         Ok(()) => println!("  Checksum: OK"),
@@ -556,7 +635,7 @@ async fn exec_read_local_sst(
             let (_pn, pf, off_in_part) =
                 offset_to_part_info(checksum_sst_offset, part_size, &part_size_name);
             eprintln!(
-                "  Checksum bytes located in: {} at offset {} within part",
+                "  Checksum bytes located in: {} at byte {} within that part",
                 pf, off_in_part
             );
         }
@@ -565,7 +644,7 @@ async fn exec_read_local_sst(
 
     // Now use SstReader to parse the SST for structural info
     let mem_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-    let obj_path = Path::from(format!("{}/compacted/{}.sst", db_path, ulid));
+    let obj_path = Path::from(location.as_str());
     mem_store
         .put(&obj_path, PutPayload::from(sst_bytes.clone()))
         .await?;
@@ -574,9 +653,13 @@ async fn exec_read_local_sst(
     let sst_file = match reader.open(ulid).await {
         Ok(f) => f,
         Err(e) => {
-            eprintln!("ERROR: Failed to open SST via SstReader: {}", e);
-            eprintln!("  The info/metadata block may be corrupted (see above).");
-            return Ok(());
+            return Err(format!(
+                "Failed to open SST via SstReader: {}\n\
+                 The info/metadata block is likely corrupted (see above).\n\
+                 Location used: {:?}, DB path: {:?}",
+                e, location, db_path
+            )
+            .into());
         }
     };
 
@@ -608,7 +691,10 @@ async fn exec_read_local_sst(
         if f_end <= sst_bytes.len() {
             let filter_region = &sst_bytes[f_start..f_end];
             let (_, pf, off_in_part) = offset_to_part_info(f_start, part_size, &part_size_name);
-            println!("  Starts in: {} at offset {} within part", pf, off_in_part);
+            println!(
+                "  Starts in: {} at byte {} within that part",
+                pf, off_in_part
+            );
             match validate_checksum_at(filter_region, "Filter", f_start) {
                 Ok(()) => println!("  Checksum: OK"),
                 Err(e) => {
@@ -616,14 +702,14 @@ async fn exec_read_local_sst(
                     let cs_off = f_start + filter_region.len() - 4;
                     let (_, pf2, off2) = offset_to_part_info(cs_off, part_size, &part_size_name);
                     eprintln!(
-                        "  Checksum bytes located in: {} at offset {} within part",
+                        "  Checksum bytes located in: {} at byte {} within that part",
                         pf2, off2
                     );
                 }
             }
         } else {
             eprintln!(
-                "  ERROR: filter block extends beyond SST data (need {} bytes, have {})",
+                "  ERROR: filter block extends beyond SST data (need offset {} but file is only {} bytes)",
                 f_end,
                 sst_bytes.len()
             );
@@ -642,7 +728,10 @@ async fn exec_read_local_sst(
         if i_end <= sst_bytes.len() {
             let index_region = &sst_bytes[i_start..i_end];
             let (_, pf, off_in_part) = offset_to_part_info(i_start, part_size, &part_size_name);
-            println!("  Starts in: {} at offset {} within part", pf, off_in_part);
+            println!(
+                "  Starts in: {} at byte {} within that part",
+                pf, off_in_part
+            );
             match validate_checksum_at(index_region, "Index", i_start) {
                 Ok(()) => println!("  Checksum: OK"),
                 Err(e) => {
@@ -650,14 +739,14 @@ async fn exec_read_local_sst(
                     let cs_off = i_start + index_region.len() - 4;
                     let (_, pf2, off2) = offset_to_part_info(cs_off, part_size, &part_size_name);
                     eprintln!(
-                        "  Checksum bytes located in: {} at offset {} within part",
+                        "  Checksum bytes located in: {} at byte {} within that part",
                         pf2, off2
                     );
                 }
             }
         } else {
             eprintln!(
-                "  ERROR: index block extends beyond SST data (need {} bytes, have {})",
+                "  ERROR: index block extends beyond SST data (need offset {} but file is only {} bytes)",
                 i_end,
                 sst_bytes.len()
             );
@@ -676,7 +765,10 @@ async fn exec_read_local_sst(
         if s_end <= sst_bytes.len() {
             let stats_region = &sst_bytes[s_start..s_end];
             let (_, pf, off_in_part) = offset_to_part_info(s_start, part_size, &part_size_name);
-            println!("  Starts in: {} at offset {} within part", pf, off_in_part);
+            println!(
+                "  Starts in: {} at byte {} within that part",
+                pf, off_in_part
+            );
             match validate_checksum_at(stats_region, "Stats", s_start) {
                 Ok(()) => println!("  Checksum: OK"),
                 Err(e) => {
@@ -684,14 +776,14 @@ async fn exec_read_local_sst(
                     let cs_off = s_start + stats_region.len() - 4;
                     let (_, pf2, off2) = offset_to_part_info(cs_off, part_size, &part_size_name);
                     eprintln!(
-                        "  Checksum bytes located in: {} at offset {} within part",
+                        "  Checksum bytes located in: {} at byte {} within that part",
                         pf2, off2
                     );
                 }
             }
         } else {
             eprintln!(
-                "  ERROR: stats block extends beyond SST data (need {} bytes, have {})",
+                "  ERROR: stats block extends beyond SST data (need offset {} but file is only {} bytes)",
                 s_end,
                 sst_bytes.len()
             );
@@ -754,11 +846,11 @@ async fn exec_read_local_sst(
                 );
                 eprintln!("    {}", e);
                 eprintln!(
-                    "    Block starts in: {} at offset {} within part",
+                    "    Block starts in file: {} at byte {} within that part",
                     pf_start, off_start
                 );
                 eprintln!(
-                    "    Checksum bytes in: {} at offset {} within part",
+                    "    Checksum bytes in file: {} at byte {} within that part",
                     pf_cs, off_cs
                 );
             }
@@ -781,14 +873,14 @@ async fn exec_read_local_sst(
         );
     }
 
-    // Try to read rows from valid blocks to show which specific block decoding fails
+    // Try to read/decode rows from blocks to identify decode failures beyond checksum
     if corruption_count > 0 {
         println!();
-        println!("=== Per-Block Read Attempt ===");
+        println!("=== Per-Block Decode Attempt ===");
         for block_idx in 0..index.len() {
             match sst_file.read_block(block_idx).await {
                 Ok(rows) => {
-                    println!("  Block {:4}: read OK ({} rows)", block_idx, rows.len());
+                    println!("  Block {:4}: decode OK ({} rows)", block_idx, rows.len());
                 }
                 Err(e) => {
                     let block_start = index[block_idx].0 as usize;
@@ -800,7 +892,7 @@ async fn exec_read_local_sst(
                     let (_, pf, off_in_part) =
                         offset_to_part_info(block_start, part_size, &part_size_name);
                     eprintln!(
-                        "  Block {:4}: READ FAILED at SST offset {}..{} (in {} at part-offset {}) -- {}",
+                        "  Block {:4}: DECODE FAILED at SST offset {}..{} (in file {} at byte {}) -- {}",
                         block_idx, block_start, block_end, pf, off_in_part, e
                     );
                 }
@@ -809,4 +901,23 @@ async fn exec_read_local_sst(
     }
 
     Ok(())
+}
+
+/// List directory contents for error messages.
+fn list_dir_contents(dir: &std::path::Path) -> String {
+    match std::fs::read_dir(dir) {
+        Ok(entries) => {
+            let mut names: Vec<String> = entries
+                .filter_map(|e| e.ok())
+                .map(|e| e.file_name().to_string_lossy().to_string())
+                .collect();
+            names.sort();
+            if names.is_empty() {
+                "(empty directory)".to_string()
+            } else {
+                names.join(", ")
+            }
+        }
+        Err(e) => format!("(cannot list: {})", e),
+    }
 }
