@@ -1,5 +1,5 @@
 use crate::args::{parse_args, CliArgs, CliCommands, GcResource, GcSchedule};
-use bytes::{Buf, BytesMut};
+use bytes::Buf;
 use chrono::{TimeZone, Utc};
 use object_store::memory::InMemory;
 use object_store::path::Path;
@@ -403,6 +403,32 @@ fn offset_to_part_info(
     (part_number, filename, offset_within_part)
 }
 
+/// Check if a byte range is fully covered by the cached parts.
+fn is_range_fully_cached(
+    range_start: usize,
+    range_end: usize,
+    covered_ranges: &[std::ops::Range<usize>],
+) -> bool {
+    // For each byte in the range, check if it's covered by at least one cached part.
+    // Since parts are non-overlapping and sorted, we can be smarter, but for correctness:
+    let mut pos = range_start;
+    while pos < range_end {
+        let mut found = false;
+        for cr in covered_ranges {
+            if cr.start <= pos && pos < cr.end {
+                // Jump to end of this covered range
+                pos = cr.end;
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            return false;
+        }
+    }
+    true
+}
+
 async fn exec_read_local_sst(sst_dir: &str, part_size: usize) -> Result<(), Box<dyn Error>> {
     let sst_cache_folder = PathBuf::from(sst_dir);
 
@@ -489,53 +515,88 @@ async fn exec_read_local_sst(sst_dir: &str, part_size: usize) -> Result<(), Box<
     println!("Part size: {} bytes ({})", part_size, part_size_name);
     println!();
 
-    // Read all parts in order, tracking which file contributes which bytes
-    let mut assembled = BytesMut::with_capacity(total_size);
-    let mut part_mappings: Vec<PartFileMapping> = Vec::new();
-    let mut part_number = 0u64;
-    loop {
-        let part_filename = format!("_part{}-{:09}", part_size_name, part_number);
-        let part_path = sst_cache_folder.join(&part_filename);
-        match std::fs::read(&part_path) {
-            Ok(data) => {
-                let start = assembled.len();
-                assembled.extend_from_slice(&data);
-                let end = assembled.len();
-                part_mappings.push(PartFileMapping {
-                    part_number,
-                    filename: part_filename,
-                    path: part_path,
-                    sst_byte_range: start..end,
-                });
-                part_number += 1;
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
-            Err(e) => {
-                return Err(format!(
-                    "Error reading part file {}:\n  {}",
-                    sst_cache_folder
-                        .join(&format!("_part{}-{:09}", part_size_name, part_number))
-                        .display(),
-                    e
-                )
-                .into());
+    // Scan directory for all _part* files and parse their part numbers
+    let part_prefix = format!("_part{}-", part_size_name);
+    let mut found_parts: Vec<(u64, String, PathBuf)> = Vec::new();
+    for entry in std::fs::read_dir(&sst_cache_folder).map_err(|e| {
+        format!(
+            "Cannot read SST cache directory {}:\n  {}",
+            sst_cache_folder.display(),
+            e
+        )
+    })? {
+        let entry = entry.map_err(|e| format!("Error reading directory entry: {}", e))?;
+        let fname = entry.file_name().to_string_lossy().to_string();
+        if let Some(suffix) = fname.strip_prefix(&part_prefix) {
+            if let Ok(num) = suffix.parse::<u64>() {
+                found_parts.push((num, fname, entry.path()));
             }
         }
     }
+    found_parts.sort_by_key(|(num, _, _)| *num);
 
-    if part_mappings.is_empty() {
+    if found_parts.is_empty() {
         return Err(format!(
             "No part files found in {}\n\
-             Expected files matching pattern: _part{}-*\n\
+             Expected files matching pattern: {}<number>\n\
              Directory contents: {}",
             sst_cache_folder.display(),
-            part_size_name,
+            part_prefix,
             list_dir_contents(&sst_cache_folder),
         )
         .into());
     }
 
-    println!("=== Part File Mapping ===");
+    let total_parts_expected = (total_size + part_size - 1) / part_size;
+    let max_part_num = found_parts.last().map(|(n, _, _)| *n).unwrap_or(0);
+
+    println!("=== Cache Coverage ===");
+    println!(
+        "  Total parts expected: {} (for {} byte file with {} byte parts)",
+        total_parts_expected, total_size, part_size
+    );
+    println!("  Parts cached: {}", found_parts.len());
+    println!(
+        "  Part number range: {}..={}",
+        found_parts.first().map(|(n, _, _)| *n).unwrap_or(0),
+        max_part_num
+    );
+    println!(
+        "  Coverage: {:.1}%",
+        (found_parts.len() as f64 / total_parts_expected as f64) * 100.0
+    );
+    println!();
+
+    // Allocate full-size buffer filled with zeros, then place parts at their correct offsets
+    // Track which byte ranges are covered by actual cached data
+    let mut assembled = vec![0u8; total_size];
+    let mut covered_ranges: Vec<std::ops::Range<usize>> = Vec::new();
+    let mut part_mappings: Vec<PartFileMapping> = Vec::new();
+
+    for (part_num, filename, path) in &found_parts {
+        let data = std::fs::read(path)
+            .map_err(|e| format!("Error reading part file {}:\n  {}", path.display(), e))?;
+        let start = (*part_num as usize) * part_size;
+        let end = (start + data.len()).min(total_size);
+        if start >= total_size {
+            eprintln!(
+                "  WARNING: part {} starts at offset {} which is beyond file size {}",
+                filename, start, total_size
+            );
+            continue;
+        }
+        let copy_len = end - start;
+        assembled[start..start + copy_len].copy_from_slice(&data[..copy_len]);
+        covered_ranges.push(start..end);
+        part_mappings.push(PartFileMapping {
+            part_number: *part_num,
+            filename: filename.clone(),
+            path: path.clone(),
+            sst_byte_range: start..end,
+        });
+    }
+
+    println!("=== Part File Mapping (cached parts) ===");
     for pm in &part_mappings {
         println!(
             "  {} -> SST bytes [{}..{}) ({} bytes)",
@@ -547,25 +608,7 @@ async fn exec_read_local_sst(sst_dir: &str, part_size: usize) -> Result<(), Box<
     }
     println!();
 
-    if assembled.len() < total_size {
-        eprintln!(
-            "ERROR: Assembled {} bytes from {} part files, but _head says size is {} bytes.",
-            assembled.len(),
-            part_mappings.len(),
-            total_size
-        );
-        eprintln!(
-            "  Expected at least {} parts of {} bytes each.",
-            (total_size + part_size - 1) / part_size,
-            part_size
-        );
-        eprintln!("  PARTS ARE MISSING. Continuing with partial data...");
-        eprintln!();
-    }
-
-    // Truncate to actual SST size
-    let actual_len = total_size.min(assembled.len());
-    let sst_bytes = assembled.freeze().slice(..actual_len);
+    let sst_bytes = bytes::Bytes::from(assembled);
 
     // --- Parse the SST footer (last 10 bytes) ---
     const NUM_FOOTER_BYTES: usize = 10;
@@ -688,7 +731,14 @@ async fn exec_read_local_sst(sst_dir: &str, part_size: usize) -> Result<(), Box<
             "=== Filter Block (offset {}..{}, {} bytes) ===",
             f_start, f_end, info.filter_len
         );
-        if f_end <= sst_bytes.len() {
+        if f_end > sst_bytes.len() {
+            eprintln!(
+                "  ERROR: filter block extends beyond SST data (need offset {} but file is only {} bytes)",
+                f_end, sst_bytes.len()
+            );
+        } else if !is_range_fully_cached(f_start, f_end, &covered_ranges) {
+            println!("  SKIPPED: not fully cached (some parts missing in this range)");
+        } else {
             let filter_region = &sst_bytes[f_start..f_end];
             let (_, pf, off_in_part) = offset_to_part_info(f_start, part_size, &part_size_name);
             println!(
@@ -707,12 +757,6 @@ async fn exec_read_local_sst(sst_dir: &str, part_size: usize) -> Result<(), Box<
                     );
                 }
             }
-        } else {
-            eprintln!(
-                "  ERROR: filter block extends beyond SST data (need offset {} but file is only {} bytes)",
-                f_end,
-                sst_bytes.len()
-            );
         }
         println!();
     }
@@ -725,7 +769,14 @@ async fn exec_read_local_sst(sst_dir: &str, part_size: usize) -> Result<(), Box<
             "=== Index Block (offset {}..{}, {} bytes) ===",
             i_start, i_end, info.index_len
         );
-        if i_end <= sst_bytes.len() {
+        if i_end > sst_bytes.len() {
+            eprintln!(
+                "  ERROR: index block extends beyond SST data (need offset {} but file is only {} bytes)",
+                i_end, sst_bytes.len()
+            );
+        } else if !is_range_fully_cached(i_start, i_end, &covered_ranges) {
+            println!("  SKIPPED: not fully cached (some parts missing in this range)");
+        } else {
             let index_region = &sst_bytes[i_start..i_end];
             let (_, pf, off_in_part) = offset_to_part_info(i_start, part_size, &part_size_name);
             println!(
@@ -744,12 +795,6 @@ async fn exec_read_local_sst(sst_dir: &str, part_size: usize) -> Result<(), Box<
                     );
                 }
             }
-        } else {
-            eprintln!(
-                "  ERROR: index block extends beyond SST data (need offset {} but file is only {} bytes)",
-                i_end,
-                sst_bytes.len()
-            );
         }
         println!();
     }
@@ -762,7 +807,14 @@ async fn exec_read_local_sst(sst_dir: &str, part_size: usize) -> Result<(), Box<
             "=== Stats Block (offset {}..{}, {} bytes) ===",
             s_start, s_end, info.stats_len
         );
-        if s_end <= sst_bytes.len() {
+        if s_end > sst_bytes.len() {
+            eprintln!(
+                "  ERROR: stats block extends beyond SST data (need offset {} but file is only {} bytes)",
+                s_end, sst_bytes.len()
+            );
+        } else if !is_range_fully_cached(s_start, s_end, &covered_ranges) {
+            println!("  SKIPPED: not fully cached (some parts missing in this range)");
+        } else {
             let stats_region = &sst_bytes[s_start..s_end];
             let (_, pf, off_in_part) = offset_to_part_info(s_start, part_size, &part_size_name);
             println!(
@@ -781,12 +833,6 @@ async fn exec_read_local_sst(sst_dir: &str, part_size: usize) -> Result<(), Box<
                     );
                 }
             }
-        } else {
-            eprintln!(
-                "  ERROR: stats block extends beyond SST data (need offset {} but file is only {} bytes)",
-                s_end,
-                sst_bytes.len()
-            );
         }
         println!();
     }
@@ -803,6 +849,7 @@ async fn exec_read_local_sst(sst_dir: &str, part_size: usize) -> Result<(), Box<
 
     println!("=== Data Blocks ({} total) ===", index.len());
     let mut corruption_count = 0usize;
+    let mut skipped_count = 0usize;
     for (block_idx, (block_offset, first_key)) in index.iter().enumerate() {
         // Determine block end: next block's offset, or filter_offset for the last block
         let block_start = *block_offset as usize;
@@ -821,6 +868,12 @@ async fn exec_read_local_sst(sst_dir: &str, part_size: usize) -> Result<(), Box<
                 block_idx, block_start, block_end, block_size, key_preview
             );
             corruption_count += 1;
+            continue;
+        }
+
+        if !is_range_fully_cached(block_start, block_end, &covered_ranges) {
+            skipped_count += 1;
+            // Only print skipped blocks at debug level (too noisy for sparse caches)
             continue;
         }
 
@@ -859,17 +912,21 @@ async fn exec_read_local_sst(sst_dir: &str, part_size: usize) -> Result<(), Box<
     println!();
 
     // --- Summary ---
+    let validated_count = index.len() - skipped_count;
     println!("=== Validation Summary ===");
-    if corruption_count == 0 {
-        println!(
-            "  All {} data blocks passed checksum validation.",
-            index.len()
-        );
-    } else {
+    println!(
+        "  Total blocks: {}, Validated: {}, Skipped (not cached): {}, Corrupted: {}",
+        index.len(),
+        validated_count,
+        skipped_count,
+        corruption_count
+    );
+    if corruption_count == 0 && validated_count > 0 {
+        println!("  All validated blocks passed checksum verification.");
+    } else if corruption_count > 0 {
         eprintln!(
-            "  {} of {} data blocks FAILED checksum validation.",
-            corruption_count,
-            index.len()
+            "  {} of {} validated data blocks FAILED checksum validation.",
+            corruption_count, validated_count
         );
     }
 
