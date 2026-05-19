@@ -3136,6 +3136,7 @@ dependencies = [
  "bytes",
  "chrono",
  "clap",
+ "crc32fast",
  "humantime",
  "object_store",
  "rstest",
