@@ -1133,6 +1133,14 @@ pub struct CompactorOptions {
     #[serde(deserialize_with = "deserialize_duration")]
     #[serde(serialize_with = "serialize_duration")]
     pub commit_compacted_interval: Duration,
+
+    /// How long the coordinator will wait without a heartbeat before reclaiming
+    /// a `Running` compaction from its worker and resetting it to `Submitted`.
+    /// A worker that crashes or stalls will have its jobs reclaimed after this
+    /// timeout. Default is 30 seconds.
+    #[serde(deserialize_with = "deserialize_duration")]
+    #[serde(serialize_with = "serialize_duration")]
+    pub worker_heartbeat_timeout: Duration,
 }
 
 /// Default options for the compactor. Currently, only a
@@ -1149,6 +1157,7 @@ impl Default for CompactorOptions {
             worker: Some(CompactionWorkerOptions::default()),
             metric_level: None,
             commit_compacted_interval: Duration::from_secs(1),
+            worker_heartbeat_timeout: Duration::from_secs(30),
         }
     }
 }
@@ -1167,6 +1176,7 @@ impl std::fmt::Debug for CompactorOptions {
             .field("worker", &self.worker)
             .field("metric_level", &self.metric_level)
             .field("commit_compacted_interval", &self.commit_compacted_interval)
+            .field("worker_heartbeat_timeout", &self.worker_heartbeat_timeout)
             .finish()
     }
 }
@@ -1210,6 +1220,37 @@ pub struct CompactionWorkerOptions {
     /// ahead of the cursor.
     pub bytes_to_fetch: usize,
 
+    /// The maximum number of subcompactions to split a single compaction into
+    /// (RFC-0028). Each subcompaction covers a disjoint sub-range of the key
+    /// space and executes concurrently with its siblings, so a single large
+    /// compaction can use multiple cores. Any value `<= 1` disables
+    /// subcompactions. The default is 4.
+    ///
+    /// The planner targets sub-ranges of
+    /// `max(total_input_bytes / max_subcompactions, max_sst_size)`, so a
+    /// compaction smaller than `max_subcompactions * max_sst_size` is split
+    /// into fewer (or zero) ranges rather than fragmented into undersized
+    /// SSTs. There is deliberately no separate minimum-size knob; the
+    /// [`max_sst_size`](CompactionWorkerOptions::max_sst_size) floor subsumes
+    /// it.
+    pub max_subcompactions: usize,
+
+    /// Write SSTables with a bloom filter if the number of keys in the SSTable
+    /// is greater than or equal to this value. Reads on small SSTables might be
+    /// faster without a bloom filter.
+    ///
+    /// Must match the writer's [`Settings::min_filter_keys`] configuration so
+    /// that SSTs rewritten by the worker carry filters consistent with those
+    /// produced by the DB.
+    pub min_filter_keys: u32,
+
+    /// The compression algorithm to use for SSTables the worker writes.
+    ///
+    /// Must match the writer's [`Settings::compression_codec`] configuration so
+    /// that SSTs rewritten by the worker are encoded consistently with those
+    /// produced by the DB.
+    pub compression_codec: Option<CompressionCodec>,
+
     /// Optional metrics reporting level for standalone compaction workers.
     /// Defaults to [`MetricLevel::default`] when unset.
     pub metric_level: Option<MetricLevel>,
@@ -1227,6 +1268,9 @@ impl Default for CompactionWorkerOptions {
             max_sst_size: 256 * 1024 * 1024,
             max_fetch_tasks: 4,
             bytes_to_fetch: 2 * 1024 * 1024,
+            max_subcompactions: 4,
+            min_filter_keys: 1000,
+            compression_codec: None,
             metric_level: None,
         }
     }

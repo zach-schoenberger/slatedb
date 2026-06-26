@@ -323,7 +323,8 @@ impl DbInner {
     ) -> WatchableOnceCellReader<Result<(), SlateDBError>> {
         let guard = self.state.read();
         let memtable = guard.memtable();
-        memtable.record_touched_segments(touched_segments);
+        self.status_manager.add_memtable_segments(&touched_segments);
+        memtable.record_touched_segments(touched_segments.clone());
         if let Some(permit) = permit.as_ref() {
             memtable.add_write_permit(permit);
         }

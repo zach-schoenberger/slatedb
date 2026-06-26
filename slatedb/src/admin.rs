@@ -8,18 +8,14 @@ use crate::compactor_state::VersionedCompactions;
 use crate::compactor_state_protocols::CompactorStateReader;
 use crate::config::{CheckpointOptions, GarbageCollectorOptions};
 use crate::db::builder::GarbageCollectorBuilder;
-use crate::dispatcher::MessageHandlerExecutor;
 use crate::error::SlateDBError;
-use crate::garbage_collector::GC_TASK_NAME;
 use crate::manifest::store::{ManifestStore, StoredManifest};
 use crate::manifest::VersionedManifest;
 use slatedb_common::clock::SystemClock;
 
-use crate::db_status::ClosedResultWriter;
 use crate::object_stores::{ObjectStoreType, ObjectStores};
 use crate::seq_tracker::FindOption;
 use crate::utils::IdGenerator;
-use crate::utils::WatchableOnceCell;
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use object_store::path::Path;
@@ -31,7 +27,6 @@ use std::env::VarError;
 use std::ops::{Bound, RangeBounds};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::runtime::Handle;
 use tokio_util::sync::CancellationToken;
 use ulid::Ulid;
 use uuid::Uuid;
@@ -303,15 +298,26 @@ impl Admin {
         Ok(())
     }
 
-    /// Run the garbage collector in the background.
+    /// Run the garbage collector in the foreground until the provided cancellation token is cancelled.
     ///
-    /// This function runs the garbage collector in a Tokio background task.
+    /// This method blocks until `cancellation_token` is cancelled, at which point it requests a
+    /// graceful shutdown and waits for the garbage collector to stop.
     ///
     /// # Arguments
     ///
-    /// * `gc_opts`: The garbage collector options.
+    /// * `cancellation_token`: Token used to request garbage collector shutdown.
     ///
-    pub async fn run_gc(&self, gc_opts: GarbageCollectorOptions) -> Result<(), crate::Error> {
+    pub async fn run_gc(&self, cancellation_token: CancellationToken) -> Result<(), crate::Error> {
+        self.run_gc_with_options(cancellation_token, GarbageCollectorOptions::default())
+            .await
+    }
+
+    /// Like [`Admin::run_gc`] but accepts explicit [`GarbageCollectorOptions`].
+    pub async fn run_gc_with_options(
+        &self,
+        cancellation_token: CancellationToken,
+        gc_opts: GarbageCollectorOptions,
+    ) -> Result<(), crate::Error> {
         let gc = GarbageCollectorBuilder::new(
             self.path.clone(),
             self.object_stores.store_of(ObjectStoreType::Main).clone(),
@@ -322,23 +328,14 @@ impl Admin {
         .with_seed(self.rand.rng().next_u64())
         .build();
 
-        let (_, rx) = async_channel::unbounded();
-        let closed_result: Arc<dyn ClosedResultWriter> = Arc::new(WatchableOnceCell::new());
-        let task_executor = MessageHandlerExecutor::new(closed_result, self.system_clock.clone());
+        gc.start()?;
 
-        task_executor
-            .add_handler(
-                GC_TASK_NAME.to_string(),
-                Box::new(gc),
-                rx,
-                &Handle::current(),
-            )
-            .map_err(Into::<crate::Error>::into)?;
-
-        task_executor
-            .join_task(GC_TASK_NAME)
-            .await
-            .map_err(Into::<crate::Error>::into)
+        tokio::select! {
+            result = gc.join() => result,
+            _ = cancellation_token.cancelled() => {
+                gc.stop().await
+            }
+        }
     }
 
     /// Run the compactor in the foreground until the provided cancellation token is cancelled.
@@ -384,24 +381,71 @@ impl Admin {
 
         let compactor = builder.build();
 
-        let mut run_task = tokio::spawn({
-            let compactor = compactor.clone();
-            async move { compactor.run().await }
-        });
+        compactor.start().await?;
 
         tokio::select! {
-            result = &mut run_task => {
-                return match result {
-                    Ok(inner) => inner,
-                    Err(join_err) => Err(crate::Error::internal("compactor task failed".to_string()).with_source(Box::new(join_err))),
-                };
-            }
+            result = compactor.join() => result,
             _ = cancellation_token.cancelled() => {
-                // fall through to shutdown logic
+                compactor.stop().await
             }
         }
+    }
 
-        compactor.stop().await
+    /// Run a standalone compaction worker in the foreground until the provided cancellation token
+    /// is cancelled.
+    ///
+    /// This method blocks until `cancellation_token` is cancelled, at which point it requests a
+    /// graceful shutdown and waits for the worker to stop, resetting any compactions it claimed
+    /// back to `Scheduled` so other workers can pick them up.
+    ///
+    /// To use compaction filters with the standalone worker, configure the `AdminBuilder` with
+    /// [`AdminBuilder::with_compaction_filter_supplier`] before building.
+    ///
+    /// # Arguments
+    ///
+    /// * `cancellation_token`: Token used to request worker shutdown.
+    pub async fn run_compaction_worker(
+        &self,
+        cancellation_token: CancellationToken,
+    ) -> Result<(), crate::Error> {
+        self.run_compaction_worker_with_options(
+            cancellation_token,
+            crate::config::CompactionWorkerOptions::default(),
+        )
+        .await
+    }
+
+    /// Like [`Admin::run_compaction_worker`] but accepts explicit
+    /// [`crate::config::CompactionWorkerOptions`].
+    pub async fn run_compaction_worker_with_options(
+        &self,
+        cancellation_token: CancellationToken,
+        options: crate::config::CompactionWorkerOptions,
+    ) -> Result<(), crate::Error> {
+        #[allow(unused_mut)]
+        let mut builder = crate::CompactionWorkerBuilder::new(
+            self.path.clone(),
+            self.object_stores.store_of(ObjectStoreType::Main).clone(),
+        )
+        .with_options(options)
+        .with_system_clock(self.system_clock.clone())
+        .with_seed(self.rand.rng().next_u64());
+
+        #[cfg(feature = "compaction_filters")]
+        if let Some(supplier) = &self.compaction_filter_supplier {
+            builder = builder.with_compaction_filter_supplier(supplier.clone());
+        }
+
+        let worker = builder.build().await?;
+
+        worker.start()?;
+
+        tokio::select! {
+            result = worker.join() => result,
+            _ = cancellation_token.cancelled() => {
+                worker.stop().await
+            }
+        }
     }
 
     /// Creates a checkpoint of the db stored in the object store at the specified path using the
@@ -683,7 +727,6 @@ fn get_env_variable(name: &str) -> Result<String, SlateDBError> {
 /// | Memory | `memory` | [load_memory] |
 /// | AWS | `aws` | [load_aws] |
 /// | Azure | `azure` | [load_azure] |
-/// | OpenDAL | `opendal` | [load_opendal] |
 pub fn load_object_store_from_env(
     env_file: Option<String>,
 ) -> Result<Arc<dyn ObjectStore>, crate::Error> {
@@ -696,8 +739,6 @@ pub fn load_object_store_from_env(
         "aws" => load_aws(),
         #[cfg(feature = "azure")]
         "azure" => load_azure(),
-        #[cfg(feature = "opendal")]
-        "opendal" => load_opendal(),
         invalid_value => Err(SlateDBError::InvalidEnvironmentVariable {
             key: "CLOUD_PROVIDER".to_string(),
             value: Some(invalid_value.to_string()),
@@ -759,65 +800,12 @@ pub fn load_azure() -> Result<Arc<dyn ObjectStore>, crate::Error> {
     })?) as Arc<dyn ObjectStore>)
 }
 
-/// Loads an OpenDAL Object store instance.
-///
-/// | Env Variable | Doc | Required |
-/// |--------------|-----|----------|
-/// | OPENDAL_SCHEME | The OpenDAL scheme to use | Yes |
-/// | OPENDAL_* | The OpenDAL configuration | Yes |
-/// full list of schemes: https://docs.rs/opendal/latest/opendal/services/index.html
-/// for example, to use s3-compatible storage, you can set:
-/// ```bash
-/// OPENDAL_SCHEME=s3
-/// OPENDAL_ENDPOINT=http://localhost:9000
-/// OPENDAL_ACCESS_KEY_ID=minioadmin
-/// OPENDAL_SECRET_ACCESS_KEY=minioadmin
-/// OPENDAL_BUCKET=test
-/// OPENDAL_REGION=us-east-1
-/// OPENDAL_ROOT=/tmp
-/// ```
-/// full list of config: https://docs.rs/opendal/latest/opendal/services/s3/config/struct.S3Config.html
-/// for example, to use oss, you can set:
-/// ```bash
-/// OPENDAL_SCHEME=oss
-/// OPENDAL_ENDPOINT=http://oss-cn-shanghai.aliyuncs.com
-/// OPENDAL_ACCESS_KEY_ID=your-access-key-id
-/// OPENDAL_ACCESS_KEY_SECRET=your-access-key-secret
-/// OPENDAL_BUCKET=your-bucket-name
-/// OPENDAL_ROOT=/your/root/path
-/// ```
-/// full list of config: https://docs.rs/opendal/latest/opendal/services/oss/config/struct.OssConfig.html
-#[cfg(feature = "opendal")]
-pub fn load_opendal() -> Result<Arc<dyn ObjectStore>, crate::Error> {
-    use opendal::Operator;
-    use std::collections::HashMap;
-
-    let scheme_value = get_env_variable("OPENDAL_SCHEME")?;
-    let iter = env::vars()
-        .filter_map(|(k, v)| k.strip_prefix("OPENDAL_").map(|k| (k.to_lowercase(), v)))
-        .collect::<HashMap<String, String>>();
-
-    let op = Operator::via_iter(&scheme_value, iter).map_err(|error| {
-        if error.kind() == opendal::ErrorKind::Unsupported {
-            SlateDBError::InvalidEnvironmentVariable {
-                key: "OPENDAL_SCHEME".to_string(),
-                value: Some(scheme_value.clone()),
-            }
-        } else {
-            SlateDBError::ObjectStoreError(Arc::new(object_store::Error::Generic {
-                store: "OpenDAL",
-                source: Box::new(error),
-            }))
-        }
-    })?;
-    Ok(Arc::new(object_store_opendal::OpendalStore::new(op)) as Arc<dyn ObjectStore>)
-}
-
 #[cfg(test)]
 mod tests {
     use crate::admin::{load_object_store_from_env, AdminBuilder};
     use crate::compactions_store::{CompactionsStore, StoredCompactions};
     use crate::compactor_state::{Compaction, CompactionSpec, CompactionStatus, SourceId};
+    use crate::config::{CompactionWorkerOptions, CompactorOptions, GarbageCollectorOptions};
     use crate::manifest::store::{ManifestStore, StoredManifest};
     use crate::manifest::ManifestCore;
     use crate::test_utils::FlakyObjectStore;
@@ -827,6 +815,7 @@ mod tests {
     use object_store::ObjectStore;
     use slatedb_common::clock::DefaultSystemClock;
     use std::sync::Arc;
+    use tokio_util::sync::CancellationToken;
     use ulid::Ulid;
 
     #[test]
@@ -859,23 +848,6 @@ mod tests {
             let store = r.expect("expected memory object store");
             assert_eq!(store.to_string(), "InMemory");
 
-            Ok(())
-        });
-    }
-
-    #[cfg(feature = "opendal")]
-    #[test]
-    fn test_load_opendal_invalid_scheme_maps_to_invalid_environment_variable() {
-        figment::Jail::expect_with(|jail| {
-            jail.set_env("OPENDAL_SCHEME", "not-a-scheme");
-
-            let err = super::load_opendal().expect_err("expected invalid OpenDAL scheme");
-
-            assert_eq!(err.kind(), ErrorKind::Invalid);
-            assert_eq!(
-                err.to_string(),
-                "Invalid error: invalid environment variable OPENDAL_SCHEME value `not-a-scheme`"
-            );
             Ok(())
         });
     }
@@ -935,6 +907,66 @@ mod tests {
         assert_eq!(first.manifest.compactor_epoch, 0);
         assert_eq!(first.manifest.core.next_wal_sst_id, 1);
         assert_eq!(first.manifest.core.last_l0_seq, 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_admin_run_gc_with_options_stops_on_cancellation() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let path = Path::from("/tmp/test_admin_run_gc_with_options_stops_on_cancellation");
+        let admin = AdminBuilder::new(path, object_store).build();
+        let cancellation_token = CancellationToken::new();
+        cancellation_token.cancel();
+
+        let result = admin
+            .run_gc_with_options(cancellation_token, GarbageCollectorOptions::default())
+            .await;
+        assert!(matches!(result, Ok(())));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_admin_run_compactor_with_options_stops_on_cancellation() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let path = Path::from("/tmp/test_admin_run_compactor_with_options_stops_on_cancellation");
+        StoredManifest::create_new_db(
+            Arc::new(ManifestStore::new(&path, object_store.clone())),
+            ManifestCore::new(),
+            Arc::new(DefaultSystemClock::new()),
+        )
+        .await
+        .unwrap();
+
+        let admin = AdminBuilder::new(path, object_store).build();
+        let cancellation_token = CancellationToken::new();
+        cancellation_token.cancel();
+
+        let result = admin
+            .run_compactor_with_options(
+                cancellation_token,
+                CompactorOptions {
+                    worker: None,
+                    ..CompactorOptions::default()
+                },
+            )
+            .await;
+        assert!(matches!(result, Ok(())));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_admin_run_compaction_worker_with_options_stops_on_cancellation() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let path =
+            Path::from("/tmp/test_admin_run_compaction_worker_with_options_stops_on_cancellation");
+        let admin = AdminBuilder::new(path, object_store).build();
+        let cancellation_token = CancellationToken::new();
+        cancellation_token.cancel();
+
+        let result = admin
+            .run_compaction_worker_with_options(
+                cancellation_token,
+                CompactionWorkerOptions::default(),
+            )
+            .await;
+        assert!(matches!(result, Ok(())));
     }
 
     #[tokio::test]

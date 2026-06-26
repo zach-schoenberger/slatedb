@@ -103,6 +103,9 @@ pub(crate) enum SlateDBError {
     #[error("segment extractor produced an empty prefix for key {key:?}")]
     EmptySegmentPrefix { key: Bytes },
 
+    #[error("compaction executor failed")]
+    CompactorExecutorFailed,
+
     #[error(
         "invalid clock tick, must be monotonic. last_tick=`{last_tick}`, next_tick=`{next_tick}`"
     )]
@@ -261,6 +264,9 @@ pub(crate) enum SlateDBError {
     #[error("invalid object store URL. url=`{0}`")]
     InvalidObjectStoreURL(String, #[source] url::ParseError),
 
+    #[error("invalid object store path. provide path to builder instead. path=`{0}`")]
+    InvalidObjectStorePath(String),
+
     #[error("transaction conflict")]
     TransactionConflict,
 
@@ -322,6 +328,31 @@ impl SlateDBError {
     /// Returns true if this error means a sequenced write should refresh and retry.
     pub(crate) fn is_sequenced_write_conflict(&self) -> bool {
         matches!(self, Self::TransactionalObjectVersionExists)
+    }
+
+    /// Classifies this error as a recoverable SST validation failure to reissue
+    /// the read with a [`RetryReason`], or `None` if it is not recoverable.
+    ///
+    /// This doesn't include transient errors like I/O or object store errors.
+    /// It includes errors that indicate the SST is corrupt or invalid, and the
+    /// read should be retried with a different strategy.
+    pub(crate) fn maybe_validation_retry_reason(&self) -> Option<RetryReason> {
+        match self {
+            SlateDBError::ChecksumMismatch { .. } => Some(RetryReason::CrcMismatch),
+            #[cfg(any(
+                feature = "snappy",
+                feature = "zlib",
+                feature = "lz4",
+                feature = "zstd"
+            ))]
+            SlateDBError::BlockDecompressionError => Some(RetryReason::DecompressionError),
+            SlateDBError::InvalidFlatbuffer(_)
+            | SlateDBError::EmptyBlock
+            | SlateDBError::EmptyBlockMeta
+            | SlateDBError::InvalidFilterBlock
+            | SlateDBError::BlockTransformError => Some(RetryReason::BlockDecodeError),
+            _ => None,
+        }
     }
 }
 
@@ -463,6 +494,24 @@ impl std::fmt::Display for ErrorKind {
     }
 }
 
+/// Why a recoverable SST read is being reissued (the reason it failed validation
+/// the first time).
+///
+/// Carried on the reissued read's tag so a caching wrapper can try a different
+/// strategy on the retry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RetryReason {
+    CrcMismatch,
+    BlockDecodeError,
+    #[cfg(any(
+        feature = "snappy",
+        feature = "zlib",
+        feature = "lz4",
+        feature = "zstd"
+    ))]
+    DecompressionError,
+}
+
 #[non_exhaustive]
 /// Represents a public error that can be returned to the user.
 #[derive(Debug)]
@@ -593,6 +642,7 @@ impl From<SlateDBError> for Error {
             SlateDBError::InvalidObjectStoreURL(_, err) => {
                 Error::invalid(msg).with_source(Box::new(err))
             }
+            SlateDBError::InvalidObjectStorePath(_) => Error::invalid(msg),
             SlateDBError::UnknownConfigurationFormat(_) => Error::invalid(msg),
             SlateDBError::InvalidSSTBatchSize(_) => Error::invalid(msg),
             SlateDBError::InvalidCheckpointLifetime(_) => Error::invalid(msg),
@@ -656,6 +706,7 @@ impl From<SlateDBError> for Error {
             SlateDBError::CloneIncorrectFinalCheckpoint { .. } => Error::data(msg),
 
             // Internal errors
+            SlateDBError::CompactorExecutorFailed => Error::internal(msg),
             #[cfg(feature = "compaction_filters")]
             SlateDBError::CompactionFilterError(_) => Error::internal(msg),
             SlateDBError::SeekKeyOutOfKeyRange { .. } => Error::internal(msg),

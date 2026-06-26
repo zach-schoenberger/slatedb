@@ -11,6 +11,7 @@ use ulid::Ulid;
 use crate::db_state::{SortedRun, SsTableHandle, SsTableView};
 use crate::error::SlateDBError;
 use crate::manifest::{Manifest, ManifestCore};
+use crate::subcompaction::Subcompaction;
 use slatedb_txn_obj::DirtyObject;
 
 /// Identifier for a compaction input source.
@@ -276,6 +277,43 @@ impl CompactionStatus {
     fn finished(self) -> bool {
         matches!(self, CompactionStatus::Completed | CompactionStatus::Failed)
     }
+
+    /// State transitions made by CompactionWorker that should be accepted into local state
+    /// during [`CompactorState::merge_remote_compactions`]
+    ///
+    /// For known active compactions (Occupied), accept these remote transitions:
+    ///   - `Compacted`: the worker's signal that execution finished; the
+    ///     coordinator must commit the output SSTs to the manifest.
+    ///   - `Scheduled → Running`: a worker has claimed the job; adopt the
+    ///     Running entry so the coordinator's local copy carries the worker
+    ///     claim. Without this, write_compactions_safely() would overwrite
+    ///     the claim with a stale Scheduled/no-worker copy, causing the
+    ///     worker to discard its result and potentially re-run the job.
+    ///   - `Running → Scheduled`: a worker released its claim (execution
+    ///     failed, post-claim validation rejected the job, or graceful
+    ///     shutdown). Adopt the release so the job can be re-claimed;
+    ///     otherwise the coordinator's stale Running/claimed copy would be
+    ///     written back and no worker would ever pick the job up again.
+    ///   - `Running -> Running`: should accept heartbeat updates when heartbeats
+    ///     land for a job that is already in local state
+    ///
+    /// Terminal local states are not overwritten by a remote `Compacted` entry.
+    /// The coordinator writes the manifest before `.compactions`, so local
+    /// `Completed`/`Failed` can be ahead of a stale persisted `Compacted` result.
+    ///
+    /// All other remote updates are ignored.
+    fn should_adopt_state_transition(&self, updated_status: CompactionStatus) -> bool {
+        match self {
+            Self::Submitted => matches!(updated_status, Self::Compacted),
+            Self::Scheduled => matches!(updated_status, Self::Running | Self::Compacted),
+            Self::Running => matches!(
+                updated_status,
+                Self::Scheduled | Self::Running | Self::Compacted
+            ),
+            Self::Compacted => matches!(updated_status, Self::Compacted),
+            Self::Completed | Self::Failed => false,
+        }
+    }
 }
 
 /// Identity and liveness for the worker currently executing a compaction.
@@ -303,6 +341,77 @@ impl WorkerSpec {
     }
 }
 
+static EMPTY_SUBCOMPACTIONS: Vec<Subcompaction> = Vec::new();
+
+#[derive(Clone, PartialEq, Debug, Serialize)]
+pub struct CompactionContext {
+    /// Subcompactions partitioning this compaction into non-overlapping key
+    /// ranges (RFC-0028). The produced output SSTs are recorded per range
+    /// here; On completion the aggregate is recorded in [`Compaction::output_ssts`]. A
+    /// compaction that runs as a single merge has one range spanning the full
+    /// keyspace. Empty only before any progress has been recorded.
+    subcompactions: Vec<Subcompaction>,
+
+    retention_min_seq: Option<u64>,
+}
+
+impl CompactionContext {
+    pub(crate) fn new(subcompactions: Vec<Subcompaction>, retention_min_seq: Option<u64>) -> Self {
+        Self {
+            subcompactions,
+            retention_min_seq,
+        }
+    }
+
+    pub(crate) fn set_output_ssts(
+        &mut self,
+        subcompaction: usize,
+        output_ssts: Vec<SsTableHandle>,
+    ) {
+        self.subcompactions
+            .get_mut(subcompaction)
+            .expect("subcompaction index out of bounds")
+            .set_output_ssts(output_ssts);
+    }
+
+    /// Returns the subcompactions of this compaction, if any.
+    pub fn subcompactions(&self) -> &Vec<Subcompaction> {
+        &self.subcompactions
+    }
+
+    pub(crate) fn retention_min_seq(&self) -> Option<u64> {
+        self.retention_min_seq
+    }
+
+    pub(crate) fn validate_update(&self, updated: &Self) {
+        assert_eq!(
+            self.retention_min_seq, updated.retention_min_seq,
+            "compaction retention_min_seq must not change once set"
+        );
+        assert_eq!(
+            self.subcompactions.len(),
+            updated.subcompactions.len(),
+            "subcompaction plan must not change once set"
+        );
+        for (prev, next) in self
+            .subcompactions
+            .iter()
+            .zip(updated.subcompactions.iter())
+        {
+            assert_eq!(
+                prev.range(),
+                next.range(),
+                "subcompaction ranges are immutable once set"
+            );
+            assert!(
+                next.output_ssts()
+                    .starts_with(prev.output_ssts().as_slice()),
+                "new subcompaction output SSTs must always extend previous output SSTs"
+            );
+        }
+    }
+}
+
 /// Canonical, internal record of a compaction.
 ///
 /// A compaction is the unit tracked by the compactor: it has a stable `id` (ULID) and a `spec`
@@ -319,11 +428,12 @@ pub struct Compaction {
     ///
     /// This is tracked only in memory at the moment.
     status: CompactionStatus,
-    /// Output SSTs produced by this compaction, if any.
+    /// The output of compaction. Only valid in Compacted state
     output_ssts: Vec<SsTableHandle>,
     /// The worker that has claimed this compaction. `None` means the
     /// compaction is unclaimed (only valid when `status == Submitted`).
     worker: Option<WorkerSpec>,
+    ctx: Option<CompactionContext>,
 }
 
 impl Compaction {
@@ -333,23 +443,29 @@ impl Compaction {
             spec,
             bytes_processed: 0,
             status: CompactionStatus::Submitted,
-            output_ssts: Vec::new(),
             worker: None,
+            output_ssts: vec![],
+            ctx: None,
         }
     }
 
     pub(crate) fn with_status(mut self, status: CompactionStatus) -> Self {
-        self.status = status;
-        self
-    }
-
-    pub(crate) fn with_output_ssts(mut self, output_ssts: Vec<SsTableHandle>) -> Self {
-        self.output_ssts = output_ssts;
+        self.set_status(status);
         self
     }
 
     pub(crate) fn with_worker(mut self, worker: Option<WorkerSpec>) -> Self {
         self.worker = worker;
+        self
+    }
+
+    pub(crate) fn with_ctx(mut self, ctx: Option<CompactionContext>) -> Self {
+        self.ctx = ctx;
+        self
+    }
+
+    pub(crate) fn with_output_ssts(mut self, output_ssts: Vec<SsTableHandle>) -> Self {
+        self.output_ssts = output_ssts;
         self
     }
 
@@ -423,26 +539,45 @@ impl Compaction {
         self.status
     }
 
-    /// Sets the output SSTs produced by this compaction.
-    // Consumed once the worker wires up progress/heartbeat emission in the
-    // failure-detection follow-up.
-    #[allow(dead_code)]
-    pub(crate) fn set_output_ssts(&mut self, output_ssts: Vec<SsTableHandle>) {
-        assert!(
-            output_ssts.starts_with(self.output_ssts.as_slice()),
-            "new output SSTs must always extend previous output SSTs"
-        );
-        self.output_ssts = output_ssts;
+    /// Returns all output SSTs produced by this compaction.
+    pub fn output_ssts(&self) -> Vec<SsTableHandle> {
+        self.output_ssts.clone()
     }
 
-    /// Returns the output SSTs produced by this compaction.
-    pub fn output_ssts(&self) -> &Vec<SsTableHandle> {
-        &self.output_ssts
+    /// Returns the job context required to resume a compaction job
+    pub fn ctx(&self) -> Option<&CompactionContext> {
+        self.ctx.as_ref()
+    }
+
+    pub(crate) fn set_ctx(&mut self, updated: Option<CompactionContext>) {
+        match (&self.ctx, updated) {
+            (_, None) => self.ctx = None,
+            (Some(existing), Some(updated)) => {
+                existing.validate_update(&updated);
+                self.ctx = Some(updated);
+            }
+            (None, Some(updated)) => self.ctx = Some(updated),
+        }
+    }
+
+    pub(crate) fn clear_ctx(&mut self) {
+        self.set_ctx(None);
+    }
+
+    /// Returns the subcompactions of this compaction, if any.
+    pub fn subcompactions(&self) -> &Vec<Subcompaction> {
+        self.ctx
+            .as_ref()
+            .map(CompactionContext::subcompactions)
+            .unwrap_or(&EMPTY_SUBCOMPACTIONS)
     }
 
     /// Sets the current status of this compaction.
     pub(crate) fn set_status(&mut self, status: CompactionStatus) {
         self.status = status;
+        if status == CompactionStatus::Failed {
+            self.clear_ctx();
+        }
     }
 
     /// Sets the current worker of this compaction.
@@ -467,6 +602,22 @@ impl Display for Compaction {
         if self.bytes_processed > 0 {
             let human_bytes_processed = crate::utils::format_bytes_si(self.bytes_processed);
             write!(f, " ({} processed)", human_bytes_processed)?;
+        }
+        // TODO: fix me by implementing Display for CompactionJob
+        if !self.subcompactions().is_empty() {
+            // Subcompactions carry no status, so report how many ranges have
+            // produced output so far rather than a completion count.
+            let with_output = self
+                .subcompactions()
+                .iter()
+                .filter(|s| !s.output_ssts().is_empty())
+                .count();
+            write!(
+                f,
+                " [{}/{} subcompactions with output]",
+                with_output,
+                self.subcompactions().len()
+            )?;
         }
         Ok(())
     }
@@ -730,48 +881,38 @@ impl CompactorState {
             merged.insert(compaction.id(), compaction.clone());
         }
 
-        // For compactions not in local state (Vacant), only accept `Submitted`. This
-        // is the only state the coordinator hasn't authored yet (external submissions,
-        // admin tools, reloaded `.compactions`). All later states (`Scheduled`,
-        // `Running`, `Compacted`, `Completed`, `Failed`) are downstream of the
-        // coordinator having seen the entry as `Submitted` and promoted it to
-        // `Scheduled`, so a Vacant entry in any of those states is anomalous and
-        // logged.
+        // For compactions not in local state (Vacant), accept new submissions,
+        // worker-completed results, and retained terminal entries. On a write
+        // conflict, the retry path reloads and merges the persisted `.compactions`
+        // object before writing again. At that point, local state may already have
+        // committed or pruned an entry while persisted state still contains an older
+        // Compacted/Completed/Failed view. Insert those entries, let the commit path
+        // resolve stale Compacted entries via `validate_compaction`, and let the compactions
+        // write path resolve stale terminal entries via `retain_active_and_last_finished`.
         //
-        // For known compactions (Occupied), accept these remote transitions:
-        //   - `Compacted`: the worker's signal that execution finished; the
-        //     coordinator must commit the output SSTs to the manifest.
-        //   - `Scheduled → Running`: a worker has claimed the job; adopt the
-        //     Running entry so the coordinator's local copy carries the worker
-        //     claim. Without this, write_compactions_safely() would overwrite
-        //     the claim with a stale Scheduled/no-worker copy, causing the
-        //     worker to discard its result and potentially re-run the job.
-        //   - `Running → Scheduled`: a worker released its claim (execution
-        //     failed, post-claim validation rejected the job, or graceful
-        //     shutdown). Adopt the release so the job can be re-claimed;
-        //     otherwise the coordinator's stale Running/claimed copy would be
-        //     written back and no worker would ever pick the job up again.
-        //   - TODO `Running -> Running`: should accept heartbeat updates when heartbeats land
-        // All other remote updates are ignored.
+        // Scheduled/Running are different: they carry no finished output and require prior
+        // coordinator ownership, so seeing them absent from local state remains anomalous.
         for compaction in remote_compactions.value.iter() {
             match merged.entry(compaction.id()) {
-                Entry::Vacant(v) => {
-                    if !matches!(compaction.status(), CompactionStatus::Submitted) {
+                Entry::Vacant(v) => match compaction.status() {
+                    CompactionStatus::Submitted
+                    | CompactionStatus::Compacted
+                    | CompactionStatus::Completed
+                    | CompactionStatus::Failed => {
+                        v.insert(compaction.clone());
+                    }
+                    CompactionStatus::Scheduled | CompactionStatus::Running => {
                         error!(
-                            "skipping remote compaction with unexpected (non-Submitted) status [compaction={:?}]",
+                            "skipping remote active compaction absent from local state [compaction={:?}]",
                             compaction,
                         );
-                        continue;
                     }
-                    v.insert(compaction.clone());
-                }
+                },
                 Entry::Occupied(mut o) => {
-                    let adopt = matches!(compaction.status(), CompactionStatus::Compacted)
-                        || (matches!(o.get().status(), CompactionStatus::Scheduled)
-                            && matches!(compaction.status(), CompactionStatus::Running))
-                        || (matches!(o.get().status(), CompactionStatus::Running)
-                            && matches!(compaction.status(), CompactionStatus::Scheduled));
-                    if adopt {
+                    if o.get()
+                        .status
+                        .should_adopt_state_transition(compaction.status)
+                    {
                         o.insert(compaction.clone());
                     } else {
                         debug!(
@@ -1082,6 +1223,7 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+    use crate::bytes_range::BytesRange;
     use crate::checkpoint::Checkpoint;
     use crate::compactor_state::SourceId::SstView;
     use crate::config::{FlushOptions, FlushType, Settings};
@@ -1102,6 +1244,101 @@ mod tests {
     use tokio::runtime::{Handle, Runtime};
 
     const PATH: &str = "/test/db";
+
+    fn test_subcompaction_sst(first_key: &[u8]) -> SsTableHandle {
+        SsTableHandle::new(
+            SsTableId::Compacted(Ulid::new()),
+            SST_FORMAT_VERSION_LATEST,
+            SsTableInfo {
+                first_entry: Some(Bytes::copy_from_slice(first_key)),
+                ..SsTableInfo::default()
+            },
+        )
+    }
+
+    fn test_compaction_with_subcompactions(subcompactions: Vec<Subcompaction>) -> Compaction {
+        Compaction::new(
+            Ulid::new(),
+            CompactionSpec::new(vec![SourceId::SortedRun(1)], 1),
+        )
+        .with_ctx(Some(CompactionContext::new(subcompactions, Some(0))))
+    }
+
+    fn set_test_subcompactions(compaction: &mut Compaction, subcompactions: Vec<Subcompaction>) {
+        compaction.set_ctx(Some(CompactionContext::new(subcompactions, Some(0))));
+    }
+
+    #[test]
+    fn test_should_extend_output_ssts_when_subcompaction_plan_unchanged() {
+        // given: a compaction with one subcompaction that recorded one output SST
+        let range = BytesRange::unbounded();
+        let sst = test_subcompaction_sst(b"a");
+        let mut compaction =
+            test_compaction_with_subcompactions(vec![
+                Subcompaction::new(range.clone()).with_output_ssts(vec![sst.clone()])
+            ]);
+
+        // when: the plan is set again with the output SST list extended
+        set_test_subcompactions(
+            &mut compaction,
+            vec![
+                Subcompaction::new(range).with_output_ssts(vec![sst, test_subcompaction_sst(b"m")])
+            ],
+        );
+
+        // then: the extended output SSTs are accepted
+        assert_eq!(compaction.subcompactions()[0].output_ssts().len(), 2);
+    }
+
+    #[test]
+    #[should_panic(expected = "subcompaction plan must not change once set")]
+    fn test_should_panic_when_subcompaction_plan_size_changes() {
+        // given: a compaction with a single-range subcompaction plan
+        let mut compaction =
+            test_compaction_with_subcompactions(vec![Subcompaction::new(BytesRange::unbounded())]);
+
+        // when/then: setting a plan with a different number of ranges panics
+        set_test_subcompactions(
+            &mut compaction,
+            vec![
+                Subcompaction::new(BytesRange::from_slice(..b"m".as_slice())),
+                Subcompaction::new(BytesRange::from_slice(b"m".as_slice()..)),
+            ],
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "subcompaction ranges are immutable once set")]
+    fn test_should_panic_when_subcompaction_range_changes() {
+        // given: a compaction with a subcompaction covering (-inf, "m")
+        let mut compaction = test_compaction_with_subcompactions(vec![Subcompaction::new(
+            BytesRange::from_slice(..b"m".as_slice()),
+        )]);
+
+        // when/then: setting a plan whose range differs panics
+        set_test_subcompactions(
+            &mut compaction,
+            vec![Subcompaction::new(BytesRange::from_slice(
+                ..b"z".as_slice(),
+            ))],
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "must always extend previous output SSTs")]
+    fn test_should_panic_when_subcompaction_output_ssts_shrink() {
+        // given: a compaction whose subcompaction already recorded output SST "a"
+        let range = BytesRange::unbounded();
+        let mut compaction =
+            test_compaction_with_subcompactions(vec![Subcompaction::new(range.clone())
+                .with_output_ssts(vec![test_subcompaction_sst(b"a")])]);
+
+        // when/then: replacing (rather than extending) the output SSTs panics
+        set_test_subcompactions(
+            &mut compaction,
+            vec![Subcompaction::new(range).with_output_ssts(vec![test_subcompaction_sst(b"b")])],
+        );
+    }
 
     #[test]
     fn test_trim_keeps_latest_finished_and_active_compactions() {

@@ -55,11 +55,13 @@
 //! attempt (JobSpec).
 
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use fail_parallel::FailPointRegistry;
 use futures::stream::BoxStream;
 use log::{debug, error, info, warn};
 use serde::{Deserialize, Serialize};
@@ -76,7 +78,7 @@ use crate::compactor_state_protocols::CompactorStateWriter;
 use crate::config::CompactorOptions;
 use crate::db_state::{SortedRun, SsTableView};
 use crate::db_status::ClosedResultWriter;
-use crate::dispatcher::{MessageFactory, MessageHandler, MessageHandlerExecutor};
+use crate::dispatcher::{MessageHandler, MessageHandlerExecutor, MessageTickerDef};
 use crate::error::{Error, SlateDBError};
 use crate::manifest::store::ManifestStore;
 use crate::manifest::{LsmTreeState, ManifestCore};
@@ -84,7 +86,7 @@ use crate::merge_operator::MergeOperatorType;
 use crate::tablestore::TableStore;
 use crate::utils::{format_bytes_si, IdGenerator};
 use slatedb_common::clock::SystemClock;
-use slatedb_common::metrics::MetricsRecorderHelper;
+use slatedb_common::metrics::{GaugeFn, MetricsRecorderHelper};
 use slatedb_common::DbRand;
 
 pub use crate::compactor_state::{
@@ -312,7 +314,9 @@ pub struct Compactor {
     compactor_runtime: Handle,
     rand: Arc<DbRand>,
     stats: Arc<CompactionStats>,
+    recorder: MetricsRecorderHelper,
     system_clock: Arc<dyn SystemClock>,
+    fp_registry: Arc<FailPointRegistry>,
     merge_operator: Option<MergeOperatorType>,
     #[cfg(feature = "compaction_filters")]
     compaction_filter_supplier: Option<Arc<dyn CompactionFilterSupplier>>,
@@ -330,6 +334,7 @@ impl Compactor {
         rand: Arc<DbRand>,
         recorder: &MetricsRecorderHelper,
         system_clock: Arc<dyn SystemClock>,
+        fp_registry: Arc<FailPointRegistry>,
         closed_result: Arc<dyn ClosedResultWriter>,
         merge_operator: Option<MergeOperatorType>,
         #[cfg(feature = "compaction_filters")] compaction_filter_supplier: Option<
@@ -351,7 +356,9 @@ impl Compactor {
             compactor_runtime,
             rand,
             stats,
+            recorder: recorder.clone(),
             system_clock,
+            fp_registry,
             merge_operator,
             #[cfg(feature = "compaction_filters")]
             compaction_filter_supplier,
@@ -367,6 +374,11 @@ impl Compactor {
     /// ## Returns
     /// - `Ok(())` when the compactor task exits cleanly, or [`SlateDBError`] on failure.
     pub async fn run(&self) -> Result<(), crate::Error> {
+        self.start().await?;
+        self.join().await
+    }
+
+    pub(crate) async fn start(&self) -> Result<(), crate::Error> {
         // The coordinator delegates compaction execution to [`crate::compaction_worker::CompactionWorker`]
         // either spawned in this process (set `worker: Some`) or running standalone (set `worker: None`).
         let (_tx, rx) = async_channel::unbounded::<CompactorMessage>();
@@ -379,6 +391,7 @@ impl Compactor {
             self.rand.clone(),
             self.stats.clone(),
             self.system_clock.clone(),
+            self.recorder.clone(),
         )
         .await?;
         self.task_executor
@@ -388,7 +401,7 @@ impl Compactor {
                 rx,
                 &Handle::current(),
             )
-            .expect("failed to spawn compactor task");
+            .map_err(crate::Error::from)?;
 
         // Spawn an in-process worker if configured. The worker runs under its
         // own cancellation token; Compactor::stop and run() are responsible for
@@ -402,7 +415,9 @@ impl Compactor {
                 self.compactor_runtime.clone(),
                 self.rand.clone(),
                 self.stats.clone(),
+                self.recorder.clone(),
                 self.system_clock.clone(),
+                self.fp_registry.clone(),
                 self.merge_operator.clone(),
                 #[cfg(feature = "compaction_filters")]
                 self.compaction_filter_supplier.clone(),
@@ -414,10 +429,14 @@ impl Compactor {
                     worker_rx,
                     &Handle::current(),
                 )
-                .expect("failed to spawn embedded compaction worker task");
+                .map_err(crate::Error::from)?;
         }
 
         self.task_executor.monitor_on(&Handle::current())?;
+        Ok(())
+    }
+
+    pub(crate) async fn join(&self) -> Result<(), crate::Error> {
         self.task_executor
             .join_task(COMPACTOR_TASK_NAME)
             .await
@@ -496,21 +515,30 @@ pub(crate) struct CompactorEventHandler {
     rand: Arc<DbRand>,
     stats: Arc<CompactionStats>,
     system_clock: Arc<dyn SystemClock>,
+    recorder: MetricsRecorderHelper,
+    /// Job ids the coordinator has observed claimed by a worker (`Running` or
+    /// `Compacted` with a worker assigned). Initially empty, so the first metrics
+    /// update counts every inherited claim before establishing the set-difference
+    /// baseline. See [`Self::update_distributed_compaction_metrics`].
+    prev_claimed: HashSet<Ulid>,
+    /// Cached handles for per-worker `worker_last_heartbeat_ms` gauges. Handles are
+    /// retained for every worker id observed by this coordinator process.
+    worker_heartbeat_gauges: HashMap<String, Arc<dyn GaugeFn>>,
 }
 
 #[async_trait]
 impl MessageHandler<CompactorMessage> for CompactorEventHandler {
-    fn tickers(&mut self) -> Vec<(Duration, Box<MessageFactory<CompactorMessage>>)> {
+    fn tickers(&mut self) -> Vec<MessageTickerDef<CompactorMessage>> {
         vec![
-            (
+            MessageTickerDef::new(
                 self.options.poll_interval,
                 Box::new(|| CompactorMessage::PollManifest),
             ),
-            (
+            MessageTickerDef::new(
                 Duration::from_secs(10),
                 Box::new(|| CompactorMessage::LogStats),
             ),
-            (
+            MessageTickerDef::new(
                 self.options.commit_compacted_interval,
                 Box::new(|| CompactorMessage::CommitCompacted),
             ),
@@ -523,6 +551,7 @@ impl MessageHandler<CompactorMessage> for CompactorEventHandler {
             CompactorMessage::PollManifest => self.handle_ticker().await?,
             CompactorMessage::CommitCompacted => {
                 self.state_writer.load_compactions().await?;
+                self.update_distributed_compaction_metrics();
                 self.commit_compacted_entries().await?;
             }
         }
@@ -547,6 +576,7 @@ impl CompactorEventHandler {
         rand: Arc<DbRand>,
         stats: Arc<CompactionStats>,
         system_clock: Arc<dyn SystemClock>,
+        recorder: MetricsRecorderHelper,
     ) -> Result<Self, SlateDBError> {
         let state_writer = CompactorStateWriter::new(
             manifest_store,
@@ -565,6 +595,9 @@ impl CompactorEventHandler {
             rand,
             stats,
             system_clock,
+            recorder,
+            prev_claimed: HashSet::new(),
+            worker_heartbeat_gauges: HashMap::new(),
         })
     }
 
@@ -681,10 +714,123 @@ impl CompactorEventHandler {
     /// Handles a polling tick by refreshing compactions and the manifest, then possibly scheduling compactions.
     async fn handle_ticker(&mut self) -> Result<(), SlateDBError> {
         self.state_writer.refresh().await?;
+        self.reclaim_stale_workers().await?;
+        self.update_distributed_compaction_metrics();
         self.commit_compacted_entries().await?;
         self.maybe_schedule_compactions().await?;
         self.maybe_validate_submitted_compactions().await?;
         Ok(())
+    }
+
+    /// Reclaims `Running` compactions whose workers have not emitted a heartbeat
+    /// within [`CompactorOptions::worker_heartbeat_timeout`], as well as any
+    /// `Running` entry with no worker at all. Reclaimed compactions are reset to
+    /// `Scheduled` (with no worker) so they can be picked up again while
+    /// preserving any persisted job context needed for resume.
+    ///
+    /// This is the coordinator-side half of the failure-detection protocol described
+    /// in RFC-0025. The worker side emits heartbeats (updating `last_heartbeat_ms`)
+    /// periodically; the coordinator scans for stale entries on each tick.
+    async fn reclaim_stale_workers(&mut self) -> Result<(), SlateDBError> {
+        let now_ms = self.system_clock.now().timestamp_millis() as u64;
+        let timeout_ms = self.options.worker_heartbeat_timeout.as_millis() as u64;
+
+        // A Running compaction is stale if its worker's heartbeat has aged past
+        // the timeout, or if it has no worker at all. The protocol shouldn't
+        // produce the latter, but it would otherwise be stuck in Running forever.
+        // Capture the owning worker id (None in the no-worker case) for the log.
+        let stale: Vec<(Ulid, Option<String>)> = self
+            .state()
+            .compactions_with_status(&[CompactionStatus::Running])
+            .filter(|c| match c.worker() {
+                Some(w) => now_ms.saturating_sub(w.last_heartbeat_ms) > timeout_ms,
+                None => true,
+            })
+            .map(|c| (c.id(), c.worker().map(|w| w.worker_id.clone())))
+            .collect();
+
+        if stale.is_empty() {
+            return Ok(());
+        }
+
+        for (id, worker_id) in &stale {
+            match worker_id {
+                Some(worker_id) => info!(
+                    "reclaiming stale compaction whose worker's heartbeat timed out \
+                     [worker_id={}, id={}]",
+                    worker_id, id
+                ),
+                None => {
+                    let message = format!(
+                        "reclaiming Running compaction that has no worker; this should \
+                         not happen. please open issue. [id={}]",
+                        id
+                    );
+                    debug_assert!(false, "{message}");
+                    error!("{message}");
+                }
+            }
+            self.state_mut().update_compaction(id, |c| {
+                c.set_status(CompactionStatus::Scheduled);
+                c.set_worker(None);
+            });
+        }
+
+        self.state_writer.write_compactions_safely().await?;
+        self.stats.jobs_reclaimed.increment(stale.len() as u64);
+        Ok(())
+    }
+
+    /// Updates coordinator-side distributed-compaction metrics after each tick:
+    /// - `jobs_claimed`: counts jobs claimed by a worker. A job is "claimed"
+    ///   once it carries a worker and is `Running` or `Compacted` (the worker
+    ///   keeps its ownership through `Compacted`), so a job that finishes
+    ///   execution between two ticks is still counted. The first update counts
+    ///   every inherited claim once; later updates count set differences.
+    /// - `worker_last_heartbeat_ms`: a per-worker gauge of the last heartbeat
+    ///   timestamp. Gauge handles are cached for every worker id observed by this
+    ///   coordinator process.
+    fn update_distributed_compaction_metrics(&mut self) {
+        use crate::compactor::stats::{WORKER_ID_LABEL, WORKER_LAST_HEARTBEAT_MS};
+
+        let claimed: Vec<(Ulid, crate::compactor_state::WorkerSpec)> = self
+            .state()
+            .compactions_with_status(&[CompactionStatus::Running, CompactionStatus::Compacted])
+            .filter_map(|c| c.worker().cloned().map(|w| (c.id(), w)))
+            .collect();
+
+        let current_ids: HashSet<Ulid> = claimed.iter().map(|(id, _)| *id).collect();
+        // The initially empty set counts all inherited claims once.
+        // This includes work claimed while the coordinator was unavailable;
+        // thereafter the counter records only newly observed claim ids.
+        let newly_claimed = current_ids.difference(&self.prev_claimed).count() as u64;
+        if newly_claimed > 0 {
+            self.stats.jobs_claimed.increment(newly_claimed);
+        }
+        self.prev_claimed = current_ids;
+
+        // Refresh the cached gauge handle for every worker that owns an in-flight job.
+        let recorder = self.recorder.clone();
+        let mut last_heartbeat_per_worker: HashMap<String, u64> = HashMap::new();
+        for (_, w) in &claimed {
+            last_heartbeat_per_worker
+                .entry(w.worker_id.clone())
+                .and_modify(|last| *last = (*last).max(w.last_heartbeat_ms))
+                .or_insert(w.last_heartbeat_ms);
+        }
+
+        for (id, last_heartbeat_ms) in &last_heartbeat_per_worker {
+            let gauge = self
+                .worker_heartbeat_gauges
+                .entry(id.clone())
+                .or_insert_with(|| {
+                    recorder
+                        .gauge(WORKER_LAST_HEARTBEAT_MS)
+                        .labels(&[(WORKER_ID_LABEL, id.as_str())])
+                        .register()
+                });
+            gauge.set(*last_heartbeat_ms as i64);
+        }
     }
 
     /// Commits any compactions in the `Compacted` state to the manifest.
@@ -723,7 +869,7 @@ impl CompactorEventHandler {
 
         for compaction in compacted {
             let id = compaction.id();
-            match self.validate_compaction(compaction.spec()) {
+            match self.validate_compaction(&compaction) {
                 Ok(()) => {
                     let destination = compaction
                         .spec()
@@ -763,32 +909,34 @@ impl CompactorEventHandler {
 
     /// Validates a Submitted compaction against the current manifest before starting it.
     ///
-    /// Runs on every Submitted spec regardless of origin (internal scheduler, admin
-    /// submission, reloaded `.compactions`), so this is the canonical gate for
-    /// spec-against-current-state validity. Cross-compaction conflicts (destination
-    /// collisions across active compactions, concurrent drains on the same segment) are
-    /// enforced upstream in [`CompactorState::add_compaction`] and are not re-checked here.
+    /// Runs when a Submitted compaction is accepted and when a Compacted entry is
+    /// committed, so this is the canonical gate for compaction-against-current-state
+    /// validity. Cross-compaction conflicts (destination collisions across active
+    /// compactions, concurrent drains on the same segment) are enforced upstream in
+    /// [`CompactorState::add_compaction`] and are not re-checked here.
     ///
     /// Invariants checked:
     /// - Compaction has sources
     /// - Drain specs do not target the empty-prefix (root) segment
     /// - The target segment exists in the manifest
     /// - All sources exist in the target segment's tree
-    /// - L0-only tiered compactions have a destination > highest SR id across all trees
+    /// - Submitted L0-only tiered compactions have a destination > highest SR id across all trees
+    /// - Compacted L0-only tiered compactions have a destination > highest SR id in their segment
     /// - A tiered destination does not overwrite a committed SR in any tree unless the SR is among sources
     /// - Drain L0 sources cover every L0 at or below the newest drained L0 in the target tree
     /// - At most one L0 compaction is Running per segment
     /// - Scheduler-specific policy via [`CompactionScheduler::validate_compaction`]
-    fn validate_compaction(&self, compaction: &CompactionSpec) -> Result<(), SlateDBError> {
+    fn validate_compaction(&self, compaction: &Compaction) -> Result<(), SlateDBError> {
+        let spec = compaction.spec();
         // Validate compaction sources exist
-        if compaction.sources().is_empty() {
-            warn!("submitted compaction is empty: {:?}", compaction.sources());
+        if spec.sources().is_empty() {
+            warn!("submitted compaction is empty: {:?}", spec.sources());
             return Err(SlateDBError::InvalidCompaction);
         }
 
         // Drain specs cannot target the empty-prefix segment (RFC-0024): the
         // root-tree compatibility encoding is not retired by drain.
-        if compaction.is_drain() && compaction.segment().is_empty() {
+        if spec.is_drain() && spec.segment().is_empty() {
             warn!("rejected drain compaction targeting the empty-prefix segment");
             return Err(SlateDBError::InvalidCompaction);
         }
@@ -797,10 +945,10 @@ impl CompactorEventHandler {
         // RFC-0024: every spec names exactly one segment, and its sources must
         // live in that segment's tree.
         let db_state = self.state().db_state();
-        let Some(tree) = db_state.tree_for_segment(compaction.segment()) else {
+        let Some(tree) = db_state.tree_for_segment(spec.segment()) else {
             warn!(
                 "submitted compaction targets unknown segment: {:?}",
-                compaction.segment()
+                spec.segment()
             );
             return Err(SlateDBError::InvalidCompaction);
         };
@@ -815,7 +963,7 @@ impl CompactorEventHandler {
             .map(|sr| sr.id)
             .collect::<std::collections::HashSet<_>>();
 
-        if let Some(missing) = compaction.sources().iter().find(|source| match source {
+        if let Some(missing) = spec.sources().iter().find(|source| match source {
             SourceId::SstView(id) => !l0_view_ids.contains(id),
             SourceId::SortedRun(id) => !sr_ids.contains(id),
         }) {
@@ -823,19 +971,37 @@ impl CompactorEventHandler {
             return Err(SlateDBError::InvalidCompaction);
         }
 
-        // Validate L0-only compactions create a new SR with id > highest existing
-        // across all segment trees. SR ids are globally unique (RFC-0024) and the
-        // scheduler allocates new L0 → SR destinations strictly above the global
-        // max; admin- or reload-submitted specs must observe the same contract.
-        if compaction.has_l0_sources() && !compaction.has_sr_sources() {
-            let highest_id = db_state
-                .trees()
-                .flat_map(|t| t.compacted.iter())
-                .map(|sr| sr.id)
-                .max()
-                .map_or(0, |id| id + 1);
+        // Validate L0-only compactions create a new SR after every SR that matters
+        // for their lifecycle stage. Submitted specs reserve a fresh globally
+        // unique SR id, so they must be above every committed SR in every segment.
+        // Compacted entries are being committed into one target segment and may
+        // validly finish after a different segment has already committed a higher
+        // SR id, but they still must preserve local SR ordering within the target
+        // segment.
+        if spec.has_l0_sources() && !spec.has_sr_sources() {
+            let highest_id = if compaction.status() == CompactionStatus::Submitted {
+                db_state
+                    .trees()
+                    .flat_map(|t| t.compacted.iter())
+                    .map(|sr| sr.id)
+                    .max()
+                    .map_or(0, |id| id + 1)
+            } else if compaction.status() == CompactionStatus::Compacted {
+                tree.compacted
+                    .iter()
+                    .map(|sr| sr.id)
+                    .max()
+                    .map_or(0, |id| id + 1)
+            } else {
+                warn!(
+                    "validate_compaction called with unexpected compaction status [id={:?}, status={:?}]",
+                    compaction.id(),
+                    compaction.status()
+                );
+                return Err(SlateDBError::InvalidCompaction);
+            };
             // Drain specs have no destination and aren't subject to this check.
-            if let Some(dst) = compaction.destination() {
+            if let Some(dst) = spec.destination() {
                 if dst < highest_id {
                     warn!(
                         "compaction destination is lesser than the expected L0-only highest_id: {:?} {:?}",
@@ -846,8 +1012,8 @@ impl CompactorEventHandler {
             }
         }
 
-        Self::validate_destination_overwrite(compaction, db_state)?;
-        Self::validate_drain_watermark_advance(compaction, tree)?;
+        Self::validate_destination_overwrite(spec, db_state)?;
+        Self::validate_drain_watermark_advance(spec, tree)?;
 
         // Reject parallel L0 compactions within the same segment. Each
         // segment owns its own `last_compacted_l0_sst_view_id` watermark
@@ -855,8 +1021,8 @@ impl CompactorEventHandler {
         // compactions sharing a target tree. L0 compactions in disjoint
         // segments — including drain specs in different segments — are
         // safe to run concurrently.
-        if compaction.has_l0_sources() {
-            let target_segment = compaction.segment();
+        if spec.has_l0_sources() {
+            let target_segment = spec.segment();
             // Only Scheduled and Running represent live claims; Submitted is still
             // being validated (and would see itself), Compacted is pending commit.
             let active_l0_in_same_segment = self
@@ -873,7 +1039,7 @@ impl CompactorEventHandler {
         }
 
         self.scheduler
-            .validate(&self.state().into(), compaction)
+            .validate(&self.state().into(), spec)
             .map_err(|_e| SlateDBError::InvalidCompaction)
     }
 
@@ -1024,7 +1190,7 @@ impl CompactorEventHandler {
 
         for compaction in &submitted_compactions {
             // Validate the candidate compaction; mark as failed if invalid.
-            if let Err(e) = self.validate_compaction(compaction.spec()) {
+            if let Err(e) = self.validate_compaction(compaction) {
                 error!(
                     "compaction validation failed [error={:?}, compaction={:?}]",
                     compaction, e
@@ -1043,6 +1209,7 @@ impl CompactorEventHandler {
                 self.state_mut().finish_drain_compaction(compaction.id());
             } else {
                 self.state_mut().update_compaction(&compaction.id(), |c| {
+                    c.clear_ctx();
                     c.set_status(CompactionStatus::Scheduled)
                 });
             }
@@ -1127,6 +1294,12 @@ pub mod stats {
     pub const COMPACTOR_EPOCH: &str = compactor_stat_name!("epoch");
     pub const LAST_COMPACTION_TS_SEC: &str = compactor_stat_name!("last_compaction_timestamp_sec");
     pub const RUNNING_COMPACTIONS: &str = compactor_stat_name!("running_compactions");
+    pub const SSTS_WRITTEN: &str = compactor_stat_name!("ssts_written");
+    pub const JOBS_CLAIMED: &str = compactor_stat_name!("jobs_claimed");
+    pub const JOBS_RECLAIMED: &str = compactor_stat_name!("jobs_reclaimed");
+    pub const WORKER_LAST_HEARTBEAT_MS: &str = compactor_stat_name!("worker_last_heartbeat_ms");
+    /// Label key carrying a worker's id on per-worker metrics.
+    pub const WORKER_ID_LABEL: &str = "worker_id";
     pub const TOTAL_BYTES_BEING_COMPACTED: &str =
         compactor_stat_name!("total_bytes_being_compacted");
     pub const TOTAL_THROUGHPUT_BYTES_PER_SEC: &str =
@@ -1140,16 +1313,25 @@ pub mod stats {
     pub const ENTRY_TYPE_VALUE: &str = "value";
     pub const ENTRY_TYPE_MERGE: &str = "merge";
 
+    /// Coordinator-side compaction metrics.
+    ///
+    /// Per-worker throughput (`bytes_compacted`, `running_compactions`,
+    /// `ssts_written`) lives in [`WorkerStats`] instead: those are emitted by the
+    /// executor running inside a worker and tagged with `{worker_id}`. The
+    /// coordinator runs no executor, so it does not emit them (RFC-0025
+    /// Observability).
     pub(crate) struct CompactionStats {
         pub(crate) compactor_epoch: Arc<dyn GaugeFn>,
         pub(crate) last_compaction_ts: Arc<dyn GaugeFn>,
-        pub(crate) running_compactions: Arc<dyn UpDownCounterFn>,
-        pub(crate) bytes_compacted: Arc<dyn CounterFn>,
         pub(crate) total_bytes_being_compacted: Arc<dyn GaugeFn>,
         pub(crate) total_throughput: Arc<dyn GaugeFn>,
         pub(crate) merge_operator_compact_operands: Arc<dyn CounterFn>,
         pub(crate) expired_entries_purged_value: Arc<dyn CounterFn>,
         pub(crate) expired_entries_purged_merge: Arc<dyn CounterFn>,
+        /// `Scheduled → Running` transitions the coordinator observed in `.compactions`.
+        pub(crate) jobs_claimed: Arc<dyn CounterFn>,
+        /// Stale jobs the coordinator reset `Running → Submitted`.
+        pub(crate) jobs_reclaimed: Arc<dyn CounterFn>,
     }
 
     impl CompactionStats {
@@ -1157,8 +1339,8 @@ pub mod stats {
             Self {
                 compactor_epoch: recorder.gauge(COMPACTOR_EPOCH).register(),
                 last_compaction_ts: recorder.gauge(LAST_COMPACTION_TS_SEC).register(),
-                running_compactions: recorder.up_down_counter(RUNNING_COMPACTIONS).register(),
-                bytes_compacted: recorder.counter(BYTES_COMPACTED).register(),
+                jobs_claimed: recorder.counter(JOBS_CLAIMED).register(),
+                jobs_reclaimed: recorder.counter(JOBS_RECLAIMED).register(),
                 total_bytes_being_compacted: recorder.gauge(TOTAL_BYTES_BEING_COMPACTED).register(),
                 total_throughput: recorder.gauge(TOTAL_THROUGHPUT_BYTES_PER_SEC).register(),
                 merge_operator_compact_operands: recorder
@@ -1184,6 +1366,47 @@ pub mod stats {
                 expired_entries_purged_value: self.expired_entries_purged_value.clone(),
                 expired_entries_purged_merge: self.expired_entries_purged_merge.clone(),
             }
+        }
+    }
+
+    /// Per-worker compaction throughput, tagged `{worker_id=<id>}`.
+    ///
+    /// Registered once per worker from the worker's recorder with the worker id
+    /// baked into the label set, and incremented by the executor (which always
+    /// runs inside a worker). A shared metrics backend can therefore attribute
+    /// throughput to individual workers in multi-worker deployments.
+    #[derive(Clone)]
+    pub(crate) struct WorkerStats {
+        /// Bytes written to output SSTs by this worker (cumulative).
+        pub(crate) bytes_compacted: Arc<dyn CounterFn>,
+        /// Compaction jobs currently executing on this worker.
+        pub(crate) running_compactions: Arc<dyn UpDownCounterFn>,
+        /// Output SSTs produced by this worker (cumulative).
+        pub(crate) ssts_written: Arc<dyn CounterFn>,
+    }
+
+    impl WorkerStats {
+        pub(crate) fn new(recorder: &MetricsRecorderHelper, worker_id: &str) -> Self {
+            Self {
+                bytes_compacted: recorder
+                    .counter(BYTES_COMPACTED)
+                    .labels(&[(WORKER_ID_LABEL, worker_id)])
+                    .register(),
+                running_compactions: recorder
+                    .up_down_counter(RUNNING_COMPACTIONS)
+                    .labels(&[(WORKER_ID_LABEL, worker_id)])
+                    .register(),
+                ssts_written: recorder
+                    .counter(SSTS_WRITTEN)
+                    .labels(&[(WORKER_ID_LABEL, worker_id)])
+                    .register(),
+            }
+        }
+
+        /// A no-op instance for tests that don't assert on worker metrics.
+        #[cfg(test)]
+        pub(crate) fn noop() -> Self {
+            Self::new(&MetricsRecorderHelper::noop(), "")
         }
     }
 }
@@ -1214,7 +1437,7 @@ mod tests {
     };
     use crate::compactor_state::Compaction;
     use crate::compactor_state::CompactionStatus;
-    use crate::compactor_state::SourceId;
+    use crate::compactor_state::{SourceId, WorkerSpec};
     use crate::config::{
         CompactionWorkerOptions, FlushOptions, FlushType, MergeOptions, PutOptions, Settings,
         SizeTieredCompactionSchedulerOptions, Ttl, WriteOptions,
@@ -1230,7 +1453,7 @@ mod tests {
     use crate::object_stores::ObjectStores;
     use crate::proptest_util::rng;
     use crate::sst_iter::{SstIterator, SstIteratorOptions};
-    use crate::tablestore::TableStore;
+    use crate::tablestore::{TableStore, TableStoreKind};
     use crate::test_utils::{assert_iterator, FixedThreeBytePrefixExtractor, GatedObjectStore};
     use crate::types::KeyValue;
     use crate::types::RowEntry;
@@ -1820,7 +2043,7 @@ mod tests {
         .expect("not every segment compacted before scan");
 
         // Full ascending scan crosses every segment in prefix order.
-        let mut iter = db.scan::<Vec<u8>, _>(..).await.unwrap();
+        let mut iter = db.scan(..).await.unwrap();
         let mut collected: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
         while let Some(kv) = iter.next().await.unwrap() {
             collected.push((kv.key.to_vec(), kv.value.to_vec()));
@@ -1832,7 +2055,7 @@ mod tests {
 
         // Per-segment prefix scan should return only that segment's keys.
         for prefix in prefixes {
-            let mut iter = db.scan_prefix(prefix).await.unwrap();
+            let mut iter = db.scan_prefix(prefix, ..).await.unwrap();
             let mut keys: Vec<Vec<u8>> = Vec::new();
             while let Some(kv) = iter.next().await.unwrap() {
                 keys.push(kv.key.to_vec());
@@ -1848,7 +2071,7 @@ mod tests {
         // Cross-segment range scan: spans the tail of aaa, all of bbb, and stops
         // before the head of ccc.
         let mut iter = db
-            .scan::<Vec<u8>, _>(b"aaa-002".to_vec()..b"ccc-001".to_vec())
+            .scan(b"aaa-002".to_vec()..b"ccc-001".to_vec())
             .await
             .unwrap();
         let mut keys: Vec<Vec<u8>> = Vec::new();
@@ -4308,6 +4531,7 @@ mod tests {
                     table_store,
                     rand: rand.clone(),
                     stats: compactor_stats.clone(),
+                    worker_stats: stats::WorkerStats::new(&recorder, "test-worker"),
                     clock: Arc::new(DefaultSystemClock::new()),
                     manifest_store: manifest_store.clone(),
                     merge_operator: None,
@@ -4323,6 +4547,7 @@ mod tests {
                 rand.clone(),
                 compactor_stats.clone(),
                 Arc::new(DefaultSystemClock::new()),
+                MetricsRecorderHelper::noop(),
             )
             .await
             .unwrap();
@@ -4330,6 +4555,77 @@ mod tests {
                 StoredManifest::load(manifest_store.clone(), Arc::new(DefaultSystemClock::new()))
                     .await
                     .unwrap();
+            Self {
+                manifest,
+                manifest_store,
+                compactions_store,
+                options,
+                db,
+                scheduler,
+                real_executor_rx,
+                real_executor,
+                test_recorder,
+                handler,
+            }
+        }
+
+        /// Like `new()` but accepts an explicit `system_clock` so tests can
+        /// control time (e.g. to exercise heartbeat-timeout reclamation).
+        async fn new_with_clock(
+            system_clock: Arc<dyn SystemClock>,
+            compactor_options: Arc<CompactorOptions>,
+        ) -> Self {
+            let options = db_options(None);
+
+            let os = Arc::new(InMemory::new());
+            let (manifest_store, compactions_store, table_store) = build_test_stores(os.clone());
+            let db = Db::builder(PATH, os.clone())
+                .with_settings(options.clone())
+                .build()
+                .await
+                .unwrap();
+
+            let scheduler = Arc::new(MockScheduler::new());
+            let (real_executor_tx, real_executor_rx) = async_channel::unbounded();
+            let rand = Arc::new(DbRand::default());
+            let test_recorder = Arc::new(slatedb_common::metrics::DefaultMetricsRecorder::new());
+            let recorder = MetricsRecorderHelper::new(
+                test_recorder.clone() as Arc<dyn slatedb_common::metrics::MetricsRecorder>,
+                slatedb_common::metrics::MetricLevel::default(),
+            );
+            let compactor_stats = Arc::new(CompactionStats::new(&recorder));
+            let worker_options = Arc::new(CompactionWorkerOptions::default());
+            let real_executor = Arc::new(TokioCompactionExecutor::new(
+                TokioCompactionExecutorOptions {
+                    handle: Handle::current(),
+                    options: worker_options,
+                    worker_tx: real_executor_tx,
+                    table_store,
+                    rand: rand.clone(),
+                    stats: compactor_stats.clone(),
+                    worker_stats: stats::WorkerStats::noop(),
+                    clock: system_clock.clone(),
+                    manifest_store: manifest_store.clone(),
+                    merge_operator: None,
+                    #[cfg(feature = "compaction_filters")]
+                    compaction_filter_supplier: None,
+                },
+            ));
+            let handler = CompactorEventHandler::new(
+                manifest_store.clone(),
+                compactions_store.clone(),
+                compactor_options.clone(),
+                scheduler.clone(),
+                rand.clone(),
+                compactor_stats.clone(),
+                system_clock.clone(),
+                recorder.clone(),
+            )
+            .await
+            .unwrap();
+            let manifest = StoredManifest::load(manifest_store.clone(), system_clock)
+                .await
+                .unwrap();
             Self {
                 manifest,
                 manifest_store,
@@ -4402,7 +4698,7 @@ mod tests {
             let scheduled = self.get_scheduled_compactions().await;
             for compaction in scheduled {
                 let destination = compaction.spec().destination().expect("tiered spec");
-                let sst_views = compaction.get_l0_sst_views(db_state);
+                let l0_sst_views = compaction.get_l0_sst_views(db_state);
                 let sorted_runs = compaction.get_sorted_runs(db_state);
                 let is_dest_last_run = match db_state.tree_for_segment(compaction.spec().segment())
                 {
@@ -4416,12 +4712,12 @@ mod tests {
                     id: compaction.id(),
                     compaction_id: compaction.id(),
                     destination,
-                    sst_views,
+                    l0_sst_views,
                     sorted_runs,
-                    output_ssts: compaction.output_ssts().clone(),
                     compaction_clock_tick: db_state.last_l0_clock_tick,
-                    retention_min_seq: Some(db_state.recent_snapshot_min_seq),
                     is_dest_last_run,
+                    retention_min_seq: None,
+                    ctx: compaction.ctx().cloned(),
                 };
 
                 self.real_executor.start_compaction_job(args);
@@ -4439,9 +4735,6 @@ mod tests {
                 .await
                 .expect("timeout waiting for compaction result");
 
-                let output_ssts: Vec<SsTableHandle> =
-                    result.sst_views.into_iter().map(|v| v.sst).collect();
-
                 let mut stored = StoredCompactions::try_load(self.compactions_store.clone())
                     .await
                     .unwrap()
@@ -4449,12 +4742,12 @@ mod tests {
                 loop {
                     stored.refresh().await.unwrap();
                     let mut dirty = stored.prepare_dirty().unwrap();
-                    dirty.value.insert(
-                        compaction
-                            .clone()
-                            .with_status(CompactionStatus::Compacted)
-                            .with_output_ssts(output_ssts.clone()),
-                    );
+                    let completed = compaction
+                        .clone()
+                        .with_status(CompactionStatus::Compacted)
+                        .with_output_ssts(result.sst_views.iter().map(|v| v.sst.clone()).collect())
+                        .with_ctx(None);
+                    dirty.value.insert(completed);
                     match stored.update(dirty).await {
                         Ok(()) => break,
                         Err(e) if e.is_sequenced_write_conflict() => continue,
@@ -4785,6 +5078,7 @@ mod tests {
             rand,
             compactor_stats,
             system_clock,
+            recorder,
         )
         .await
         .unwrap();
@@ -4915,7 +5209,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[cfg(feature = "zstd")]
     async fn test_compactor_compressed_block_size() {
-        use crate::compactor::stats::BYTES_COMPACTED;
+        use crate::compactor::stats::{BYTES_COMPACTED, SSTS_WRITTEN};
         use crate::config::{CompressionCodec, SstBlockSize};
         use slatedb_common::metrics::{lookup_metric, DefaultMetricsRecorder};
 
@@ -4963,17 +5257,21 @@ mod tests {
             .await
             .expect("db was not compacted");
 
-        // then:
+        // then: the embedded worker recorded per-worker throughput.
         let bytes_compacted = lookup_metric(&metrics_recorder, BYTES_COMPACTED).unwrap();
-
         assert!(bytes_compacted > 0, "bytes_compacted: {}", bytes_compacted);
+        let ssts_written = lookup_metric(&metrics_recorder, SSTS_WRITTEN).unwrap();
+        assert!(ssts_written > 0, "ssts_written: {}", ssts_written);
     }
 
     #[tokio::test]
     async fn test_validate_compaction_empty_sources_rejected() {
         let fixture = CompactorEventHandlerTestFixture::new().await;
         let c = CompactionSpec::new(Vec::new(), 0);
-        let err = fixture.handler.validate_compaction(&c).unwrap_err();
+        let err = fixture
+            .handler
+            .validate_compaction(&Compaction::new(Ulid::new(), c))
+            .unwrap_err();
         assert!(matches!(err, SlateDBError::InvalidCompaction));
     }
 
@@ -4982,7 +5280,10 @@ mod tests {
         let mut fixture = CompactorEventHandlerTestFixture::new().await;
         fixture.handler.handle_ticker().await.unwrap();
         let c = CompactionSpec::new(vec![SourceId::SstView(Ulid::new())], 0);
-        let err = fixture.handler.validate_compaction(&c).unwrap_err();
+        let err = fixture
+            .handler
+            .validate_compaction(&Compaction::new(Ulid::new(), c))
+            .unwrap_err();
         assert!(matches!(err, SlateDBError::InvalidCompaction));
     }
 
@@ -4991,7 +5292,10 @@ mod tests {
         let mut fixture = CompactorEventHandlerTestFixture::new().await;
         fixture.handler.handle_ticker().await.unwrap();
         let c = CompactionSpec::new(vec![SourceId::SortedRun(42)], 42);
-        let err = fixture.handler.validate_compaction(&c).unwrap_err();
+        let err = fixture
+            .handler
+            .validate_compaction(&Compaction::new(Ulid::new(), c))
+            .unwrap_err();
         assert!(matches!(err, SlateDBError::InvalidCompaction));
     }
 
@@ -5002,7 +5306,10 @@ mod tests {
         fixture.write_l0().await;
         fixture.handler.handle_ticker().await.unwrap();
         let c = fixture.build_l0_compaction().await;
-        fixture.handler.validate_compaction(&c).unwrap();
+        fixture
+            .handler
+            .validate_compaction(&Compaction::new(Ulid::new(), c))
+            .unwrap();
     }
 
     #[tokio::test]
@@ -5020,7 +5327,10 @@ mod tests {
         fixture.write_l0().await;
         fixture.handler.handle_ticker().await.unwrap();
         let c2 = fixture.build_l0_compaction().await; // destination 0
-        let err = fixture.handler.validate_compaction(&c2).unwrap_err();
+        let err = fixture
+            .handler
+            .validate_compaction(&Compaction::new(Ulid::new(), c2))
+            .unwrap_err();
         assert!(matches!(err, SlateDBError::InvalidCompaction));
     }
 
@@ -5030,8 +5340,6 @@ mod tests {
     /// segment) must be rejected.
     #[tokio::test]
     async fn test_validate_compaction_l0_only_rejects_when_dest_below_global_highest_sr() {
-        use crate::manifest::{LsmTreeState, Segment};
-
         let mut fixture = CompactorEventHandlerTestFixture::new().await;
         let prefix = Bytes::from_static(b"seg/");
         let l0_view = Ulid::from_parts(1, 0);
@@ -5067,7 +5375,100 @@ mod tests {
         }];
 
         let spec = CompactionSpec::for_segment(prefix, vec![SourceId::SstView(l0_view)], 3);
-        let err = fixture.handler.validate_compaction(&spec).unwrap_err();
+        let err = fixture
+            .handler
+            .validate_compaction(&Compaction::new(Ulid::new(), spec))
+            .unwrap_err();
+        assert!(matches!(err, SlateDBError::InvalidCompaction));
+    }
+
+    /// Completion validation must not reuse the Submitted-only fresh-SR check.
+    /// Cross-segment L0 compactions can commit out of order: a job submitted
+    /// earlier with destination 3 is still valid even if another segment has
+    /// since committed destination 7.
+    #[tokio::test]
+    async fn test_validate_completed_l0_allows_destination_below_global_highest_sr() {
+        let mut fixture = CompactorEventHandlerTestFixture::new().await;
+        let prefix = Bytes::from_static(b"seg/");
+        let l0_view = Ulid::from_parts(1, 0);
+        let make_view = |id: Ulid| {
+            SsTableView::identity(SsTableHandle::new(
+                SsTableId::Compacted(id),
+                SST_FORMAT_VERSION_LATEST,
+                SsTableInfo::default(),
+            ))
+        };
+        let core = &mut fixture
+            .handler
+            .state_writer
+            .state
+            .manifest_mut_for_test()
+            .value
+            .core;
+        Arc::make_mut(&mut core.tree).compacted = vec![SortedRun {
+            id: 7,
+            sst_views: Vec::new(),
+        }];
+        core.segments = vec![Segment {
+            prefix: prefix.clone(),
+            tree: Arc::new(LsmTreeState {
+                last_compacted_l0_sst_view_id: None,
+                last_compacted_l0_sst_id: None,
+                l0: VecDeque::from(vec![make_view(l0_view)]),
+                compacted: Vec::new(),
+            }),
+        }];
+
+        let spec = CompactionSpec::for_segment(prefix, vec![SourceId::SstView(l0_view)], 3);
+
+        let submitted_err = fixture
+            .handler
+            .validate_compaction(&Compaction::new(Ulid::new(), spec.clone()))
+            .unwrap_err();
+        assert!(matches!(submitted_err, SlateDBError::InvalidCompaction));
+        let completed = Compaction::new(Ulid::new(), spec).with_status(CompactionStatus::Compacted);
+        fixture
+            .handler
+            .validate_compaction(&completed)
+            .expect("completed L0 compaction should not require a still-fresh destination");
+    }
+
+    #[tokio::test]
+    async fn test_validate_completed_l0_rejects_destination_below_segment_highest_sr() {
+        let mut fixture = CompactorEventHandlerTestFixture::new().await;
+        let prefix = Bytes::from_static(b"seg/");
+        let l0_view = Ulid::from_parts(1, 0);
+        let make_view = |id: Ulid| {
+            SsTableView::identity(SsTableHandle::new(
+                SsTableId::Compacted(id),
+                SST_FORMAT_VERSION_LATEST,
+                SsTableInfo::default(),
+            ))
+        };
+        fixture
+            .handler
+            .state_writer
+            .state
+            .manifest_mut_for_test()
+            .value
+            .core
+            .segments = vec![Segment {
+            prefix: prefix.clone(),
+            tree: Arc::new(LsmTreeState {
+                last_compacted_l0_sst_view_id: None,
+                last_compacted_l0_sst_id: None,
+                l0: VecDeque::from(vec![make_view(l0_view)]),
+                compacted: vec![SortedRun {
+                    id: 7,
+                    sst_views: Vec::new(),
+                }],
+            }),
+        }];
+
+        let spec = CompactionSpec::for_segment(prefix, vec![SourceId::SstView(l0_view)], 3);
+        let completed = Compaction::new(Ulid::new(), spec).with_status(CompactionStatus::Compacted);
+
+        let err = fixture.handler.validate_compaction(&completed).unwrap_err();
         assert!(matches!(err, SlateDBError::InvalidCompaction));
     }
 
@@ -5093,7 +5494,10 @@ mod tests {
             sr_id,
         );
         // Compactor-level validation should not reject (scheduler default validate returns Ok(()))
-        fixture.handler.validate_compaction(&mixed).unwrap();
+        fixture
+            .handler
+            .validate_compaction(&Compaction::new(Ulid::new(), mixed))
+            .unwrap();
     }
 
     #[tokio::test]
@@ -5119,7 +5523,10 @@ mod tests {
             vec![SourceId::SstView(state.tree.l0.front().unwrap().id)],
             1,
         );
-        let err = fixture.handler.validate_compaction(&second_l0).unwrap_err();
+        let err = fixture
+            .handler
+            .validate_compaction(&Compaction::new(Ulid::new(), second_l0))
+            .unwrap_err();
         assert!(matches!(err, SlateDBError::InvalidCompaction));
     }
 
@@ -5191,7 +5598,7 @@ mod tests {
             CompactionSpec::for_segment(prefix_b.clone(), vec![SourceId::SstView(l0_b)], 201);
         fixture
             .handler
-            .validate_compaction(&spec_b)
+            .validate_compaction(&Compaction::new(Ulid::new(), spec_b))
             .expect("L0 in disjoint segment must be allowed");
 
         // Sanity check: a second L0 spec in the SAME segment is still rejected.
@@ -5199,7 +5606,7 @@ mod tests {
             CompactionSpec::for_segment(prefix_a.clone(), vec![SourceId::SstView(l0_a)], 202);
         let err = fixture
             .handler
-            .validate_compaction(&spec_a_dup)
+            .validate_compaction(&Compaction::new(Ulid::new(), spec_a_dup))
             .unwrap_err();
         assert!(matches!(err, SlateDBError::InvalidCompaction));
     }
@@ -5215,7 +5622,10 @@ mod tests {
             vec![SourceId::SortedRun(0)],
             0,
         );
-        let err = fixture.handler.validate_compaction(&spec).unwrap_err();
+        let err = fixture
+            .handler
+            .validate_compaction(&Compaction::new(Ulid::new(), spec))
+            .unwrap_err();
         assert!(matches!(err, SlateDBError::InvalidCompaction));
     }
 
@@ -5253,7 +5663,10 @@ mod tests {
         // Segment-targeted spec lists SR(99) as a source — but SR(99) lives in
         // the root tree, not in "seg/". Must be rejected.
         let spec = CompactionSpec::for_segment(prefix, vec![SourceId::SortedRun(99)], 0);
-        let err = fixture.handler.validate_compaction(&spec).unwrap_err();
+        let err = fixture
+            .handler
+            .validate_compaction(&Compaction::new(Ulid::new(), spec))
+            .unwrap_err();
         assert!(matches!(err, SlateDBError::InvalidCompaction));
     }
 
@@ -5296,7 +5709,10 @@ mod tests {
         }];
 
         let spec = CompactionSpec::for_segment(prefix, vec![SourceId::SortedRun(99)], 7);
-        let err = fixture.handler.validate_compaction(&spec).unwrap_err();
+        let err = fixture
+            .handler
+            .validate_compaction(&Compaction::new(Ulid::new(), spec))
+            .unwrap_err();
         assert!(matches!(err, SlateDBError::InvalidCompaction));
     }
 
@@ -5306,7 +5722,10 @@ mod tests {
     async fn test_validate_compaction_rejects_drain_for_empty_prefix() {
         let fixture = CompactorEventHandlerTestFixture::new().await;
         let spec = CompactionSpec::drain_segment(Bytes::new(), vec![SourceId::SortedRun(0)]);
-        let err = fixture.handler.validate_compaction(&spec).unwrap_err();
+        let err = fixture
+            .handler
+            .validate_compaction(&Compaction::new(Ulid::new(), spec))
+            .unwrap_err();
         assert!(matches!(err, SlateDBError::InvalidCompaction));
     }
 
@@ -5353,7 +5772,10 @@ mod tests {
             prefix,
             vec![SourceId::SstView(l0_3), SourceId::SstView(l0_1)],
         );
-        let err = fixture.handler.validate_compaction(&spec).unwrap_err();
+        let err = fixture
+            .handler
+            .validate_compaction(&Compaction::new(Ulid::new(), spec))
+            .unwrap_err();
         assert!(matches!(err, SlateDBError::InvalidCompaction));
     }
 
@@ -5412,6 +5834,7 @@ mod tests {
             sst_format,
             Path::from(PATH),
             None,
+            TableStoreKind::Compactor,
         ));
         (manifest_store, compactions_store, table_store)
     }
@@ -5584,6 +6007,18 @@ mod tests {
         )
     }
 
+    // Builds a Compacted compaction whose output is recorded on a single
+    // unbounded-range subcompaction, mirroring what a worker persists on finish.
+    fn compacted_with_output(
+        id: Ulid,
+        spec: CompactionSpec,
+        output: Vec<SsTableHandle>,
+    ) -> Compaction {
+        Compaction::new(id, spec)
+            .with_status(CompactionStatus::Compacted)
+            .with_output_ssts(output)
+    }
+
     #[tokio::test]
     async fn test_commit_compacted_entries_writes_manifest() {
         // given: a handler with one L0 in the manifest
@@ -5602,9 +6037,7 @@ mod tests {
         let spec = CompactionSpec::new(sources, destination);
         let compaction_id = Ulid::from_parts(1, 0);
         let output_sst = fake_output_sst();
-        let compaction = Compaction::new(compaction_id, spec)
-            .with_status(CompactionStatus::Compacted)
-            .with_output_ssts(vec![output_sst.clone()]);
+        let compaction = compacted_with_output(compaction_id, spec, vec![output_sst.clone()]);
 
         // inject the Compacted compaction into state (bypassing the executor)
         fixture
@@ -5648,12 +6081,11 @@ mod tests {
         // given: a Compacted SR0→SR1 compaction to validate the SR source path removed when not in L0
         let sr1_output_sst = fake_output_sst();
         let sr_compaction_id = Ulid::from_parts(2, 0);
-        let sr_compaction = Compaction::new(
+        let sr_compaction = compacted_with_output(
             sr_compaction_id,
             CompactionSpec::new(vec![SourceId::SortedRun(0)], 1),
-        )
-        .with_status(CompactionStatus::Compacted)
-        .with_output_ssts(vec![sr1_output_sst.clone()]);
+            vec![sr1_output_sst.clone()],
+        );
         fixture
             .handler
             .state_mut()
@@ -5706,9 +6138,7 @@ mod tests {
         let ghost_view_id = Ulid::from_parts(u64::MAX, 0);
         let spec = CompactionSpec::new(vec![SourceId::SstView(ghost_view_id)], 0);
         let compaction_id = Ulid::new();
-        let compaction = Compaction::new(compaction_id, spec)
-            .with_status(CompactionStatus::Compacted)
-            .with_output_ssts(vec![fake_output_sst()]);
+        let compaction = compacted_with_output(compaction_id, spec, vec![fake_output_sst()]);
 
         fixture
             .handler
@@ -5736,5 +6166,252 @@ mod tests {
                 .status(),
             CompactionStatus::Failed,
         );
+    }
+
+    /// A Running compaction whose heartbeat is older than the timeout must be
+    /// reset to Scheduled (worker cleared) by `reclaim_stale_workers`.
+    #[tokio::test]
+    async fn test_reclaim_stale_running_compaction() {
+        // given: clock starts at 0 ms
+        let system_clock = Arc::new(MockSystemClock::new());
+        let timeout = Duration::from_secs(30);
+        let options = Arc::new(CompactorOptions {
+            worker_heartbeat_timeout: timeout,
+            ..compactor_options()
+        });
+        let mut fixture = CompactorEventHandlerTestFixture::new_with_clock(
+            system_clock.clone() as Arc<dyn SystemClock>,
+            options,
+        )
+        .await;
+
+        fixture.handler.state_writer.refresh().await.unwrap();
+
+        // Seed a Running compaction in-memory with last_heartbeat_ms = 0 (epoch).
+        // Then persist it so that the compactions_store reflects the seeded state.
+        let compaction_id = Ulid::new();
+        let worker = WorkerSpec::new("worker-1".to_string(), 0);
+        let compaction = Compaction::new(compaction_id, CompactionSpec::new(vec![], 0))
+            .with_status(CompactionStatus::Running)
+            .with_worker(Some(worker));
+        fixture
+            .handler
+            .state_mut()
+            .insert_compaction_for_test(compaction);
+        fixture
+            .handler
+            .state_writer
+            .write_compactions_safely()
+            .await
+            .expect("failed to persist seeded compaction");
+
+        // Advance clock well past the timeout (2× the timeout = 60 s).
+        system_clock.advance(Duration::from_secs(60)).await;
+
+        // when: call reclaim_stale_workers directly to avoid the scheduling
+        // side-effects of handle_ticker (which would try to claim the reclaimed
+        // Scheduled compaction with an empty spec and mark it Failed).
+        fixture
+            .handler
+            .reclaim_stale_workers()
+            .await
+            .expect("reclaim_stale_workers failed");
+
+        // then: the compaction is now Scheduled with no worker.
+        let stored = fixture
+            .compactions_store
+            .read_latest_compactions()
+            .await
+            .unwrap()
+            .compactions;
+        let c = stored.get(&compaction_id).expect("compaction missing");
+        assert_eq!(
+            c.status(),
+            CompactionStatus::Scheduled,
+            "should be reclaimed"
+        );
+        assert!(c.worker().is_none(), "worker should be cleared");
+
+        // and: the reclamation is counted.
+        let reclaimed = slatedb_common::metrics::lookup_metric(
+            &fixture.test_recorder,
+            crate::compactor::stats::JOBS_RECLAIMED,
+        )
+        .expect("metric not found");
+        assert_eq!(reclaimed, 1, "one job should be counted as reclaimed");
+    }
+
+    /// `jobs_claimed` counts every job inherited by the coordinator on its first
+    /// metrics update, then counts each newly claimed job exactly once across the
+    /// `Running` and `Compacted` states.
+    #[tokio::test]
+    async fn test_jobs_claimed_metric_counts_inherited_then_new_claims() {
+        let mut fixture = CompactorEventHandlerTestFixture::new().await;
+
+        let claimed_count = || {
+            slatedb_common::metrics::lookup_metric(
+                &fixture.test_recorder,
+                crate::compactor::stats::JOBS_CLAIMED,
+            )
+            .expect("metric not found")
+        };
+
+        // given: a job already claimed (Running) before the coordinator's first tick.
+        let id1 = Ulid::new();
+        fixture.handler.state_mut().insert_compaction_for_test(
+            Compaction::new(id1, CompactionSpec::new(vec![], 0))
+                .with_status(CompactionStatus::Running)
+                .with_worker(Some(WorkerSpec::new("worker-1".to_string(), 0))),
+        );
+
+        // when: the first snapshot inherits the existing claim.
+        fixture.handler.update_distributed_compaction_metrics();
+        // then: the inherited job is counted once.
+        assert_eq!(claimed_count(), 1);
+
+        // when: a new job is claimed.
+        let id2 = Ulid::new();
+        fixture.handler.state_mut().insert_compaction_for_test(
+            Compaction::new(id2, CompactionSpec::new(vec![], 0))
+                .with_status(CompactionStatus::Running)
+                .with_worker(Some(WorkerSpec::new("worker-1".to_string(), 0))),
+        );
+        fixture.handler.update_distributed_compaction_metrics();
+        // then: it is counted once.
+        assert_eq!(claimed_count(), 2);
+
+        // when: that job finishes execution (Compacted, worker retained) and we
+        // tick again.
+        fixture.handler.state_mut().update_compaction(&id2, |c| {
+            c.set_status(CompactionStatus::Compacted);
+        });
+        fixture.handler.update_distributed_compaction_metrics();
+        // then: a still-claimed job is not recounted.
+        assert_eq!(claimed_count(), 2);
+    }
+
+    /// A Running compaction whose heartbeat is within the timeout must NOT be
+    /// reclaimed by `reclaim_stale_workers`.
+    #[tokio::test]
+    async fn test_does_not_reclaim_fresh_running_compaction() {
+        // given: clock starts at 0 ms; heartbeat is also at 0 ms.
+        let system_clock = Arc::new(MockSystemClock::new());
+        let timeout = Duration::from_secs(30);
+        let options = Arc::new(CompactorOptions {
+            worker_heartbeat_timeout: timeout,
+            ..compactor_options()
+        });
+        let mut fixture = CompactorEventHandlerTestFixture::new_with_clock(
+            system_clock.clone() as Arc<dyn SystemClock>,
+            options,
+        )
+        .await;
+
+        fixture.handler.state_writer.refresh().await.unwrap();
+
+        // Seed a Running compaction with heartbeat = "now" (0 ms).
+        let compaction_id = Ulid::new();
+        let now_ms = system_clock.now().timestamp_millis() as u64;
+        let worker = WorkerSpec::new("worker-2".to_string(), now_ms);
+        let compaction = Compaction::new(compaction_id, CompactionSpec::new(vec![], 0))
+            .with_status(CompactionStatus::Running)
+            .with_worker(Some(worker));
+        fixture
+            .handler
+            .state_mut()
+            .insert_compaction_for_test(compaction);
+        fixture
+            .handler
+            .state_writer
+            .write_compactions_safely()
+            .await
+            .expect("failed to persist seeded compaction");
+
+        // Advance clock by only 5 s — well within the 30 s timeout.
+        system_clock.advance(Duration::from_secs(5)).await;
+
+        // when:
+        fixture
+            .handler
+            .reclaim_stale_workers()
+            .await
+            .expect("reclaim_stale_workers failed");
+
+        // then: the compaction is still Running (no reclaim write happened).
+        // Since nothing was written, re-read from the store and verify.
+        let stored = fixture
+            .compactions_store
+            .read_latest_compactions()
+            .await
+            .unwrap()
+            .compactions;
+        let c = stored.get(&compaction_id).expect("compaction missing");
+        assert_eq!(
+            c.status(),
+            CompactionStatus::Running,
+            "should NOT be reclaimed"
+        );
+        assert!(c.worker().is_some(), "worker should still be set");
+    }
+
+    /// A Running compaction without a worker violates the claim protocol. It
+    /// panics in debug builds and is reclaimed in release builds so it cannot
+    /// remain stuck in Running forever.
+    #[tokio::test]
+    #[cfg_attr(
+        debug_assertions,
+        should_panic(expected = "reclaiming Running compaction that has no worker")
+    )]
+    async fn test_reclaim_worker_less_running_compaction() {
+        let system_clock = Arc::new(MockSystemClock::new());
+        let options = Arc::new(CompactorOptions {
+            worker_heartbeat_timeout: Duration::from_secs(30),
+            ..compactor_options()
+        });
+        let mut fixture = CompactorEventHandlerTestFixture::new_with_clock(
+            system_clock.clone() as Arc<dyn SystemClock>,
+            options,
+        )
+        .await;
+
+        fixture.handler.state_writer.refresh().await.unwrap();
+
+        // Seed a Running compaction with no worker set.
+        let compaction_id = Ulid::new();
+        let compaction = Compaction::new(compaction_id, CompactionSpec::new(vec![], 0))
+            .with_status(CompactionStatus::Running);
+        fixture
+            .handler
+            .state_mut()
+            .insert_compaction_for_test(compaction);
+        fixture
+            .handler
+            .state_writer
+            .write_compactions_safely()
+            .await
+            .expect("failed to persist seeded compaction");
+
+        // when: reclaim should treat the worker-less entry as stale regardless
+        // of how much time has (not) passed.
+        fixture
+            .handler
+            .reclaim_stale_workers()
+            .await
+            .expect("reclaim_stale_workers failed");
+
+        // then: the compaction is now Scheduled with no worker.
+        let stored = fixture
+            .compactions_store
+            .read_latest_compactions()
+            .await
+            .unwrap()
+            .compactions;
+        let c = stored.get(&compaction_id).expect("compaction missing");
+        assert_eq!(
+            c.status(),
+            CompactionStatus::Scheduled,
+            "should be reclaimed"
+        );
+        assert!(c.worker().is_none(), "worker should remain cleared");
     }
 }

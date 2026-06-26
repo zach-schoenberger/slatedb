@@ -20,17 +20,16 @@
 //! }
 //! ```
 
-pub use crate::db_status::DbStatus;
+pub use crate::db_status::{DbStatus, SegmentPrefix};
 
 use crate::byte_buffer_manager::ByteBufferManager;
 use crate::db_cache_manager::{self, CacheTarget};
-use std::ops::{Range, RangeBounds};
+use std::ops::Range;
 use std::sync::Arc;
 
 use bytes::Bytes;
 use fail_parallel::{fail_point, FailPointRegistry};
 use object_store::path::Path;
-use object_store::prefix::PrefixStore;
 use object_store::{parse_url_opts, ObjectStore};
 use tracing::trace;
 
@@ -46,16 +45,17 @@ use std::time::Duration;
 
 use crate::batch::WriteBatch;
 use crate::batch_write::{WriteBatchMessage, WRITE_BATCH_TASK_NAME};
-use crate::bytes_range::BytesRange;
+use crate::bytes_range::{ByteRangeBounds, BytesRange};
 use crate::cached_object_store::CachedObjectStore;
 use crate::clock::MonotonicClock;
 use crate::config::{
     FlushOptions, FlushType, MergeOptions, PutOptions, ReadOptions, ScanOptions, Settings,
     WriteOptions,
 };
+use crate::db_common::extract_segment_prefix;
 use crate::db_iter::{DbIterator, DbRecencyIterator};
 use crate::db_snapshot::DbSnapshot;
-use crate::db_state::{DbState, SsTableId};
+use crate::db_state::{collect_touched_segments, DbState, SsTableId};
 use crate::db_stats::DbStats;
 use crate::error::SlateDBError;
 use crate::iter::IterationOrder;
@@ -242,10 +242,14 @@ impl DbInner {
             .await
     }
 
+    /// Shared scan path for plain range scans and prefix scans. When
+    /// `prefix` is set, every key in `range` starts with it and prefix
+    /// bloom filters are consulted to skip non-matching SSTs.
     pub(crate) async fn scan_with_options(
         &self,
         range: BytesRange,
         options: &ScanOptions,
+        prefix: Option<Bytes>,
     ) -> Result<DbIterator, SlateDBError> {
         self.check_closed()?;
         let db_state = self.state.read().view();
@@ -257,29 +261,7 @@ impl DbInner {
                     db_state: &db_state,
                     write_batch_iter: None,
                     max_seq: None,
-                    prefix: None,
-                },
-            )
-            .await
-    }
-
-    pub(crate) async fn scan_prefix_with_options(
-        &self,
-        prefix: Bytes,
-        options: &ScanOptions,
-    ) -> Result<DbIterator, SlateDBError> {
-        self.check_closed()?;
-        let range = BytesRange::from_prefix(prefix.as_ref());
-        let db_state = self.state.read().view();
-        self.reader
-            .scan_with_options(
-                range,
-                options,
-                ScanContext {
-                    db_state: &db_state,
-                    write_batch_iter: None,
-                    max_seq: None,
-                    prefix: Some(prefix),
+                    prefix,
                 },
             )
             .await
@@ -629,14 +611,8 @@ impl DbInner {
                     std::collections::BTreeSet::new();
                 let mut iter = replayed_table.table.table().iter();
                 while let Some(entry) = iter.next_sync() {
-                    match extractor.prefix_len(&crate::PrefixTarget::Point(entry.key.clone())) {
-                        Some(0) | None => {
-                            return Err(SlateDBError::EmptySegmentPrefix { key: entry.key });
-                        }
-                        Some(n) => {
-                            touched_segments.insert(entry.key.slice(0..n));
-                        }
-                    }
+                    touched_segments
+                        .insert(extract_segment_prefix(extractor.as_ref(), &entry.key)?);
                 }
                 replayed_table
                     .table
@@ -655,6 +631,10 @@ impl DbInner {
             self.replay_memtable(replayed_table)?;
             self.maybe_apply_backpressure().await?;
         }
+
+        let guard = self.state.read();
+        self.status_manager
+            .report_memtable_segments(collect_touched_segments(&guard.view()));
 
         Ok(())
     }
@@ -1080,10 +1060,9 @@ impl Db {
     ///     Ok(())
     /// }
     /// ```
-    pub async fn scan<K, T>(&self, range: T) -> Result<DbIterator, crate::Error>
+    pub async fn scan<T>(&self, range: T) -> Result<DbIterator, crate::Error>
     where
-        K: AsRef<[u8]> + Send,
-        T: RangeBounds<K> + Send,
+        T: ByteRangeBounds + Send,
     {
         self.scan_with_options(range, &ScanOptions::default()).await
     }
@@ -1120,32 +1099,36 @@ impl Db {
     ///     Ok(())
     /// }
     /// ```
-    pub async fn scan_with_options<K, T>(
+    pub async fn scan_with_options<T>(
         &self,
         range: T,
         options: &ScanOptions,
     ) -> Result<DbIterator, crate::Error>
     where
-        K: AsRef<[u8]> + Send,
-        T: RangeBounds<K> + Send,
+        T: ByteRangeBounds + Send,
     {
-        let start = range
-            .start_bound()
-            .map(|b| Bytes::copy_from_slice(b.as_ref()));
-        let end = range
-            .end_bound()
-            .map(|b| Bytes::copy_from_slice(b.as_ref()));
+        let start = range.start_bound().map(Bytes::copy_from_slice);
+        let end = range.end_bound().map(Bytes::copy_from_slice);
         let range = (start, end);
         self.inner
-            .scan_with_options(BytesRange::from(range), options)
+            .scan_with_options(BytesRange::from(range), options, None)
             .await
             .map_err(Into::into)
     }
 
-    /// Scan all keys that share the provided prefix using the default scan options.
+    /// Scan keys that share the provided prefix, restricted to `subrange`,
+    /// using the default scan options.
+    ///
+    /// The subrange bounds are key *suffixes* interpreted relative to the
+    /// prefix: a bound `s` selects the full key `prefix ++ s`. Pass `..` to
+    /// scan the prefix's entire keyspace. When a prefix extractor is
+    /// configured, prefix bloom filters are consulted to skip SSTs that
+    /// contain no matching keys.
     ///
     /// ## Arguments
     /// - `prefix`: the key prefix to scan
+    /// - `subrange`: the range of key suffixes (relative to `prefix`) to
+    ///   scan; `..` scans all keys with the prefix
     ///
     /// ## Returns
     /// - `Result<DbIterator, Error>`: An iterator with the results of the scan
@@ -1165,7 +1148,7 @@ impl Db {
     ///     db.put(b"aba", b"v1").await?;
     ///     db.put(b"b", b"v2").await?;
     ///
-    ///     let mut iter = db.scan_prefix(b"ab").await?;
+    ///     let mut iter = db.scan_prefix(b"ab", ..).await?;
     ///     let kv = iter.next().await?.unwrap();
     ///     assert_eq!(kv.key.as_ref(), b"ab");
     ///     assert_eq!(kv.value.as_ref(), b"v0");
@@ -1173,21 +1156,37 @@ impl Db {
     ///     assert_eq!(kv.key.as_ref(), b"aba");
     ///     assert_eq!(kv.value.as_ref(), b"v1");
     ///     assert_eq!(None, iter.next().await?);
+    ///
+    ///     // Restrict the scan to suffixes from b"a" onward.
+    ///     // Ordinary Rust range syntax works here; `as_slice()` is optional.
+    ///     let mut iter = db.scan_prefix(b"ab", b"a".as_slice()..).await?;
+    ///     let kv = iter.next().await?.unwrap();
+    ///     assert_eq!(kv.key.as_ref(), b"aba");
+    ///     assert_eq!(None, iter.next().await?);
     ///     Ok(())
     /// }
     /// ```
-    pub async fn scan_prefix<P>(&self, prefix: P) -> Result<DbIterator, crate::Error>
+    pub async fn scan_prefix<P, T>(
+        &self,
+        prefix: P,
+        subrange: T,
+    ) -> Result<DbIterator, crate::Error>
     where
         P: AsRef<[u8]> + Send,
+        T: ByteRangeBounds + Send,
     {
-        self.scan_prefix_with_options(prefix, &ScanOptions::default())
+        self.scan_prefix_with_options(prefix, subrange, &ScanOptions::default())
             .await
     }
 
-    /// Scan all keys that share the provided prefix with custom options.
+    /// Scan keys that share the provided prefix, restricted to `subrange`,
+    /// with custom options. See [`Self::scan_prefix`] for the subrange
+    /// semantics.
     ///
     /// ## Arguments
     /// - `prefix`: the key prefix to scan
+    /// - `subrange`: the range of key suffixes (relative to `prefix`) to
+    ///   scan; `..` scans all keys with the prefix
     /// - `options`: the scan options to use
     ///
     /// ## Returns
@@ -1213,7 +1212,7 @@ impl Db {
     ///         cache_blocks: false,
     ///         ..ScanOptions::default()
     ///     };
-    ///     let mut iter = db.scan_prefix_with_options(b"x", &options).await?;
+    ///     let mut iter = db.scan_prefix_with_options(b"x", .., &options).await?;
     ///     let kv = iter.next().await?.unwrap();
     ///     assert_eq!(kv.key.as_ref(), b"x1");
     ///     assert_eq!(kv.value.as_ref(), b"v1");
@@ -1224,17 +1223,20 @@ impl Db {
     ///     Ok(())
     /// }
     /// ```
-    pub async fn scan_prefix_with_options<P>(
+    pub async fn scan_prefix_with_options<P, T>(
         &self,
         prefix: P,
+        subrange: T,
         options: &ScanOptions,
     ) -> Result<DbIterator, crate::Error>
     where
         P: AsRef<[u8]> + Send,
+        T: ByteRangeBounds + Send,
     {
         let prefix = Bytes::copy_from_slice(prefix.as_ref());
+        let range = BytesRange::from_prefix_and_subrange(prefix.as_ref(), subrange);
         self.inner
-            .scan_prefix_with_options(prefix, options)
+            .scan_with_options(range, options, Some(prefix))
             .await
             .map_err(Into::into)
     }
@@ -1926,11 +1928,19 @@ impl Db {
 
     /// Resolve an object store from a URL.
     ///
+    /// URL must not have a path component. This is an artifact of the way `object_store`
+    /// handles URL parsing. Paths should be provided in the various `*Builder::new`
+    /// methods that take `path` arguments, not in the URL passed to this method.
+    ///
     /// ## Arguments
-    /// - `url`: the URL to resolve, for example `s3://my-bucket/my-prefix`.
+    /// - `url`: the URL to resolve with no trailing path, for example `s3://my-bucket`.
     ///
     /// ## Returns
     /// - `Result<Arc<dyn ObjectStore>, crate::Error>`: the resolved object store
+    ///
+    /// ## Errors
+    /// - `Error`: if the URL is unparseable, if the URL contains a path component, or if
+    ///   there was an error initializing the object store.
     pub fn resolve_object_store(url: &str) -> Result<Arc<dyn ObjectStore>, crate::Error> {
         let url = url
             .try_into()
@@ -1938,13 +1948,10 @@ impl Db {
         // Lowercase env keys because parse_url_opts only recognizes lower case option keys.
         let env_vars = std::env::vars().map(|(key, value)| (key.to_ascii_lowercase(), value));
         let (object_store, path) = parse_url_opts(&url, env_vars).map_err(SlateDBError::from)?;
-        let object_store: Arc<dyn ObjectStore> = if path.as_ref().is_empty() {
-            Arc::from(object_store)
-        } else {
-            let object_store: Arc<dyn ObjectStore> = Arc::from(object_store);
-            Arc::new(PrefixStore::new(object_store, path))
-        };
-        Ok(object_store)
+        if !path.as_ref().is_empty() {
+            return Err(SlateDBError::InvalidObjectStorePath(path.to_string()))?;
+        }
+        Ok(Arc::from(object_store))
     }
 }
 
@@ -1966,27 +1973,28 @@ impl DbReadOps for Db {
         Db::get_key_value_with_options(self, key, options).await
     }
 
-    async fn scan_with_options<K, T>(
+    async fn scan_with_options<T>(
         &self,
         range: T,
         options: &ScanOptions,
     ) -> Result<DbIterator, crate::Error>
     where
-        K: AsRef<[u8]> + Send,
-        T: RangeBounds<K> + Send,
+        T: ByteRangeBounds + Send,
     {
         Db::scan_with_options(self, range, options).await
     }
 
-    async fn scan_prefix_with_options<P>(
+    async fn scan_prefix_with_options<P, T>(
         &self,
         prefix: P,
+        subrange: T,
         options: &ScanOptions,
     ) -> Result<DbIterator, crate::Error>
     where
         P: AsRef<[u8]> + Send,
+        T: ByteRangeBounds + Send,
     {
-        Db::scan_prefix_with_options(self, prefix, options).await
+        Db::scan_prefix_with_options(self, prefix, subrange, options).await
     }
 }
 
@@ -2135,7 +2143,7 @@ mod tests {
     use crate::config::{
         CheckpointOptions, CompactionWorkerOptions, CompactorOptions,
         GarbageCollectorDirectoryOptions, GarbageCollectorOptions, ObjectStoreCacheOptions,
-        PutOptions, ScanOptions, Settings, Ttl, WriteOptions,
+        PutOptions, ScanOptions, Settings, SstBlockSize, Ttl, WriteOptions,
     };
     use crate::db::builder::{GarbageCollectorBuilder, MIN_WRITE_BUFFER_SIZE};
     use crate::db_stats::IMMUTABLE_MEMTABLE_FLUSHES;
@@ -2155,6 +2163,7 @@ mod tests {
     use crate::proptest_util::sample;
     use crate::seq_tracker::FindOption;
     use crate::sst_iter::{SstIterator, SstIteratorOptions};
+    use crate::tablestore::TableStoreKind;
     use crate::test_utils::{
         assert_iterator, lookup_merge_operator_operands, GatedObjectStore,
         OnDemandCompactionSchedulerSupplier, StringConcatMergeOperator,
@@ -2167,7 +2176,7 @@ mod tests {
     use fail_parallel::FailPointRegistry;
     use futures::{future, future::join_all, FutureExt, StreamExt};
     use object_store::memory::InMemory;
-    use object_store::{ObjectStore, ObjectStoreExt};
+    use object_store::ObjectStore;
     use proptest::test_runner::{TestRng, TestRunner};
     use slatedb_common::clock::DefaultSystemClock;
     use slatedb_common::clock::MockSystemClock;
@@ -2323,7 +2332,8 @@ mod tests {
             .with_settings(test_db_options(0, 1024, None))
             .with_compactor_builder(
                 CompactorBuilder::new(path, object_store.clone())
-                    .with_scheduler_supplier(compaction_scheduler),
+                    .with_scheduler_supplier(compaction_scheduler)
+                    .with_options(fast_compactor_options()),
             )
             .build()
             .await
@@ -2396,11 +2406,61 @@ mod tests {
         kv_store.put(b"abb", b"v2").await.unwrap();
         kv_store.put(b"ac", b"v3").await.unwrap();
 
-        let mut iter = kv_store.scan_prefix(b"ab").await.unwrap();
+        let mut iter = kv_store.scan_prefix(b"ab", ..).await.unwrap();
         assert_eq!(iter.next().await.unwrap().unwrap().key.as_ref(), b"ab");
         assert_eq!(iter.next().await.unwrap().unwrap().key.as_ref(), b"aba");
         assert_eq!(iter.next().await.unwrap().unwrap().key.as_ref(), b"abb");
         assert_eq!(iter.next().await.unwrap(), None);
+
+        kv_store.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_scan_and_prefix_range_forms_are_accepted() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let kv_store = Db::builder("/tmp/test_scan_range_forms", object_store)
+            .with_settings(test_db_options(0, 1024, None))
+            .build()
+            .await
+            .unwrap();
+
+        kv_store.put(b"a", b"v0").await.unwrap();
+        kv_store.put(b"aa", b"v1").await.unwrap();
+        kv_store.put(b"ab", b"v2").await.unwrap();
+        kv_store.put(b"b", b"v3").await.unwrap();
+
+        let mut all = kv_store.scan(..).await.unwrap();
+        assert_eq!(all.next().await.unwrap().unwrap().key.as_ref(), b"a");
+        assert_eq!(all.next().await.unwrap().unwrap().key.as_ref(), b"aa");
+        assert_eq!(all.next().await.unwrap().unwrap().key.as_ref(), b"ab");
+        assert_eq!(all.next().await.unwrap().unwrap().key.as_ref(), b"b");
+        assert_eq!(all.next().await.unwrap(), None);
+
+        let mut range = kv_store.scan(b"a".to_vec()..=b"ab".to_vec()).await.unwrap();
+        assert_eq!(range.next().await.unwrap().unwrap().key.as_ref(), b"a");
+        assert_eq!(range.next().await.unwrap().unwrap().key.as_ref(), b"aa");
+        assert_eq!(range.next().await.unwrap().unwrap().key.as_ref(), b"ab");
+        assert_eq!(range.next().await.unwrap(), None);
+
+        let mut prefix = kv_store.scan_prefix(b"a", b"".to_vec()..).await.unwrap();
+        assert_eq!(prefix.next().await.unwrap().unwrap().key.as_ref(), b"a");
+        assert_eq!(prefix.next().await.unwrap().unwrap().key.as_ref(), b"aa");
+        assert_eq!(prefix.next().await.unwrap().unwrap().key.as_ref(), b"ab");
+        assert_eq!(prefix.next().await.unwrap(), None);
+
+        let mut bounded_prefix = kv_store
+            .scan_prefix(b"a", b"a".to_vec()..=b"b".to_vec())
+            .await
+            .unwrap();
+        assert_eq!(
+            bounded_prefix.next().await.unwrap().unwrap().key.as_ref(),
+            b"aa"
+        );
+        assert_eq!(
+            bounded_prefix.next().await.unwrap().unwrap().key.as_ref(),
+            b"ab"
+        );
+        assert_eq!(bounded_prefix.next().await.unwrap(), None);
 
         kv_store.close().await.unwrap();
     }
@@ -2421,10 +2481,7 @@ mod tests {
         kv_store.put(b"d", b"v3").await.unwrap();
 
         let scan_options = ScanOptions::default().with_order(IterationOrder::Descending);
-        let mut iter = kv_store
-            .scan_with_options::<Vec<u8>, _>(.., &scan_options)
-            .await
-            .unwrap();
+        let mut iter = kv_store.scan_with_options(.., &scan_options).await.unwrap();
         assert_eq!(iter.next().await.unwrap().unwrap().key.as_ref(), b"d");
         assert_eq!(iter.next().await.unwrap().unwrap().key.as_ref(), b"c");
         assert_eq!(iter.next().await.unwrap().unwrap().key.as_ref(), b"b");
@@ -2451,7 +2508,7 @@ mod tests {
 
         let scan_options = ScanOptions::default().with_order(IterationOrder::Descending);
         let mut iter = kv_store
-            .scan_with_options::<Vec<u8>, _>(b"b".to_vec()..b"d".to_vec(), &scan_options)
+            .scan_with_options(b"b".to_vec()..b"d".to_vec(), &scan_options)
             .await
             .unwrap();
         assert_eq!(iter.next().await.unwrap().unwrap().key.as_ref(), b"c");
@@ -2478,10 +2535,7 @@ mod tests {
         kv_store.delete(b"d").await.unwrap();
 
         let scan_options = ScanOptions::default().with_order(IterationOrder::Descending);
-        let mut iter = kv_store
-            .scan_with_options::<Vec<u8>, _>(.., &scan_options)
-            .await
-            .unwrap();
+        let mut iter = kv_store.scan_with_options(.., &scan_options).await.unwrap();
         assert_eq!(iter.next().await.unwrap().unwrap().key.as_ref(), b"c");
         assert_eq!(iter.next().await.unwrap().unwrap().key.as_ref(), b"a");
         assert_eq!(iter.next().await.unwrap(), None);
@@ -2505,7 +2559,7 @@ mod tests {
 
         let scan_options = ScanOptions::default().with_order(IterationOrder::Descending);
         let mut iter = kv_store
-            .scan_prefix_with_options(b"prefix/", &scan_options)
+            .scan_prefix_with_options(b"prefix/", .., &scan_options)
             .await
             .unwrap();
         assert_eq!(
@@ -2545,7 +2599,7 @@ mod tests {
             ..ScanOptions::default()
         };
         let mut iter = kv_store
-            .scan_prefix_with_options(&[0xff, 0xff], &scan_options)
+            .scan_prefix_with_options(&[0xff, 0xff], .., &scan_options)
             .await
             .unwrap();
         assert_eq!(
@@ -2851,7 +2905,8 @@ mod tests {
             .with_settings(test_db_options(0, 64 * 1024, None))
             .with_compactor_builder(
                 CompactorBuilder::new(path, object_store.clone())
-                    .with_scheduler_supplier(scheduler),
+                    .with_scheduler_supplier(scheduler)
+                    .with_options(fast_compactor_options()),
             )
             .build()
             .await
@@ -2967,26 +3022,6 @@ mod tests {
         assert!(iter.next_entry().await.unwrap().is_none());
 
         db.close().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn test_resolve_object_store_local_prefix_store_writes_to_path() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let prefix_path = temp_dir.path().join("prefix-store");
-        let url = format!("file://{}", prefix_path.display());
-
-        let object_store = Db::resolve_object_store(&url).unwrap();
-        let location = object_store::path::Path::from("nested/file.txt");
-        let payload = Bytes::from_static(b"local prefix payload");
-
-        object_store
-            .put(&location, payload.clone().into())
-            .await
-            .unwrap();
-
-        let expected_path = prefix_path.join("nested").join("file.txt");
-        let stored = tokio::fs::read(&expected_path).await.unwrap();
-        assert_eq!(stored, payload.to_vec());
     }
 
     #[test]
@@ -3729,17 +3764,6 @@ mod tests {
             .build()
             .await
             .unwrap();
-        // `cache_puts_enabled` won't take effect until after the first
-        // `resolve_root`. Call head to force the root to be resolved.
-        // Use the first WAL entry since it's guaranteed to exist because
-        // it's the fencing write.
-        cached_object_store
-            .head(&object_store::path::Path::from(format!(
-                "{}/wal/00000000000000000001.sst",
-                db_path
-            )))
-            .await
-            .unwrap();
         let key = b"test_key";
         let value = b"test_value";
         kv_store.put(key, value).await.unwrap();
@@ -3787,9 +3811,7 @@ mod tests {
     async fn test_get_with_object_store_cache_put_caching_enabled() {
         let expected_cache_parts =
             vec![
-            // not cached because this manifest is put before the root is resolved, which is when
-            // `cache_puts_enabled` starts taking effect.
-            ("tmp/test_kv_store_with_put_cache_enabled/manifest/00000000000000000001.manifest", 0),
+            ("tmp/test_kv_store_with_put_cache_enabled/manifest/00000000000000000001.manifest", 1),
             // 1 part is cached because fence_writers refreshes the manifest after writing the fence.
             ("tmp/test_kv_store_with_put_cache_enabled/manifest/00000000000000000002.manifest", 1),
             // The startup fence WAL is zero bytes, so replay does not cache any object parts.
@@ -3847,7 +3869,7 @@ mod tests {
                 let iter = self
                     .db
                     .inner
-                    .scan_with_options(range, &ScanOptions::default())
+                    .scan_with_options(range, &ScanOptions::default(), None)
                     .await
                     .unwrap();
                 Box::new(iter)
@@ -3887,7 +3909,7 @@ mod tests {
     ) {
         let mut iter = db
             .inner
-            .scan_with_options(range.clone(), scan_options)
+            .scan_with_options(range.clone(), scan_options, None)
             .await
             .unwrap();
         test_utils::assert_ranged_db_scan(table, range, IterationOrder::Ascending, &mut iter).await;
@@ -4030,14 +4052,17 @@ mod tests {
         ) {
             let mut iter = db
                 .inner
-                .scan_with_options(scan_range.clone(), &ScanOptions::default())
+                .scan_with_options(scan_range.clone(), &ScanOptions::default(), None)
                 .await
                 .unwrap();
 
             let seek_key = sample::bytes_in_range(rng, scan_range);
             iter.seek(seek_key.clone()).await.unwrap();
 
-            let seek_range = BytesRange::new(Included(seek_key), scan_range.end_bound().cloned());
+            let seek_range = BytesRange::new(
+                Included(seek_key),
+                std::ops::RangeBounds::end_bound(scan_range).cloned(),
+            );
             test_utils::assert_ranged_db_scan(
                 table,
                 seek_range,
@@ -4287,6 +4312,7 @@ mod tests {
             sst_format,
             path.clone(),
             None,
+            TableStoreKind::Main,
         ));
         let db = Db::builder(path.clone(), object_store.clone())
             .with_settings(options)
@@ -4387,6 +4413,7 @@ mod tests {
             sst_format,
             path,
             None,
+            TableStoreKind::Main,
         ));
 
         // Write data a few times such that each loop results in a memtable flush
@@ -4573,6 +4600,7 @@ mod tests {
             sst_format,
             path,
             None,
+            TableStoreKind::Main,
         ));
 
         // Write some data to populate the memtable
@@ -5660,7 +5688,8 @@ mod tests {
             .with_merge_operator(Arc::new(StringConcatMergeOperator {}))
             .with_compactor_builder(
                 CompactorBuilder::new(path, object_store.clone())
-                    .with_scheduler_supplier(compaction_scheduler.clone()),
+                    .with_scheduler_supplier(compaction_scheduler.clone())
+                    .with_options(fast_compactor_options()),
             )
             .build()
             .await
@@ -6199,6 +6228,7 @@ mod tests {
             SsTableFormat::default(),
             path,
             None,
+            TableStoreKind::Main,
         ));
 
         // Get the next WAL SST ID based on what's currently in the object store
@@ -6411,7 +6441,7 @@ mod tests {
         assert_eq!(db.inner.state.read().state().core().next_wal_sst_id, 2);
         let wal_ssts = db.inner.table_store.list_wal_ssts(..).await.unwrap();
         assert_eq!(wal_ssts.len(), 1);
-        assert_eq!(wal_ssts[0].size, 0);
+        assert_eq!(wal_ssts[0].metadata.size, 0);
         db.put(b"1", b"1").await.unwrap();
         // assert that second open writes another empty wal.
         let db = Db::builder(path, object_store.clone())
@@ -6509,6 +6539,7 @@ mod tests {
             SsTableFormat::default(),
             path,
             None,
+            TableStoreKind::Main,
         ));
         let mut w1_paused = false;
         for _ in 0..600 {
@@ -6604,6 +6635,7 @@ mod tests {
             SsTableFormat::default(),
             path,
             None,
+            TableStoreKind::Main,
         );
         wait_for_wal_sst_count(
             &probe_table_store,
@@ -6681,6 +6713,7 @@ mod tests {
             SsTableFormat::default(),
             path,
             None,
+            TableStoreKind::Main,
         );
         wait_for_wal_sst_count(
             &probe_table_store,
@@ -7201,6 +7234,21 @@ mod tests {
         test_db_options_with_ttl(min_filter_keys, l0_sst_size_bytes, compactor_options, None)
     }
 
+    /// Compactor options with fast poll intervals. With the defaults (5s
+    /// coordinator poll + 5s worker claim poll, jittered up to 1.5x), a
+    /// compaction can take longer to land in the manifest than the 10s the
+    /// tests using this helper wait for one.
+    fn fast_compactor_options() -> CompactorOptions {
+        CompactorOptions {
+            poll_interval: Duration::from_millis(100),
+            worker: Some(CompactionWorkerOptions {
+                compactions_poll_interval: Duration::from_millis(100),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
     fn test_db_options_with_ttl(
         min_filter_keys: u32,
         l0_sst_size_bytes: usize,
@@ -7352,6 +7400,150 @@ mod tests {
             );
             assert!(recent_min_seq > snapshot_seq);
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_compaction_resume_loses_merge_operands_after_snapshot_retention_advances() {
+        let path =
+            "/tmp/test_compaction_resume_loses_merge_operands_after_snapshot_retention_advances";
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let fp_registry = Arc::new(FailPointRegistry::new());
+        let should_compact = Arc::new(AtomicBool::new(false));
+        let compactor_options = CompactorOptions {
+            poll_interval: Duration::from_millis(10),
+            commit_compacted_interval: Duration::from_millis(10),
+            worker: Some(CompactionWorkerOptions {
+                compactions_poll_interval: Duration::from_millis(10),
+                max_sst_size: 1,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let settings_without_compactor = test_db_options(0, 1024, None);
+
+        let db = Db::builder(path, object_store.clone())
+            .with_settings(settings_without_compactor.clone())
+            .with_sst_block_size(SstBlockSize::Other(1))
+            .with_fp_registry(fp_registry.clone())
+            .with_merge_operator(Arc::new(StringConcatMergeOperator))
+            .with_compactor_builder(
+                CompactorBuilder::new(path, object_store.clone())
+                    .with_options(compactor_options.clone())
+                    .with_scheduler_supplier(Arc::new(OnDemandCompactionSchedulerSupplier::new({
+                        let should_compact = should_compact.clone();
+                        Arc::new(move |_| should_compact.load(Ordering::SeqCst))
+                    }))),
+            )
+            .build()
+            .await
+            .unwrap();
+
+        db.merge(b"k", b"1").await.unwrap();
+        let snapshot = db.snapshot().await.unwrap();
+        let snapshot_seq = db.inner.oracle.last_committed_seq();
+        db.flush().await.unwrap();
+
+        for operand in [b"2", b"3", b"4", b"5", b"6"] {
+            db.merge(b"k", operand).await.unwrap();
+            db.flush().await.unwrap();
+        }
+
+        let manifest_store = Arc::new(ManifestStore::new(&Path::from(path), object_store.clone()));
+        let mut stored_manifest =
+            StoredManifest::load(manifest_store.clone(), Arc::new(DefaultSystemClock::new()))
+                .await
+                .unwrap();
+        let staged = wait_for_manifest_condition(
+            &mut stored_manifest,
+            |core| core.last_l0_seq >= 6 && core.recent_snapshot_min_seq == snapshot_seq,
+            Duration::from_secs(10),
+        )
+        .await;
+        assert!(
+            staged.tree.l0.len() > 1,
+            "the test requires multiple L0s so compaction has work to resume"
+        );
+
+        fail_parallel::cfg(
+            fp_registry.clone(),
+            "compactor-progress-after-first-output-sst",
+            "return",
+        )
+        .unwrap();
+
+        let mut status_rx = db.subscribe();
+        should_compact.store(true, Ordering::SeqCst);
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if status_rx.borrow().close_reason.is_some() {
+                    break;
+                }
+                status_rx.changed().await.expect("db status channel closed");
+            }
+        })
+        .await
+        .expect("compactor did not hit the failpoint");
+
+        drop(snapshot);
+        db.close().await.unwrap();
+        fail_parallel::cfg(
+            fp_registry.clone(),
+            "compactor-progress-after-first-output-sst",
+            "off",
+        )
+        .unwrap();
+
+        let db = Db::builder(path, object_store.clone())
+            .with_settings(settings_without_compactor.clone())
+            .with_sst_block_size(SstBlockSize::Other(1))
+            .with_fp_registry(fp_registry.clone())
+            .with_merge_operator(Arc::new(StringConcatMergeOperator))
+            .build()
+            .await
+            .unwrap();
+        db.put(b"zz-advance-retention", b"x").await.unwrap();
+        db.flush().await.unwrap();
+        wait_for_manifest_condition(
+            &mut stored_manifest,
+            |core| core.last_l0_seq >= 7 && core.recent_snapshot_min_seq > snapshot_seq,
+            Duration::from_secs(10),
+        )
+        .await;
+        db.close().await.unwrap();
+
+        let db = Db::builder(path, object_store.clone())
+            .with_settings(settings_without_compactor)
+            .with_sst_block_size(SstBlockSize::Other(1))
+            .with_fp_registry(fp_registry)
+            .with_merge_operator(Arc::new(StringConcatMergeOperator))
+            .with_compactor_builder(
+                CompactorBuilder::new(path, object_store.clone())
+                    .with_options(compactor_options)
+                    .with_scheduler_supplier(Arc::new(OnDemandCompactionSchedulerSupplier::new(
+                        Arc::new(|_| false),
+                    ))),
+            )
+            .build()
+            .await
+            .unwrap();
+
+        let manifest_store = Arc::new(ManifestStore::new(&Path::from(path), object_store.clone()));
+        let mut stored_manifest =
+            StoredManifest::load(manifest_store, Arc::new(DefaultSystemClock::new()))
+                .await
+                .unwrap();
+        wait_for_manifest_condition(
+            &mut stored_manifest,
+            |core| !core.tree.compacted.is_empty(),
+            Duration::from_secs(10),
+        )
+        .await;
+        db.refresh_manifest().await.unwrap();
+
+        let actual = db.get(b"k").await.unwrap();
+        db.close().await.unwrap();
+
+        assert_eq!(actual, Some(Bytes::from_static(b"123456")));
     }
 
     #[tokio::test]
@@ -7928,6 +8120,7 @@ mod tests {
             SsTableFormat::default(),
             path.clone(),
             None,
+            TableStoreKind::Main,
         );
         let compacted_ssts = table_store
             .list_compacted_ssts(..)
@@ -9319,7 +9512,7 @@ mod tests {
             .await
             .unwrap();
 
-        let mut iter = db.scan::<Bytes, _>(..).await.unwrap();
+        let mut iter = db.scan(..).await.unwrap();
 
         let row_entry1 = iter.next_entry().await.unwrap().unwrap();
         assert_eq!(row_entry1.key, Bytes::from_static(b"key1"));
@@ -9421,7 +9614,7 @@ mod tests {
         db.put(b"k1", b"v1").await.unwrap();
 
         // when:
-        let mut iter = db.scan::<&[u8], _>(..).await.unwrap();
+        let mut iter = db.scan(..).await.unwrap();
         let _ = iter.next().await;
 
         // then:
@@ -10039,6 +10232,165 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn should_report_new_memtable_segments_in_subscription() {
+        // given
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let path = "/tmp/test_subscribe_reports_memtable_segments";
+        let mut settings = test_db_options(0, 16 * 1024, None);
+        settings.flush_interval = None;
+        let db = Db::builder(path, object_store.clone())
+            .with_settings(settings)
+            .with_segment_extractor(Arc::new(test_utils::FixedThreeBytePrefixExtractor))
+            .build()
+            .await
+            .unwrap();
+        let mut rx = db.subscribe();
+        assert!(rx.borrow_and_update().list_segments().is_empty());
+        let write_opts = WriteOptions {
+            await_durable: false,
+            ..Default::default()
+        };
+
+        // when
+        db.put_with_options(b"abc-1", b"v1", &PutOptions::default(), &write_opts)
+            .await
+            .unwrap();
+
+        // then
+        rx.wait_for(|s| {
+            s.list_segments()
+                .iter()
+                .any(|seg| seg.prefix.as_ref() == b"abc")
+        })
+        .await
+        .unwrap();
+
+        // when
+        db.put_with_options(b"xyz-1", b"v2", &PutOptions::default(), &write_opts)
+            .await
+            .unwrap();
+
+        // then
+        rx.wait_for(|s| {
+            s.list_segments()
+                .into_iter()
+                .map(|seg| seg.prefix)
+                .collect::<Vec<_>>()
+                == vec![Bytes::from_static(b"abc"), Bytes::from_static(b"xyz")]
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn should_report_segments_in_manifest_after_flush() {
+        // given
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let path = "/tmp/test_report_segments_in_manifest_after_flush";
+        let mut settings = test_db_options(0, 16 * 1024, None);
+        settings.flush_interval = None;
+        let db = Db::builder(path, object_store.clone())
+            .with_settings(settings)
+            .with_segment_extractor(Arc::new(test_utils::FixedThreeBytePrefixExtractor))
+            .build()
+            .await
+            .unwrap();
+        let mut rx = db.subscribe();
+        rx.borrow_and_update();
+
+        // when
+        db.put_with_options(
+            b"abc-1",
+            b"v1",
+            &PutOptions::default(),
+            &WriteOptions {
+                await_durable: false,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        // then
+        rx.wait_for(|s| {
+            s.list_segments()
+                .iter()
+                .any(|seg| seg.prefix.as_ref() == b"abc")
+        })
+        .await
+        .unwrap();
+
+        // when
+        db.flush_with_options(FlushOptions {
+            flush_type: FlushType::MemTable,
+        })
+        .await
+        .unwrap();
+
+        // then
+        rx.wait_for(|s| {
+            s.list_segments()
+                .into_iter()
+                .map(|seg| seg.prefix)
+                .collect::<Vec<_>>()
+                == vec![Bytes::from_static(b"abc")]
+        })
+        .await
+        .unwrap();
+
+        // when
+        // the segments are deleted from the manifest (as a full compaction would)
+        db.inner
+            .state
+            .write()
+            .modify(|m| m.state.manifest.value.core.segments.clear());
+        let manifest = db.inner.state.read().state().manifest.clone();
+        db.inner.status_manager.report_manifest(manifest.into());
+
+        // then
+        assert!(db.status().list_segments().is_empty());
+    }
+
+    #[tokio::test]
+    async fn should_not_report_segments_without_extractor() {
+        // given
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let path = "/tmp/test_no_segments_without_extractor";
+        let mut settings = test_db_options(0, 16 * 1024, None);
+        settings.flush_interval = None;
+        let db = Db::builder(path, object_store.clone())
+            .with_settings(settings)
+            .build()
+            .await
+            .unwrap();
+        let mut rx = db.subscribe();
+        assert!(rx.borrow_and_update().list_segments().is_empty());
+
+        // when
+        db.put_with_options(
+            b"abc-1",
+            b"v1",
+            &PutOptions::default(),
+            &WriteOptions {
+                await_durable: false,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        // the flush drains the write path and folds the memtable into the
+        // manifest, so both reporting paths have run by the time it returns.
+        db.flush_with_options(FlushOptions {
+            flush_type: FlushType::MemTable,
+        })
+        .await
+        .unwrap();
+
+        // then
+        assert!(db.status().list_segments().is_empty());
+    }
+
     #[derive(Clone, Copy, Debug)]
     enum ExtractorConfig {
         None,
@@ -10541,7 +10893,7 @@ mod tests {
     where
         R: DbReadOps + Sync,
     {
-        let mut prefix_iter = reader.scan_prefix(b"bbb").await.unwrap();
+        let mut prefix_iter = reader.scan_prefix(b"bbb", ..).await.unwrap();
         test_utils::assert_ranged_db_scan(
             table,
             Bytes::from_static(b"bbb")..Bytes::from_static(b"bbc"),
@@ -10550,8 +10902,35 @@ mod tests {
         )
         .await;
 
+        // Bounded subranges compose with the prefix on every read surface:
+        // a start bound that excludes earlier suffixes...
+        let mut subrange_iter = reader
+            .scan_prefix(b"bbb", b"-002".as_slice()..)
+            .await
+            .unwrap();
+        test_utils::assert_ranged_db_scan(
+            table,
+            Bytes::from_static(b"bbb-002")..Bytes::from_static(b"bbc"),
+            IterationOrder::Ascending,
+            &mut subrange_iter,
+        )
+        .await;
+
+        // ...and an end bound that excludes later suffixes.
+        let mut subrange_iter = reader
+            .scan_prefix(b"ddd", b"-001".as_slice()..b"-004".as_slice())
+            .await
+            .unwrap();
+        test_utils::assert_ranged_db_scan(
+            table,
+            Bytes::from_static(b"ddd-001")..Bytes::from_static(b"ddd-004"),
+            IterationOrder::Ascending,
+            &mut subrange_iter,
+        )
+        .await;
+
         let mut asc_iter = reader
-            .scan::<Vec<u8>, _>(b"aaa".to_vec()..=b"ddd-999".to_vec())
+            .scan(b"aaa".to_vec()..=b"ddd-999".to_vec())
             .await
             .unwrap();
         test_utils::assert_ranged_db_scan(
@@ -10564,7 +10943,7 @@ mod tests {
 
         let desc_options = ScanOptions::default().with_order(IterationOrder::Descending);
         let mut desc_iter = reader
-            .scan_with_options::<Vec<u8>, _>(b"aaa".to_vec()..=b"ddd-999".to_vec(), &desc_options)
+            .scan_with_options(b"aaa".to_vec()..=b"ddd-999".to_vec(), &desc_options)
             .await
             .unwrap();
         test_utils::assert_ranged_db_scan(
@@ -10576,7 +10955,7 @@ mod tests {
         .await;
 
         let mut gap_iter = reader
-            .scan::<Vec<u8>, _>(b"bbc".to_vec()..=b"ddd-002".to_vec())
+            .scan(b"bbc".to_vec()..=b"ddd-002".to_vec())
             .await
             .unwrap();
         test_utils::assert_ranged_db_scan(
@@ -10619,6 +10998,7 @@ mod tests {
         db.close().await.unwrap();
 
         let reader = DbReaderBuilder::new(path, object_store)
+            .with_segment_extractor(Arc::new(test_utils::FixedThreeBytePrefixExtractor))
             .build()
             .await
             .unwrap();

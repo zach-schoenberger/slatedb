@@ -388,6 +388,15 @@ pub enum SstType {
     Wal,
 }
 
+impl From<&SsTableId> for SstType {
+    fn from(id: &SsTableId) -> Self {
+        match id {
+            SsTableId::Wal(_) => SstType::Wal,
+            SsTableId::Compacted(_) => SstType::Compacted,
+        }
+    }
+}
+
 /// Filter block format stored in SsTableInfo.
 /// Default is `Composite` (the current format). `Legacy` is only set when
 /// decoding old SSTs via FlatBuffers (where the field is absent and maps to 0).
@@ -658,6 +667,34 @@ impl DbStateReader for DbStateView {
     fn core(&self) -> &ManifestCore {
         self.state.core()
     }
+}
+
+/// Union of the segment prefixes (RFC-0024) touched across a handle's live
+/// memtables — the active memtable plus every immutable memtable.
+///
+/// Used to (re)establish or shrink the published memtable segment set at the
+/// points where the live-memtable set changes in a way a single write cannot
+/// express: open / WAL replay / checkpoint refresh, and right after a flush pops
+/// a memtable and folds its prefixes into the manifest. Recomputing the union
+/// here makes the set drop a prefix once the last live memtable holding it has
+/// flushed (and keeps it while any other live memtable still holds it). The
+/// write path, by contrast, only ever *adds* prefixes, so it publishes
+/// incrementally via [`DbStatusManager::add_memtable_segments`] instead of
+/// calling this.
+///
+/// The set is empty for a non-segmented database — one whose manifest records
+/// no segment extractor — so the caller need not gate the call itself.
+pub(crate) fn collect_touched_segments(
+    reader: &dyn DbStateReader,
+) -> std::collections::BTreeSet<Bytes> {
+    if reader.core().segment_extractor_name.is_none() {
+        return std::collections::BTreeSet::new();
+    }
+    let mut set = reader.memtable().touched_segments();
+    for imm in reader.imm_memtable() {
+        set.extend(imm.table().touched_segments());
+    }
+    set
 }
 
 impl DbState {

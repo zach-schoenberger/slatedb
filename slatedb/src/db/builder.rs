@@ -101,7 +101,7 @@
 //! }
 //! ```
 //!
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::ops::{Bound, RangeBounds};
 use std::sync::Arc;
 
@@ -147,8 +147,8 @@ use crate::error::SlateDBError;
 use crate::fence::{WriterFenceResult, WriterFencer};
 use crate::filter_policy::{BloomFilterPolicy, FilterPolicy};
 use crate::format::sst::{BlockTransformer, SsTableFormat};
-use crate::garbage_collector::GarbageCollector;
 use crate::garbage_collector::GC_TASK_NAME;
+use crate::garbage_collector::{GarbageCollector, GcFilter};
 use crate::instrumented_object_store::{InstrumentedObjectStore, ObjectStoreComponent};
 use crate::manifest::store::{ManifestStore, StoredManifest};
 use crate::manifest::ManifestCore;
@@ -159,7 +159,7 @@ use crate::object_stores::ObjectStores;
 use crate::paths::PathResolver;
 use crate::retrying_object_store::RetryingObjectStore;
 use crate::store_provider::DefaultStoreProvider;
-use crate::tablestore::TableStore;
+use crate::tablestore::{TableStore, TableStoreKind};
 use crate::utils::SafeSender;
 use crate::utils::WatchableOnceCell;
 use slatedb_common::clock::DefaultSystemClock;
@@ -567,6 +567,7 @@ impl<P: Into<Path>> DbBuilder<P> {
                     system_clock.clone(),
                 )) as Arc<dyn DbCache>
             }),
+            TableStoreKind::Main,
         ));
 
         // Initialize the database
@@ -597,9 +598,10 @@ impl<P: Into<Path>> DbBuilder<P> {
 
         // Shared lifecycle state — created before DbInner so it can be shared
         // with the executor and future channel construction.
-        let status_manager = DbStatusManager::new_with_manifest(
+        let status_manager = DbStatusManager::new_with_initial_values(
             manifest_dirty.value.core.last_l0_seq,
             manifest_dirty.clone().into(),
+            BTreeSet::new(),
         );
 
         // Setup communication channels wired to the shared closed state.
@@ -657,18 +659,8 @@ impl<P: Into<Path>> DbBuilder<P> {
             write_rx,
             &tokio_handle,
         )?;
-        // Not to pollute the cache during compaction or GC
-        let uncached_table_store = Arc::new(TableStore::new_with_fp_registry(
-            ObjectStores::new(
-                retrying_main_object_store.clone(),
-                retrying_wal_object_store.clone(),
-            ),
-            sst_format,
-            path_resolver.clone(),
-            self.fp_registry.clone(),
-            None,
-        ));
-
+        // The compactor and GC each get their own cacheless store (so background
+        // reads do not pollute the foreground cache), tagged with their kind.
         let compactor_builder = self.compactor_builder.or_else(|| {
             self.settings.compactor_options.as_ref().map(|opts| {
                 CompactorBuilder::new(path.clone(), retrying_main_object_store.clone())
@@ -689,10 +681,22 @@ impl<P: Into<Path>> DbBuilder<P> {
             if let Some(operator) = self.merge_operator {
                 builder = builder.with_merge_operator(operator);
             }
+            builder = builder.with_fp_registry(self.fp_registry.clone());
 
+            let compactor_table_store = Arc::new(TableStore::new_with_fp_registry(
+                ObjectStores::new(
+                    retrying_main_object_store.clone(),
+                    retrying_wal_object_store.clone(),
+                ),
+                sst_format.clone(),
+                path_resolver.clone(),
+                self.fp_registry.clone(),
+                None,
+                TableStoreKind::Compactor,
+            ));
             let compactor_handlers = builder
                 .build_handler(
-                    uncached_table_store.clone(),
+                    compactor_table_store,
                     manifest_store.clone(),
                     compactions_store.clone(),
                 )
@@ -728,12 +732,23 @@ impl<P: Into<Path>> DbBuilder<P> {
                 .options
                 .metric_level
                 .or(Some(self.settings.metric_level));
+            let gc_table_store = Arc::new(TableStore::new_with_fp_registry(
+                ObjectStores::new(
+                    retrying_main_object_store.clone(),
+                    retrying_wal_object_store.clone(),
+                ),
+                sst_format.clone(),
+                path_resolver.clone(),
+                self.fp_registry.clone(),
+                None,
+                TableStoreKind::GC,
+            ));
             let gc = gc_builder
                 .with_system_clock(system_clock.clone())
                 .with_metrics_recorder(metrics_recorder.clone())
                 .with_seed(rand.rng().next_u64())
                 .build_collector(
-                    uncached_table_store.clone(),
+                    gc_table_store,
                     manifest_store.clone(),
                     compactions_store.clone(),
                     retrying_main_object_store.clone(),
@@ -859,6 +874,7 @@ pub struct GarbageCollectorBuilder<P: Into<Path>> {
     main_object_store: Arc<dyn ObjectStore>,
     wal_object_store: Option<Arc<dyn ObjectStore>>,
     options: GarbageCollectorOptions,
+    gc_filter: Option<Arc<dyn GcFilter>>,
     metrics_recorder: Arc<dyn MetricsRecorder>,
     system_clock: Arc<dyn SystemClock>,
     rand: Arc<DbRand>,
@@ -871,6 +887,7 @@ impl<P: Into<Path>> GarbageCollectorBuilder<P> {
             main_object_store,
             wal_object_store: None,
             options: GarbageCollectorOptions::default(),
+            gc_filter: None,
             metrics_recorder: Arc::new(NoopMetricsRecorder::new()),
             system_clock: Arc::new(DefaultSystemClock::default()),
             rand: Arc::new(DbRand::default()),
@@ -884,6 +901,7 @@ impl<P: Into<Path>> GarbageCollectorBuilder<P> {
             main_object_store: self.main_object_store,
             wal_object_store: self.wal_object_store,
             options: self.options,
+            gc_filter: self.gc_filter,
             metrics_recorder: self.metrics_recorder,
             system_clock: self.system_clock,
             rand: self.rand,
@@ -893,6 +911,15 @@ impl<P: Into<Path>> GarbageCollectorBuilder<P> {
     /// Sets the options to use for the garbage collector.
     pub fn with_options(mut self, options: GarbageCollectorOptions) -> Self {
         self.options = options;
+        self
+    }
+
+    /// Sets a garbage-collection filter for deletion candidates.
+    ///
+    /// The filter receives objects that SlateDB has already determined are
+    /// eligible for GC and returns the subset that may be physically deleted.
+    pub fn with_gc_filter(mut self, gc_filter: Arc<dyn GcFilter>) -> Self {
+        self.gc_filter = Some(gc_filter);
         self
     }
 
@@ -940,6 +967,7 @@ impl<P: Into<Path>> GarbageCollectorBuilder<P> {
             self.options,
             &recorder,
             self.system_clock,
+            self.gc_filter,
         )
     }
 
@@ -984,6 +1012,7 @@ impl<P: Into<Path>> GarbageCollectorBuilder<P> {
             SsTableFormat::default(), // read only SSTs can use default
             path,
             None, // no need for cache in GC
+            TableStoreKind::GC,
         ));
         GarbageCollector::new(
             manifest_store,
@@ -993,6 +1022,7 @@ impl<P: Into<Path>> GarbageCollectorBuilder<P> {
             self.options,
             &recorder,
             self.system_clock,
+            self.gc_filter,
         )
     }
 }
@@ -1027,6 +1057,7 @@ pub struct CompactorBuilder<P: Into<Path>> {
     system_clock: Arc<dyn SystemClock>,
     closed_result: Arc<dyn ClosedResultWriter>,
     merge_operator: Option<MergeOperatorType>,
+    fp_registry: Arc<FailPointRegistry>,
     block_transformer: Option<Arc<dyn BlockTransformer>>,
     filter_policies: Vec<Arc<dyn FilterPolicy>>,
     #[cfg(feature = "compaction_filters")]
@@ -1047,6 +1078,7 @@ impl<P: Into<Path>> CompactorBuilder<P> {
             system_clock: Arc::new(DefaultSystemClock::default()),
             closed_result: Arc::new(WatchableOnceCell::new()),
             merge_operator: None,
+            fp_registry: Arc::new(FailPointRegistry::new()),
             block_transformer: None,
             filter_policies: default_filter_policies(),
             #[cfg(feature = "compaction_filters")]
@@ -1066,6 +1098,7 @@ impl<P: Into<Path>> CompactorBuilder<P> {
             system_clock: self.system_clock,
             closed_result: self.closed_result,
             merge_operator: self.merge_operator,
+            fp_registry: self.fp_registry,
             block_transformer: self.block_transformer,
             filter_policies: self.filter_policies,
             #[cfg(feature = "compaction_filters")]
@@ -1116,6 +1149,11 @@ impl<P: Into<Path>> CompactorBuilder<P> {
     /// Sets the merge operator to use for the compactor.
     pub fn with_merge_operator(mut self, merge_operator: MergeOperatorType) -> Self {
         self.merge_operator = Some(merge_operator);
+        self
+    }
+
+    pub(crate) fn with_fp_registry(mut self, fp_registry: Arc<FailPointRegistry>) -> Self {
+        self.fp_registry = fp_registry;
         self
     }
 
@@ -1196,7 +1234,8 @@ impl<P: Into<Path>> CompactorBuilder<P> {
             ObjectStores::new(retrying_main_object_store, None),
             sst_format,
             path,
-            None, // no need for cache in GC
+            None,
+            TableStoreKind::Compactor,
         ));
 
         let scheduler_supplier = self
@@ -1213,6 +1252,7 @@ impl<P: Into<Path>> CompactorBuilder<P> {
             self.rand,
             &recorder,
             self.system_clock,
+            self.fp_registry,
             self.closed_result,
             self.merge_operator,
             #[cfg(feature = "compaction_filters")]
@@ -1251,6 +1291,7 @@ impl<P: Into<Path>> CompactorBuilder<P> {
             self.rand.clone(),
             stats.clone(),
             self.system_clock.clone(),
+            recorder.clone(),
         )
         .await?;
         let worker = options.worker.clone().map(|worker_options| {
@@ -1262,7 +1303,9 @@ impl<P: Into<Path>> CompactorBuilder<P> {
                 self.compaction_runtime,
                 self.rand,
                 stats,
+                recorder.clone(),
                 self.system_clock,
+                self.fp_registry,
                 self.merge_operator,
                 #[cfg(feature = "compaction_filters")]
                 self.compaction_filter_supplier,
@@ -1290,6 +1333,10 @@ pub struct CompactionWorkerBuilder<P: Into<Path>> {
     metrics_recorder: Arc<dyn MetricsRecorder>,
     system_clock: Arc<dyn SystemClock>,
     merge_operator: Option<MergeOperatorType>,
+    fp_registry: Arc<FailPointRegistry>,
+    block_transformer: Option<Arc<dyn BlockTransformer>>,
+    filter_policies: Vec<Arc<dyn FilterPolicy>>,
+    sst_block_size: Option<SstBlockSize>,
     #[cfg(feature = "compaction_filters")]
     compaction_filter_supplier: Option<Arc<dyn CompactionFilterSupplier>>,
 }
@@ -1305,6 +1352,10 @@ impl<P: Into<Path>> CompactionWorkerBuilder<P> {
             metrics_recorder: Arc::new(NoopMetricsRecorder::new()),
             system_clock: Arc::new(DefaultSystemClock::default()),
             merge_operator: None,
+            fp_registry: Arc::new(FailPointRegistry::new()),
+            block_transformer: None,
+            filter_policies: default_filter_policies(),
+            sst_block_size: None,
             #[cfg(feature = "compaction_filters")]
             compaction_filter_supplier: None,
         }
@@ -1340,6 +1391,41 @@ impl<P: Into<Path>> CompactionWorkerBuilder<P> {
         self
     }
 
+    /// Sets the block transformer the worker uses when reading and rewriting
+    /// SSTs during compaction.
+    ///
+    /// Must match the writer's `DbBuilder::with_block_transformer` configuration.
+    /// Without it the worker reads and writes SST blocks untransformed, so a DB
+    /// configured with a transformer (e.g. encryption) cannot offload compaction
+    /// to standalone workers.
+    pub fn with_block_transformer(mut self, block_transformer: Arc<dyn BlockTransformer>) -> Self {
+        self.block_transformer = Some(block_transformer);
+        self
+    }
+
+    /// Sets the filter policies the worker uses when it rewrites SSTs.
+    ///
+    /// Must match the writer's `DbBuilder::with_filter_policies` configuration,
+    /// otherwise compacted SSTs will be written with different (or no) filter
+    /// policies and existing filters may be silently dropped during compaction.
+    ///
+    /// Defaults to `vec![Arc::new(BloomFilterPolicy::new(10))]`. Pass an
+    /// empty vec to disable filters entirely.
+    pub fn with_filter_policies(mut self, policies: Vec<Arc<dyn FilterPolicy>>) -> Self {
+        self.filter_policies = policies;
+        self
+    }
+
+    /// Sets the SST block size the worker uses when it rewrites SSTs.
+    ///
+    /// Must match the writer's `DbBuilder::with_sst_block_size` configuration so
+    /// that SSTs rewritten by the worker are encoded consistently with those
+    /// produced by the DB. Defaults to [`SstBlockSize::default`].
+    pub fn with_sst_block_size(mut self, block_size: SstBlockSize) -> Self {
+        self.sst_block_size = Some(block_size);
+        self
+    }
+
     #[cfg(feature = "compaction_filters")]
     pub fn with_compaction_filter_supplier(
         mut self,
@@ -1356,9 +1442,17 @@ impl<P: Into<Path>> CompactionWorkerBuilder<P> {
             Arc::new(CompactionsStore::new(&path, self.main_object_store.clone()));
         let table_store = Arc::new(TableStore::new(
             ObjectStores::new(self.main_object_store, None),
-            SsTableFormat::default(),
+            SsTableFormat {
+                filter_policies: self.filter_policies.clone(),
+                block_transformer: self.block_transformer.clone(),
+                block_size: self.sst_block_size.unwrap_or_default().as_bytes(),
+                min_filter_keys: self.options.min_filter_keys,
+                compression_codec: self.options.compression_codec,
+                ..SsTableFormat::default()
+            },
             path,
             None,
+            TableStoreKind::Compactor,
         ));
         let recorder = MetricsRecorderHelper::new(
             self.metrics_recorder,
@@ -1380,7 +1474,9 @@ impl<P: Into<Path>> CompactionWorkerBuilder<P> {
             worker_runtime,
             self.rand,
             stats,
+            recorder,
             self.system_clock,
+            self.fp_registry,
             self.merge_operator,
             #[cfg(feature = "compaction_filters")]
             self.compaction_filter_supplier,
@@ -1458,6 +1554,7 @@ pub struct DbReaderBuilder<P: Into<Path>> {
     merge_operator: Option<MergeOperatorType>,
     block_transformer: Option<Arc<dyn BlockTransformer>>,
     filter_policies: Vec<Arc<dyn FilterPolicy>>,
+    segment_extractor: Option<Arc<dyn crate::prefix_extractor::PrefixExtractor>>,
     options: DbReaderOptions,
     system_clock: Arc<dyn SystemClock>,
     rand: Arc<DbRand>,
@@ -1476,6 +1573,7 @@ impl<P: Into<Path>> DbReaderBuilder<P> {
             merge_operator: None,
             block_transformer: None,
             filter_policies: default_filter_policies(),
+            segment_extractor: None,
             options: DbReaderOptions::default(),
             system_clock: Arc::new(DefaultSystemClock::default()),
             rand: Arc::new(DbRand::default()),
@@ -1500,6 +1598,18 @@ impl<P: Into<Path>> DbReaderBuilder<P> {
     /// Sets the merge operator to use when reading merge operands.
     pub fn with_merge_operator(mut self, merge_operator: MergeOperatorType) -> Self {
         self.merge_operator = Some(merge_operator);
+        self
+    }
+
+    /// Sets the segment extractor (RFC-0024). When configured, the reader
+    /// re-derives each WAL-replayed entry's segment prefix so that in-memory
+    /// segments are reported via [`DbReader::subscribe`]. Must match the
+    /// extractor the database was created with.
+    pub fn with_segment_extractor(
+        mut self,
+        extractor: Arc<dyn crate::prefix_extractor::PrefixExtractor>,
+    ) -> Self {
+        self.segment_extractor = Some(extractor);
         self
     }
 
@@ -1649,12 +1759,14 @@ impl<P: Into<Path>> DbReaderBuilder<P> {
             block_cache: wrapped_cache,
             block_transformer: self.block_transformer.clone(),
             filter_policies: self.filter_policies.clone(),
+            kind: TableStoreKind::Reader,
         };
 
         let reader = DbReader::open_internal(
             &store_provider,
             self.checkpoint_id,
             self.merge_operator,
+            self.segment_extractor,
             self.options,
             self.system_clock,
             self.rand,

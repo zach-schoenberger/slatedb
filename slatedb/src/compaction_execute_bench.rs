@@ -16,7 +16,7 @@ use ulid::Ulid;
 
 use crate::bytes_generator::OrderedBytesGenerator;
 use crate::compaction_worker::WorkerMessage;
-use crate::compactor::stats::CompactionStats;
+use crate::compactor::stats::{CompactionStats, WorkerStats};
 use crate::compactor_executor::{
     CompactionExecutor, StartCompactionJobArgs, TokioCompactionExecutor,
     TokioCompactionExecutorOptions,
@@ -28,7 +28,7 @@ use crate::error::SlateDBError;
 use crate::format::sst::SsTableFormat;
 use crate::manifest::store::{ManifestStore, StoredManifest};
 use crate::object_stores::ObjectStores;
-use crate::tablestore::TableStore;
+use crate::tablestore::{TableStore, TableStoreKind};
 use crate::types::RowEntry;
 use crate::types::ValueDeletable;
 use crate::utils::IdGenerator;
@@ -78,6 +78,7 @@ impl CompactionExecuteBench {
             sst_format,
             self.path.clone(),
             None,
+            TableStoreKind::Main,
         ));
         let num_keys = sst_bytes / (val_bytes + key_bytes);
         let mut key_start = vec![0u8; key_bytes - mem::size_of::<u32>()];
@@ -264,12 +265,12 @@ impl CompactionExecuteBench {
             id,
             compaction_id,
             destination: 0,
-            sst_views,
+            l0_sst_views: sst_views,
             sorted_runs: vec![],
-            output_ssts: vec![],
             compaction_clock_tick: manifest.db_state().last_l0_clock_tick,
-            retention_min_seq: Some(manifest.db_state().recent_snapshot_min_seq),
             is_dest_last_run,
+            retention_min_seq: Some(manifest.db_state().recent_snapshot_min_seq),
+            ctx: None,
         })
     }
 
@@ -304,12 +305,12 @@ impl CompactionExecuteBench {
             id: rand.rng().gen_ulid(system_clock.as_ref()),
             compaction_id: job.id(),
             destination: 0,
-            sst_views: vec![],
+            l0_sst_views: vec![],
             sorted_runs: srs,
-            output_ssts: vec![],
             compaction_clock_tick: state.last_l0_clock_tick,
-            retention_min_seq: Some(state.recent_snapshot_min_seq),
             is_dest_last_run,
+            retention_min_seq: Some(state.recent_snapshot_min_seq),
+            ctx: None,
         }
     }
 
@@ -329,6 +330,7 @@ impl CompactionExecuteBench {
             sst_format,
             self.path.clone(),
             None,
+            TableStoreKind::Compactor,
         ));
         let (tx, rx) = async_channel::unbounded();
         let worker_options = CompactionWorkerOptions::default();
@@ -345,6 +347,7 @@ impl CompactionExecuteBench {
             table_store: table_store.clone(),
             rand: self.rand.clone(),
             stats: stats.clone(),
+            worker_stats: WorkerStats::new(&recorder, "bench"),
             clock: self.system_clock.clone(),
             manifest_store: manifest_store.clone(),
             merge_operator: None,

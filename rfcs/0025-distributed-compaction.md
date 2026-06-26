@@ -18,7 +18,7 @@ Table of Contents:
    * [Heartbeat and Failure Detection](#heartbeat-and-failure-detection)
    * [Worker Lifecycle](#worker-lifecycle)
    * [Manifest Commit Protocol](#manifest-commit-protocol)
-   * [Deployment Shapes](#deployment-shapes)
+   * [Deployment Patterns](#deployment-patterns)
 - [Impact Analysis](#impact-analysis)
    * [Core API & Query Semantics](#core-api-query-semantics)
    * [Consistency, Isolation, and Multi-Versioning](#consistency-isolation-and-multi-versioning)
@@ -60,15 +60,13 @@ SlateDB currently runs compaction on a single process. Compaction is either embe
 
 ## Motivation
 
-In write-heavy workloads, compaction can fall behind the rate of SST flushes. When this happens, the L0 file count grows toward `l0_max_ssts`. Once that limit is reached, the flusher stops writing immutable memtables to L0. Immutable memtables then accumulate in memory until `max_unflushed_bytes` is exceeded, at which point SlateDB applies back-pressure that stalls writes. A lagging compactor therefore degrades the entire system: first read latency (more L0 files to scan), then write throughput.
+Both existing compaction modes share the same single-node execution ceiling: in-process compaction competes with the write path for CPU and I/O, and the standalone compactor offloads compute but is still capped by a single node's resources. Distributed execution increases aggregate compaction capacity which can be utilized when the scheduler has independent work. Furthermore, offloading compute from an embedded compactor to a standalone compactor at runtime adds extra complexity to the single-compactor design. If a standalone compactor is started alongside a compactor embedded in the writer, the compactor's epoch is rewritten by the new compaction process. This fences the Db, disabling all Db operations. A solution to this is to hand-off the job of coordination to the new process, but this requires additional complexity without the added benefit of horizontal scaling.
 
-Both existing compaction modes share the same single-node ceiling: in-process compaction competes with the write path for CPU and I/O, and the standalone compactor offloads compute but is still capped by a single node's resources. The only way to raise this ceiling is to distribute compaction execution across multiple workers. Furthermore, offloading compute from an embedded compactor to a standalone compactor at runtime adds extra complexity to the single-compactor design. If a standalone compactor is started alongside a compactor embedded in the writer, the compactor's epoch is rewritten by the new compaction process. This fences the Db, disabling all Db operations. A solution to this is to hand-off the job of coordination to the new process, but this requires additional complexity without the added benefit of horizontal scaling.
-
-The design in this RFC sidesteps this complexity by separating coordination (scheduling, manifest commits) from execution (compaction jobs). Workers are stateless and interchangeable, so there is no leadership to hand off when a worker starts or stops. The coordinator can run embedded in the DB process or as a standalone `Compactor` process, and compaction compute can be offloaded to any number of external workers without any coordination handoff. Since SlateDB already uses the object store as its sole coordination primitive, the `.compactions` file provides everything needed to schedule and claim work across processes.
+The design in this RFC sidesteps this complexity by separating coordination (scheduling, manifest commits) from execution (compaction jobs). Workers are stateless and interchangeable, so there is no leadership to hand off when a worker starts or stops. The coordinator can run embedded in the DB process or as a standalone `Compactor` process, and compaction compute can be offloaded to external workers without any coordination handoff. Since SlateDB already uses the object store as its sole coordination primitive, the `.compactions` file provides everything needed to schedule and claim work across processes.
 
 ## Goals
 
-- Increase compaction throughput by enabling horizontal scale-out across multiple worker processes, targeting roughly linear throughput scaling with worker count.
+- Increase aggregate compaction execution throughput for concurrently runnable, non-conflicting compactions.
 - Tolerate individual worker failures without losing compaction progress, by checkpointing output SSTs and reclaiming stalled jobs.
 - Preserve the single-writer invariant: only the coordinator commits manifest updates.
 - Add no external dependencies beyond the object store already required by SlateDB.
@@ -77,6 +75,7 @@ The design in this RFC sidesteps this complexity by separating coordination (sch
 ## Non-Goals
 
 - **Changing the compaction scheduling strategy.** The scheduler logic is unchanged; only execution is distributed.
+- **Eliminating L0 admission back-pressure for a single hot segment.** L0 capacity is released by manifest commits, and the current scheduler permits one L0-sourcing compaction per segment due to the single cursor L0 watermark design. Addressing this bottleneck directly requires faster execution of a single logical L0 compaction (for example, through subcompactions), or a separate redesign of L0 scheduling, commit ordering, and watermark semantics.
 - **Multi-coordinator support.** The single-coordinator invariant is preserved; leader election across coordinators or purely distributed coordination is a future concern. This includes split-brain handling (e.g. a zombie coordinator that resumes writing after a new coordinator has taken over): deployments are responsible for ensuring at most one coordinator is active at a time to avoid fencing the DB.
 - **Changes to the public read/write API.** Distributed compaction is transparent to DB clients.
 
@@ -185,7 +184,7 @@ pub struct CompactionWorkerOptions {
 
 - `max_concurrent_compactions` controls how many jobs a single worker may hold simultaneously.
 
-- `compactions_poll_interval` is used for polling frequency. Each poll sleeps for `compactions_poll_interval + random(0, compactions_poll_interval * 0.1)` to prevent workers from synchronizing on `.compactions` reads. This jitter is applied on every poll and requires no configuration.
+- `compactions_poll_interval` is used for polling frequency. To prevent workers from synchronizing on `.compactions` reads, the poll ticker jitters each wait: instead of waiting exactly `compactions_poll_interval`, each tick waits a random duration picked uniformly between `compactions_poll_interval/2` and `3 * compactions_poll_interval/2` (the interval plus or minus half). Because the range is centered on `compactions_poll_interval`, each worker still polls once per `compactions_poll_interval` on average. Jitter is a feature of the shared task dispatcher (defaulting to off) that the worker enables for its poll ticker; the randomized wait happens inside the ticker rather than in the message handler, so waiting on it never blocks the worker from processing job-progress or job-finished messages. It requires no user configuration.
 
 - `heartbeat_bytes` is used to tie heartbeats to compaction progress and gives the coordinator a liveness guarantee. A worker that falls behind this rate will be reclaimed and its job handed off, regardless of whether its event loop is still alive.
 
@@ -329,7 +328,7 @@ On coordinator restart, the recovery logic is:
 2. For each `Compacted` job, retry steps 2–3 of the normal flow above. `validate_compaction()` is called before the manifest write and will fail if the job's sources are already absent from the manifest (i.e. step 2 already completed before the crash). In that case the job is marked `Failed` in `.compactions`. This is safe: the manifest was already updated, the output SSTs are already referenced and protected from GC, and the scheduler has no dependency on whether the entry reads `Completed` or `Failed`.
 3. Retain active (`Submitted`, `Scheduled`, `Running`, `Compacted`) and last finished (`Completed`, `Failed`) entries.
 
-### Deployment Shapes
+### Deployment Patterns
 
 In all cases the coordinator uses `RemoteCompactionExecutor`. `compactor_options: None` in `Settings` means no coordinator runs in that process; a standalone `Compactor` process owns coordination instead.
 
@@ -490,9 +489,9 @@ SlateDB features and components that this RFC interacts with. Check all that app
 ## Operations
 
 ### Performance & Cost
+- **Latency**: Read/write latency is unchanged. The distributed model adds one extra round-trip to the L0 drain cycle that does not exist in the embedded case: the coordinator writes a `Submitted` job to `.compactions`, then a worker picks it up on its next poll. In the worst case this delays the start of an L0 compaction by up to the upper end of the poll ticker's randomized wait (`3 * compactions_poll_interval_ms / 2`). Whether the end-to-end drain time (submit → claim → compact → manifest commit) remains competitive with the current single-node path warrants benchmarking, particularly at the default `compactions_poll_interval_ms`.
 
-- **Latency**: Read/write latency is unchanged. The distributed model adds one extra round-trip to the L0 drain cycle that does not exist in the embedded case: the coordinator writes a `Submitted` job to `.compactions`, then a worker picks it up on its next poll. In the worst case this delays the start of an L0 compaction by up to `compactions_poll_interval`. Whether the end-to-end drain time (submit → claim → compact → manifest commit) remains competitive with the current single-node path warrants benchmarking, particularly at the default `compactions_poll_interval`.
-- **Throughput**: Scales roughly linearly with worker count, bounded by per-worker object store bandwidth.
+- **Throughput**: Scales up to the available independent, non-conflicting compaction work. It is bounded by how much independent work the scheduler produces, source conflicts, and worker/object store bandwidth. The coordinator may batch completed jobs into one manifest update, but manifest commits remain a serial process done by the coordinator rather than a separate commit lane per worker.
 - **Object-store requests**: ~1 GET per poll interval + ~1 PUT per claim + ~1 PUT per output SST. At N=10 workers polling every 5s: ~120 GETs/min overhead.
 - **Space/write/read amplification**: Unchanged.
 
@@ -573,7 +572,7 @@ Use gossip to distribute jobs directly.
 
 ### Compaction routing
 
-Routing compactions to specific workers or worker classes (e.g. L0 jobs to an embedded worker, major compactions to a beefy short-lived node). The claim protocol in this RFC is designed so that selectivity can be added entirely on the worker side without coordinator or schema changes: a worker can filter `Submitted` entries by `CompactionSpec` properties (level, input bytes, etc.) before attempting a claim. Common shapes worth exploring:
+Routing compactions to specific workers or worker classes (e.g. L0 jobs to an embedded worker, major compactions to a beefy short-lived node). The claim protocol in this RFC is designed so that selectivity can be added entirely on the worker side without coordinator or schema changes: a worker can filter `Submitted` entries by `CompactionSpec` properties (level, input bytes, etc.) before attempting a claim. Common policies worth exploring:
 
 - **L0 affinity:** embedded workers preferentially claim L0 jobs to keep flush-side latency low; remote workers handle larger compactions. Naively prioritizing L0 jobs interacts with `max_concurrent_compactions`: a single worker could greedily claim every available L0 job, bottlenecking them on one worker's CPU/IO rather than spreading them across the pool. In practice we expect only one or two L0 compactions outstanding at a time, so simple prioritization is likely fine; a pluggable work-scheduling trait is a natural extension if fairer policies are ever needed.
 - **Size-class pools:** small jobs go to long-lived workers; large major compactions go to a separate pool of beefy short-lived nodes that can scale to zero between jobs.
@@ -593,7 +592,7 @@ Some SlateDB users run thousands of DBs. A single worker process today is bound 
 **Resolved:** Exponential backoff does not make sense for `compactions_poll_interval` because GETs to object storage are cheap and it is critical that L0 compactions are started as soon as possible. A reasonable default is one second (e.g. `compactions_poll_interval="1s"`).
 
 2. ~~Is optimistic claiming sufficient at high worker counts (50+), or will contention require sharding across multiple `.compactions` files?~~
-**Resolved:** Claim contention is naturally low because compaction jobs run far longer than the claim operation itself. Each poll also adds a small random jitter to `compactions_poll_interval`, spreading poll timing across workers without any additional configuration.
+**Resolved:** Claim contention is naturally low because compaction jobs run far longer than the claim operation itself. The poll ticker also randomizes each wait around `compactions_poll_interval_ms` (see `compactions_poll_interval` above), spreading poll timing across workers without any additional configuration.
 
 3. ~~How should existing per-compaction metrics (`bytes_processed`, `ssts_written`) work for remote workers? Workers are separate processes with no metrics infrastructure: should they be reported by the coordinator based on what it observes in `.compactions`, or does each worker need its own metrics endpoint?~~
 **Resolved:** Workers should have the same metrics infrastructure introduced by the metrics RFC and users can wire in reporting as they'd like. The worker tags the metrics with the worker id.

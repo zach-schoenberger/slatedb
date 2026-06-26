@@ -1,9 +1,8 @@
 use bytes::Bytes;
-use std::ops::RangeBounds;
 use uuid::Uuid;
 
 use crate::batch::WriteBatch;
-use crate::bytes_range::BytesRange;
+use crate::bytes_range::{ByteRangeBounds, BytesRange};
 use crate::config::{
     FlushOptions, MergeOptions, PutOptions, ReadOptions, ScanOptions, WriteOptions,
 };
@@ -128,10 +127,9 @@ pub trait DbReadOps {
     ///
     /// ## Returns
     /// - `Result<DbIterator, Error>`: An iterator with the results of the scan
-    async fn scan<K, T>(&self, range: T) -> Result<DbIterator, crate::Error>
+    async fn scan<T>(&self, range: T) -> Result<DbIterator, crate::Error>
     where
-        K: AsRef<[u8]> + Send,
-        T: RangeBounds<K> + Send,
+        T: ByteRangeBounds + Send,
     {
         self.scan_with_options(range, &ScanOptions::default()).await
     }
@@ -149,47 +147,60 @@ pub trait DbReadOps {
     ///
     /// ## Returns
     /// - `Result<DbIterator, Error>`: An iterator with the results of the scan
-    async fn scan_with_options<K, T>(
+    async fn scan_with_options<T>(
         &self,
         range: T,
         options: &ScanOptions,
     ) -> Result<DbIterator, crate::Error>
     where
-        K: AsRef<[u8]> + Send,
-        T: RangeBounds<K> + Send;
+        T: ByteRangeBounds + Send;
 
-    /// Scan all keys that share the provided prefix using the default scan options.
+    /// Scan keys that share the provided prefix, restricted to `subrange`,
+    /// using the default scan options.
+    ///
+    /// The subrange bounds are key *suffixes* interpreted relative to the
+    /// prefix: a bound `s` selects the full key `prefix ++ s`. Pass `..` to
+    /// scan the prefix's entire keyspace.
     ///
     /// ## Arguments
     /// - `prefix`: the key prefix to scan
+    /// - `subrange`: the range of key suffixes (relative to `prefix`) to
+    ///   scan; `..` scans all keys with the prefix
     ///
     /// ## Returns
     /// - `Result<DbIterator, Error>`: An iterator with the results of the scan
-    async fn scan_prefix<P>(&self, prefix: P) -> Result<DbIterator, crate::Error>
+    async fn scan_prefix<P, T>(&self, prefix: P, subrange: T) -> Result<DbIterator, crate::Error>
     where
         P: AsRef<[u8]> + Send,
+        T: ByteRangeBounds + Send,
     {
-        self.scan_prefix_with_options(prefix, &ScanOptions::default())
+        self.scan_prefix_with_options(prefix, subrange, &ScanOptions::default())
             .await
     }
 
-    /// Scan all keys that share the provided prefix with custom options.
+    /// Scan keys that share the provided prefix, restricted to `subrange`,
+    /// with custom options. See [`Self::scan_prefix`] for the subrange
+    /// semantics.
     ///
     /// ## Arguments
     /// - `prefix`: the key prefix to scan
+    /// - `subrange`: the range of key suffixes (relative to `prefix`) to
+    ///   scan; `..` scans all keys with the prefix
     /// - `options`: the scan options to use
     ///
     /// ## Returns
     /// - `Result<DbIterator, Error>`: An iterator with the results of the scan
-    async fn scan_prefix_with_options<P>(
+    async fn scan_prefix_with_options<P, T>(
         &self,
         prefix: P,
+        subrange: T,
         options: &ScanOptions,
     ) -> Result<DbIterator, crate::Error>
     where
         P: AsRef<[u8]> + Send,
+        T: ByteRangeBounds + Send,
     {
-        let range = BytesRange::from_prefix(prefix.as_ref());
+        let range = BytesRange::from_prefix_and_subrange(prefix.as_ref(), subrange);
         self.scan_with_options(range, options).await
     }
 }
@@ -521,7 +532,7 @@ pub trait DbMetadataOps {
     /// Returns a [`tokio::sync::watch::Receiver<DbStatus>`] that always
     /// reflects the latest database status. The status includes the latest durable
     /// sequence number and the current manifest snapshot observed by this
-    /// handle. For [`Db`](crate::Db) is is the current in-memory snapshot and
+    /// handle. For [`Db`](crate::Db) is the current in-memory snapshot and
     /// for [`DbReader`](crate::DbReader) it is the latest manifest polled from object storage.
     /// For example, you can wait for a specific sequence number to
     /// become durable:
@@ -530,6 +541,20 @@ pub trait DbMetadataOps {
     /// let seq = 42; // sequence number from a write operation
     /// let mut rx = db.subscribe();
     /// rx.wait_for(|s| s.durable_seq >= seq).await.expect("db dropped");
+    /// ```
+    ///
+    /// The status also exposes the segment prefixes (RFC-0024) known to the
+    /// handle via [`DbStatus::list_segments`](crate::DbStatus::list_segments),
+    /// which returns all segments — the union of those in the manifest and those
+    /// touched in the memtables but not yet flushed. For example, you can wait
+    /// for a segment to appear:
+    ///
+    /// ```ignore
+    /// let want = b"prefix".to_vec();
+    /// let mut rx = db.subscribe();
+    /// rx.wait_for(|s| s.list_segments().iter().any(|seg| seg.prefix == want))
+    ///     .await
+    ///     .expect("db dropped");
     /// ```
     ///
     /// # Deadlock risk

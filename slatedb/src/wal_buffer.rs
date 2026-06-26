@@ -14,7 +14,7 @@ use crate::clock::MonotonicClock;
 use crate::db_state::SsTableId;
 use crate::db_stats::DbStats;
 use crate::db_status::ClosedResultWriter;
-use crate::dispatcher::{MessageFactory, MessageHandler, MessageHandlerExecutor};
+use crate::dispatcher::{MessageHandler, MessageHandlerExecutor, MessageTickerDef};
 use crate::error::SlateDBError;
 use crate::oracle::{DbOracle, Oracle};
 use crate::tablestore::TableStore;
@@ -601,9 +601,9 @@ struct WalFlushHandler {
 
 #[async_trait]
 impl MessageHandler<WalFlushWork> for WalFlushHandler {
-    fn tickers(&mut self) -> Vec<(Duration, Box<MessageFactory<WalFlushWork>>)> {
+    fn tickers(&mut self) -> Vec<MessageTickerDef<WalFlushWork>> {
         if let Some(max_flush_interval) = self.max_flush_interval {
-            return vec![(
+            return vec![MessageTickerDef::new(
                 max_flush_interval,
                 Box::new(|| WalFlushWork { result_tx: None }),
             )];
@@ -659,7 +659,7 @@ mod tests {
     use crate::manifest::SsTableView;
     use crate::object_stores::ObjectStores;
     use crate::sst_iter::{SstIterator, SstIteratorOptions};
-    use crate::tablestore::TableStore;
+    use crate::tablestore::{TableStore, TableStoreKind};
     use crate::types::{RowEntry, ValueDeletable};
     use bytes::Bytes;
     use object_store::{memory::InMemory, path::Path, ObjectStore};
@@ -890,6 +890,7 @@ mod tests {
             SsTableFormat::default(),
             Path::from("/root"),
             None,
+            TableStoreKind::Main,
         ));
         let test_clock = Arc::new(MockSystemClock::new());
         let mono_clock = Arc::new(MonotonicClock::new(test_clock.clone(), 0));

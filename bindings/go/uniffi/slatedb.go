@@ -401,6 +401,24 @@ func uniffiCheckChecksums() {
 	}
 	{
 		checksum := rustCall(func(_uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_slatedb_uniffi_checksum_method_admin_create_detached_checkpoint()
+		})
+		if checksum != 37184 {
+			// If this happens try cleaning and rebuilding your project
+			panic("slatedb: uniffi_slatedb_uniffi_checksum_method_admin_create_detached_checkpoint: UniFFI API checksum mismatch")
+		}
+	}
+	{
+		checksum := rustCall(func(_uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_slatedb_uniffi_checksum_method_admin_delete_checkpoint()
+		})
+		if checksum != 28193 {
+			// If this happens try cleaning and rebuilding your project
+			panic("slatedb: uniffi_slatedb_uniffi_checksum_method_admin_delete_checkpoint: UniFFI API checksum mismatch")
+		}
+	}
+	{
+		checksum := rustCall(func(_uniffiStatus *C.RustCallStatus) C.uint16_t {
 			return C.uniffi_slatedb_uniffi_checksum_method_admin_get_sequence_for_timestamp()
 		})
 		if checksum != 39670 {
@@ -478,6 +496,15 @@ func uniffiCheckChecksums() {
 		if checksum != 1383 {
 			// If this happens try cleaning and rebuilding your project
 			panic("slatedb: uniffi_slatedb_uniffi_checksum_method_admin_read_manifest: UniFFI API checksum mismatch")
+		}
+	}
+	{
+		checksum := rustCall(func(_uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_slatedb_uniffi_checksum_method_admin_refresh_checkpoint()
+		})
+		if checksum != 42876 {
+			// If this happens try cleaning and rebuilding your project
+			panic("slatedb: uniffi_slatedb_uniffi_checksum_method_admin_refresh_checkpoint: UniFFI API checksum mismatch")
 		}
 	}
 	{
@@ -635,6 +662,15 @@ func uniffiCheckChecksums() {
 	}
 	{
 		checksum := rustCall(func(_uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_slatedb_uniffi_checksum_method_dbbuilder_with_segment_extractor()
+		})
+		if checksum != 14261 {
+			// If this happens try cleaning and rebuilding your project
+			panic("slatedb: uniffi_slatedb_uniffi_checksum_method_dbbuilder_with_segment_extractor: UniFFI API checksum mismatch")
+		}
+	}
+	{
+		checksum := rustCall(func(_uniffiStatus *C.RustCallStatus) C.uint16_t {
 			return C.uniffi_slatedb_uniffi_checksum_method_dbbuilder_with_settings()
 		})
 		if checksum != 64263 {
@@ -712,6 +748,15 @@ func uniffiCheckChecksums() {
 		if checksum != 46155 {
 			// If this happens try cleaning and rebuilding your project
 			panic("slatedb: uniffi_slatedb_uniffi_checksum_method_dbreaderbuilder_with_options: UniFFI API checksum mismatch")
+		}
+	}
+	{
+		checksum := rustCall(func(_uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_slatedb_uniffi_checksum_method_dbreaderbuilder_with_segment_extractor()
+		})
+		if checksum != 2822 {
+			// If this happens try cleaning and rebuilding your project
+			panic("slatedb: uniffi_slatedb_uniffi_checksum_method_dbreaderbuilder_with_segment_extractor: UniFFI API checksum mismatch")
 		}
 	}
 	{
@@ -862,7 +907,7 @@ func uniffiCheckChecksums() {
 		checksum := rustCall(func(_uniffiStatus *C.RustCallStatus) C.uint16_t {
 			return C.uniffi_slatedb_uniffi_checksum_method_db_scan_prefix()
 		})
-		if checksum != 44288 {
+		if checksum != 23945 {
 			// If this happens try cleaning and rebuilding your project
 			panic("slatedb: uniffi_slatedb_uniffi_checksum_method_db_scan_prefix: UniFFI API checksum mismatch")
 		}
@@ -871,7 +916,7 @@ func uniffiCheckChecksums() {
 		checksum := rustCall(func(_uniffiStatus *C.RustCallStatus) C.uint16_t {
 			return C.uniffi_slatedb_uniffi_checksum_method_db_scan_prefix_with_options()
 		})
-		if checksum != 34774 {
+		if checksum != 8173 {
 			// If this happens try cleaning and rebuilding your project
 			panic("slatedb: uniffi_slatedb_uniffi_checksum_method_db_scan_prefix_with_options: UniFFI API checksum mismatch")
 		}
@@ -907,7 +952,7 @@ func uniffiCheckChecksums() {
 		checksum := rustCall(func(_uniffiStatus *C.RustCallStatus) C.uint16_t {
 			return C.uniffi_slatedb_uniffi_checksum_method_db_status()
 		})
-		if checksum != 33776 {
+		if checksum != 51988 {
 			// If this happens try cleaning and rebuilding your project
 			panic("slatedb: uniffi_slatedb_uniffi_checksum_method_db_status: UniFFI API checksum mismatch")
 		}
@@ -997,7 +1042,7 @@ func uniffiCheckChecksums() {
 		checksum := rustCall(func(_uniffiStatus *C.RustCallStatus) C.uint16_t {
 			return C.uniffi_slatedb_uniffi_checksum_method_dbreader_scan_prefix()
 		})
-		if checksum != 2510 {
+		if checksum != 16399 {
 			// If this happens try cleaning and rebuilding your project
 			panic("slatedb: uniffi_slatedb_uniffi_checksum_method_dbreader_scan_prefix: UniFFI API checksum mismatch")
 		}
@@ -1006,7 +1051,7 @@ func uniffiCheckChecksums() {
 		checksum := rustCall(func(_uniffiStatus *C.RustCallStatus) C.uint16_t {
 			return C.uniffi_slatedb_uniffi_checksum_method_dbreader_scan_prefix_with_options()
 		})
-		if checksum != 46251 {
+		if checksum != 35795 {
 			// If this happens try cleaning and rebuilding your project
 			panic("slatedb: uniffi_slatedb_uniffi_checksum_method_dbreader_scan_prefix_with_options: UniFFI API checksum mismatch")
 		}
@@ -1096,7 +1141,7 @@ func uniffiCheckChecksums() {
 		checksum := rustCall(func(_uniffiStatus *C.RustCallStatus) C.uint16_t {
 			return C.uniffi_slatedb_uniffi_checksum_method_dbsnapshot_scan_prefix()
 		})
-		if checksum != 57746 {
+		if checksum != 55324 {
 			// If this happens try cleaning and rebuilding your project
 			panic("slatedb: uniffi_slatedb_uniffi_checksum_method_dbsnapshot_scan_prefix: UniFFI API checksum mismatch")
 		}
@@ -1105,7 +1150,7 @@ func uniffiCheckChecksums() {
 		checksum := rustCall(func(_uniffiStatus *C.RustCallStatus) C.uint16_t {
 			return C.uniffi_slatedb_uniffi_checksum_method_dbsnapshot_scan_prefix_with_options()
 		})
-		if checksum != 4221 {
+		if checksum != 38325 {
 			// If this happens try cleaning and rebuilding your project
 			panic("slatedb: uniffi_slatedb_uniffi_checksum_method_dbsnapshot_scan_prefix_with_options: UniFFI API checksum mismatch")
 		}
@@ -1258,7 +1303,7 @@ func uniffiCheckChecksums() {
 		checksum := rustCall(func(_uniffiStatus *C.RustCallStatus) C.uint16_t {
 			return C.uniffi_slatedb_uniffi_checksum_method_dbtransaction_scan_prefix()
 		})
-		if checksum != 28799 {
+		if checksum != 25663 {
 			// If this happens try cleaning and rebuilding your project
 			panic("slatedb: uniffi_slatedb_uniffi_checksum_method_dbtransaction_scan_prefix: UniFFI API checksum mismatch")
 		}
@@ -1267,7 +1312,7 @@ func uniffiCheckChecksums() {
 		checksum := rustCall(func(_uniffiStatus *C.RustCallStatus) C.uint16_t {
 			return C.uniffi_slatedb_uniffi_checksum_method_dbtransaction_scan_prefix_with_options()
 		})
-		if checksum != 31002 {
+		if checksum != 2853 {
 			// If this happens try cleaning and rebuilding your project
 			panic("slatedb: uniffi_slatedb_uniffi_checksum_method_dbtransaction_scan_prefix_with_options: UniFFI API checksum mismatch")
 		}
@@ -1537,7 +1582,7 @@ func uniffiCheckChecksums() {
 		checksum := rustCall(func(_uniffiStatus *C.RustCallStatus) C.uint16_t {
 			return C.uniffi_slatedb_uniffi_checksum_method_walfile_metadata()
 		})
-		if checksum != 32912 {
+		if checksum != 45103 {
 			// If this happens try cleaning and rebuilding your project
 			panic("slatedb: uniffi_slatedb_uniffi_checksum_method_walfile_metadata: UniFFI API checksum mismatch")
 		}
@@ -2103,6 +2148,11 @@ func (ffiObject *FfiObject) freeRustArcPtr() {
 // Administrative read/query handle for SlateDB.
 type AdminInterface interface {
 	CreateCloneBuilderFromSource(source CloneSourceSpec) (*CloneBuilder, error)
+	// Creates a checkpoint of the db stored in the object store at the specified path using the
+	// provided options.
+	CreateDetachedCheckpoint(options CheckpointOptions) (CheckpointCreateResult, error)
+	// Deletes the checkpoint with the specified id.
+	DeleteCheckpoint(id string) error
 	// Looks up a sequence number for the provided Unix UTC timestamp seconds.
 	GetSequenceForTimestamp(timestampSecs int64, roundUp bool) (*uint64, error)
 	// Looks up a timestamp for the provided sequence number.
@@ -2121,6 +2171,8 @@ type AdminInterface interface {
 	ReadCompactorStateView() (CompactorStateView, error)
 	// Reads a specific manifest by ID, or the latest when `id` is `None`.
 	ReadManifest(id *uint64) (*VersionedManifest, error)
+	// Refresh the lifetime of an existing checkpoint.
+	RefreshCheckpoint(id string, lifetimeMs *uint64) error
 }
 
 // Administrative read/query handle for SlateDB.
@@ -2141,6 +2193,75 @@ func (_self *Admin) CreateCloneBuilderFromSource(source CloneSourceSpec) (*Clone
 	} else {
 		return FfiConverterCloneBuilderINSTANCE.Lift(_uniffiRV), nil
 	}
+}
+
+// Creates a checkpoint of the db stored in the object store at the specified path using the
+// provided options.
+func (_self *Admin) CreateDetachedCheckpoint(options CheckpointOptions) (CheckpointCreateResult, error) {
+	_pointer := _self.ffiObject.incrementPointer("*Admin")
+	defer _self.ffiObject.decrementPointer()
+	res, err := uniffiRustCallAsync[*Error](
+		FfiConverterErrorINSTANCE,
+		// completeFn
+		func(handle C.uint64_t, status *C.RustCallStatus) RustBufferI {
+			res := C.ffi_slatedb_uniffi_rust_future_complete_rust_buffer(handle, status)
+			return GoRustBuffer{
+				inner: res,
+			}
+		},
+		// liftFn
+		func(ffi RustBufferI) CheckpointCreateResult {
+			return FfiConverterCheckpointCreateResultINSTANCE.Lift(ffi)
+		},
+		C.uniffi_slatedb_uniffi_fn_method_admin_create_detached_checkpoint(
+			_pointer, FfiConverterCheckpointOptionsINSTANCE.Lower(options)),
+		// pollFn
+		func(handle C.uint64_t, continuation C.UniffiRustFutureContinuationCallback, data C.uint64_t) {
+			C.ffi_slatedb_uniffi_rust_future_poll_rust_buffer(handle, continuation, data)
+		},
+		// freeFn
+		func(handle C.uint64_t) {
+			C.ffi_slatedb_uniffi_rust_future_free_rust_buffer(handle)
+		},
+	)
+
+	if err == nil {
+		return res, nil
+	}
+
+	return res, err
+}
+
+// Deletes the checkpoint with the specified id.
+func (_self *Admin) DeleteCheckpoint(id string) error {
+	_pointer := _self.ffiObject.incrementPointer("*Admin")
+	defer _self.ffiObject.decrementPointer()
+	_, err := uniffiRustCallAsync[*Error](
+		FfiConverterErrorINSTANCE,
+		// completeFn
+		func(handle C.uint64_t, status *C.RustCallStatus) struct{} {
+			C.ffi_slatedb_uniffi_rust_future_complete_void(handle, status)
+			return struct{}{}
+		},
+		// liftFn
+		func(_ struct{}) struct{} { return struct{}{} },
+		C.uniffi_slatedb_uniffi_fn_method_admin_delete_checkpoint(
+			_pointer, FfiConverterStringINSTANCE.Lower(id)),
+		// pollFn
+		func(handle C.uint64_t, continuation C.UniffiRustFutureContinuationCallback, data C.uint64_t) {
+			C.ffi_slatedb_uniffi_rust_future_poll_void(handle, continuation, data)
+		},
+		// freeFn
+		func(handle C.uint64_t) {
+			C.ffi_slatedb_uniffi_rust_future_free_void(handle)
+		},
+	)
+
+	if err == nil {
+		return nil
+	}
+
+	return err
 }
 
 // Looks up a sequence number for the provided Unix UTC timestamp seconds.
@@ -2465,6 +2586,38 @@ func (_self *Admin) ReadManifest(id *uint64) (*VersionedManifest, error) {
 	}
 
 	return res, err
+}
+
+// Refresh the lifetime of an existing checkpoint.
+func (_self *Admin) RefreshCheckpoint(id string, lifetimeMs *uint64) error {
+	_pointer := _self.ffiObject.incrementPointer("*Admin")
+	defer _self.ffiObject.decrementPointer()
+	_, err := uniffiRustCallAsync[*Error](
+		FfiConverterErrorINSTANCE,
+		// completeFn
+		func(handle C.uint64_t, status *C.RustCallStatus) struct{} {
+			C.ffi_slatedb_uniffi_rust_future_complete_void(handle, status)
+			return struct{}{}
+		},
+		// liftFn
+		func(_ struct{}) struct{} { return struct{}{} },
+		C.uniffi_slatedb_uniffi_fn_method_admin_refresh_checkpoint(
+			_pointer, FfiConverterStringINSTANCE.Lower(id), FfiConverterOptionalUint64INSTANCE.Lower(lifetimeMs)),
+		// pollFn
+		func(handle C.uint64_t, continuation C.UniffiRustFutureContinuationCallback, data C.uint64_t) {
+			C.ffi_slatedb_uniffi_rust_future_poll_void(handle, continuation, data)
+		},
+		// freeFn
+		func(handle C.uint64_t) {
+			C.ffi_slatedb_uniffi_rust_future_free_void(handle)
+		},
+	)
+
+	if err == nil {
+		return nil
+	}
+
+	return err
 }
 func (object *Admin) Destroy() {
 	runtime.SetFinalizer(object, nil)
@@ -3033,17 +3186,19 @@ type DbInterface interface {
 	PutWithOptions(key []byte, value []byte, putOptions PutOptions, writeOptions WriteOptions) (WriteHandle, error)
 	// Scans rows inside `range`.
 	Scan(varRange KeyRange) (*DbIterator, error)
-	// Scans rows whose keys start with `prefix`.
-	ScanPrefix(prefix []byte) (*DbIterator, error)
-	// Scans rows whose keys start with `prefix` using custom scan options.
-	ScanPrefixWithOptions(prefix []byte, options ScanOptions) (*DbIterator, error)
+	// Scans rows whose keys start with `prefix`, restricted to `subrange`.
+	ScanPrefix(prefix []byte, subrange KeyRange) (*DbIterator, error)
+	// Scans rows whose keys start with `prefix`, restricted to `subrange`,
+	// using custom scan options.
+	ScanPrefixWithOptions(prefix []byte, subrange KeyRange, options ScanOptions) (*DbIterator, error)
 	// Scans rows inside `range` using custom scan options.
 	ScanWithOptions(varRange KeyRange, options ScanOptions) (*DbIterator, error)
 	// Flushes outstanding work and closes the database.
 	Shutdown() error
 	// Creates a read-only snapshot representing a consistent point in time.
 	Snapshot() (*DbSnapshot, error)
-	// Returns the latest database status snapshot.
+	// Returns the latest database status snapshot, including the segment
+	// prefixes (RFC-0024) live as of the snapshot (see [`DbStatus::segments`]).
 	Status() DbStatus
 	// Warms selected cache content for one SST.
 	//
@@ -3595,8 +3750,8 @@ func (_self *Db) Scan(varRange KeyRange) (*DbIterator, error) {
 	return res, err
 }
 
-// Scans rows whose keys start with `prefix`.
-func (_self *Db) ScanPrefix(prefix []byte) (*DbIterator, error) {
+// Scans rows whose keys start with `prefix`, restricted to `subrange`.
+func (_self *Db) ScanPrefix(prefix []byte, subrange KeyRange) (*DbIterator, error) {
 	_pointer := _self.ffiObject.incrementPointer("*Db")
 	defer _self.ffiObject.decrementPointer()
 	res, err := uniffiRustCallAsync[*Error](
@@ -3611,7 +3766,7 @@ func (_self *Db) ScanPrefix(prefix []byte) (*DbIterator, error) {
 			return FfiConverterDbIteratorINSTANCE.Lift(ffi)
 		},
 		C.uniffi_slatedb_uniffi_fn_method_db_scan_prefix(
-			_pointer, FfiConverterBytesINSTANCE.Lower(prefix)),
+			_pointer, FfiConverterBytesINSTANCE.Lower(prefix), FfiConverterKeyRangeINSTANCE.Lower(subrange)),
 		// pollFn
 		func(handle C.uint64_t, continuation C.UniffiRustFutureContinuationCallback, data C.uint64_t) {
 			C.ffi_slatedb_uniffi_rust_future_poll_u64(handle, continuation, data)
@@ -3629,8 +3784,9 @@ func (_self *Db) ScanPrefix(prefix []byte) (*DbIterator, error) {
 	return res, err
 }
 
-// Scans rows whose keys start with `prefix` using custom scan options.
-func (_self *Db) ScanPrefixWithOptions(prefix []byte, options ScanOptions) (*DbIterator, error) {
+// Scans rows whose keys start with `prefix`, restricted to `subrange`,
+// using custom scan options.
+func (_self *Db) ScanPrefixWithOptions(prefix []byte, subrange KeyRange, options ScanOptions) (*DbIterator, error) {
 	_pointer := _self.ffiObject.incrementPointer("*Db")
 	defer _self.ffiObject.decrementPointer()
 	res, err := uniffiRustCallAsync[*Error](
@@ -3645,7 +3801,7 @@ func (_self *Db) ScanPrefixWithOptions(prefix []byte, options ScanOptions) (*DbI
 			return FfiConverterDbIteratorINSTANCE.Lift(ffi)
 		},
 		C.uniffi_slatedb_uniffi_fn_method_db_scan_prefix_with_options(
-			_pointer, FfiConverterBytesINSTANCE.Lower(prefix), FfiConverterScanOptionsINSTANCE.Lower(options)),
+			_pointer, FfiConverterBytesINSTANCE.Lower(prefix), FfiConverterKeyRangeINSTANCE.Lower(subrange), FfiConverterScanOptionsINSTANCE.Lower(options)),
 		// pollFn
 		func(handle C.uint64_t, continuation C.UniffiRustFutureContinuationCallback, data C.uint64_t) {
 			C.ffi_slatedb_uniffi_rust_future_poll_u64(handle, continuation, data)
@@ -3763,7 +3919,8 @@ func (_self *Db) Snapshot() (*DbSnapshot, error) {
 	return res, err
 }
 
-// Returns the latest database status snapshot.
+// Returns the latest database status snapshot, including the segment
+// prefixes (RFC-0024) live as of the snapshot (see [`DbStatus::segments`]).
 func (_self *Db) Status() DbStatus {
 	_pointer := _self.ffiObject.incrementPointer("*Db")
 	defer _self.ffiObject.decrementPointer()
@@ -3963,6 +4120,11 @@ type DbBuilderInterface interface {
 	WithMetricsRecorder(metricsRecorder MetricsRecorder) error
 	// Sets the seed used for SlateDB's internal random number generation.
 	WithSeed(seed uint64) error
+	// Sets the segment extractor (RFC-0024). When configured, every write is
+	// routed through the extractor and the database tracks per-segment LSM
+	// state. The extractor must be configured at database creation time and
+	// cannot be changed thereafter.
+	WithSegmentExtractor(extractor PrefixExtractor) error
 	// Applies a [`crate::Settings`] object to the builder.
 	WithSettings(settings *Settings) error
 	// Sets the SSTable block size used for newly written tables.
@@ -4089,6 +4251,21 @@ func (_self *DbBuilder) WithSeed(seed uint64) error {
 	_, _uniffiErr := rustCallWithError[*Error](FfiConverterError{}, func(_uniffiStatus *C.RustCallStatus) bool {
 		C.uniffi_slatedb_uniffi_fn_method_dbbuilder_with_seed(
 			_pointer, FfiConverterUint64INSTANCE.Lower(seed), _uniffiStatus)
+		return false
+	})
+	return _uniffiErr.AsError()
+}
+
+// Sets the segment extractor (RFC-0024). When configured, every write is
+// routed through the extractor and the database tracks per-segment LSM
+// state. The extractor must be configured at database creation time and
+// cannot be changed thereafter.
+func (_self *DbBuilder) WithSegmentExtractor(extractor PrefixExtractor) error {
+	_pointer := _self.ffiObject.incrementPointer("*DbBuilder")
+	defer _self.ffiObject.decrementPointer()
+	_, _uniffiErr := rustCallWithError[*Error](FfiConverterError{}, func(_uniffiStatus *C.RustCallStatus) bool {
+		C.uniffi_slatedb_uniffi_fn_method_dbbuilder_with_segment_extractor(
+			_pointer, FfiConverterPrefixExtractorINSTANCE.Lower(extractor), _uniffiStatus)
 		return false
 	})
 	return _uniffiErr.AsError()
@@ -4441,10 +4618,11 @@ type DbReaderInterface interface {
 	GetWithOptions(key []byte, options ReadOptions) (*[]byte, error)
 	// Scans rows inside `range`.
 	Scan(varRange KeyRange) (*DbIterator, error)
-	// Scans rows whose keys start with `prefix`.
-	ScanPrefix(prefix []byte) (*DbIterator, error)
-	// Scans rows whose keys start with `prefix` using custom scan options.
-	ScanPrefixWithOptions(prefix []byte, options ScanOptions) (*DbIterator, error)
+	// Scans rows whose keys start with `prefix`, restricted to `subrange`.
+	ScanPrefix(prefix []byte, subrange KeyRange) (*DbIterator, error)
+	// Scans rows whose keys start with `prefix`, restricted to `subrange`,
+	// using custom scan options.
+	ScanPrefixWithOptions(prefix []byte, subrange KeyRange, options ScanOptions) (*DbIterator, error)
 	// Scans rows inside `range` using custom scan options.
 	ScanWithOptions(varRange KeyRange, options ScanOptions) (*DbIterator, error)
 	// Closes the reader.
@@ -4676,8 +4854,8 @@ func (_self *DbReader) Scan(varRange KeyRange) (*DbIterator, error) {
 	return res, err
 }
 
-// Scans rows whose keys start with `prefix`.
-func (_self *DbReader) ScanPrefix(prefix []byte) (*DbIterator, error) {
+// Scans rows whose keys start with `prefix`, restricted to `subrange`.
+func (_self *DbReader) ScanPrefix(prefix []byte, subrange KeyRange) (*DbIterator, error) {
 	_pointer := _self.ffiObject.incrementPointer("*DbReader")
 	defer _self.ffiObject.decrementPointer()
 	res, err := uniffiRustCallAsync[*Error](
@@ -4692,7 +4870,7 @@ func (_self *DbReader) ScanPrefix(prefix []byte) (*DbIterator, error) {
 			return FfiConverterDbIteratorINSTANCE.Lift(ffi)
 		},
 		C.uniffi_slatedb_uniffi_fn_method_dbreader_scan_prefix(
-			_pointer, FfiConverterBytesINSTANCE.Lower(prefix)),
+			_pointer, FfiConverterBytesINSTANCE.Lower(prefix), FfiConverterKeyRangeINSTANCE.Lower(subrange)),
 		// pollFn
 		func(handle C.uint64_t, continuation C.UniffiRustFutureContinuationCallback, data C.uint64_t) {
 			C.ffi_slatedb_uniffi_rust_future_poll_u64(handle, continuation, data)
@@ -4710,8 +4888,9 @@ func (_self *DbReader) ScanPrefix(prefix []byte) (*DbIterator, error) {
 	return res, err
 }
 
-// Scans rows whose keys start with `prefix` using custom scan options.
-func (_self *DbReader) ScanPrefixWithOptions(prefix []byte, options ScanOptions) (*DbIterator, error) {
+// Scans rows whose keys start with `prefix`, restricted to `subrange`,
+// using custom scan options.
+func (_self *DbReader) ScanPrefixWithOptions(prefix []byte, subrange KeyRange, options ScanOptions) (*DbIterator, error) {
 	_pointer := _self.ffiObject.incrementPointer("*DbReader")
 	defer _self.ffiObject.decrementPointer()
 	res, err := uniffiRustCallAsync[*Error](
@@ -4726,7 +4905,7 @@ func (_self *DbReader) ScanPrefixWithOptions(prefix []byte, options ScanOptions)
 			return FfiConverterDbIteratorINSTANCE.Lift(ffi)
 		},
 		C.uniffi_slatedb_uniffi_fn_method_dbreader_scan_prefix_with_options(
-			_pointer, FfiConverterBytesINSTANCE.Lower(prefix), FfiConverterScanOptionsINSTANCE.Lower(options)),
+			_pointer, FfiConverterBytesINSTANCE.Lower(prefix), FfiConverterKeyRangeINSTANCE.Lower(subrange), FfiConverterScanOptionsINSTANCE.Lower(options)),
 		// pollFn
 		func(handle C.uint64_t, continuation C.UniffiRustFutureContinuationCallback, data C.uint64_t) {
 			C.ffi_slatedb_uniffi_rust_future_poll_u64(handle, continuation, data)
@@ -4933,6 +5112,10 @@ type DbReaderBuilderInterface interface {
 	WithMetricsRecorder(metricsRecorder MetricsRecorder) error
 	// Applies custom reader options.
 	WithOptions(options ReaderOptions) error
+	// Sets the segment extractor (RFC-0024). A reader opening a segmented
+	// database must configure an extractor matching the one the database
+	// was created with.
+	WithSegmentExtractor(extractor PrefixExtractor) error
 	// Uses a separate object store for WAL files.
 	WithWalObjectStore(walObjectStore *ObjectStore) error
 }
@@ -5049,6 +5232,20 @@ func (_self *DbReaderBuilder) WithOptions(options ReaderOptions) error {
 	return _uniffiErr.AsError()
 }
 
+// Sets the segment extractor (RFC-0024). A reader opening a segmented
+// database must configure an extractor matching the one the database
+// was created with.
+func (_self *DbReaderBuilder) WithSegmentExtractor(extractor PrefixExtractor) error {
+	_pointer := _self.ffiObject.incrementPointer("*DbReaderBuilder")
+	defer _self.ffiObject.decrementPointer()
+	_, _uniffiErr := rustCallWithError[*Error](FfiConverterError{}, func(_uniffiStatus *C.RustCallStatus) bool {
+		C.uniffi_slatedb_uniffi_fn_method_dbreaderbuilder_with_segment_extractor(
+			_pointer, FfiConverterPrefixExtractorINSTANCE.Lower(extractor), _uniffiStatus)
+		return false
+	})
+	return _uniffiErr.AsError()
+}
+
 // Uses a separate object store for WAL files.
 func (_self *DbReaderBuilder) WithWalObjectStore(walObjectStore *ObjectStore) error {
 	_pointer := _self.ffiObject.incrementPointer("*DbReaderBuilder")
@@ -5128,10 +5325,12 @@ type DbSnapshotInterface interface {
 	GetWithOptions(key []byte, options ReadOptions) (*[]byte, error)
 	// Scans rows inside `range` as of this snapshot.
 	Scan(varRange KeyRange) (*DbIterator, error)
-	// Scans rows whose keys start with `prefix` as of this snapshot.
-	ScanPrefix(prefix []byte) (*DbIterator, error)
-	// Scans rows whose keys start with `prefix` as of this snapshot using custom options.
-	ScanPrefixWithOptions(prefix []byte, options ScanOptions) (*DbIterator, error)
+	// Scans rows whose keys start with `prefix` as of this snapshot,
+	// restricted to `subrange`.
+	ScanPrefix(prefix []byte, subrange KeyRange) (*DbIterator, error)
+	// Scans rows whose keys start with `prefix` as of this snapshot,
+	// restricted to `subrange`, using custom options.
+	ScanPrefixWithOptions(prefix []byte, subrange KeyRange, options ScanOptions) (*DbIterator, error)
 	// Scans rows inside `range` as of this snapshot using custom scan options.
 	ScanWithOptions(varRange KeyRange, options ScanOptions) (*DbIterator, error)
 }
@@ -5319,8 +5518,9 @@ func (_self *DbSnapshot) Scan(varRange KeyRange) (*DbIterator, error) {
 	return res, err
 }
 
-// Scans rows whose keys start with `prefix` as of this snapshot.
-func (_self *DbSnapshot) ScanPrefix(prefix []byte) (*DbIterator, error) {
+// Scans rows whose keys start with `prefix` as of this snapshot,
+// restricted to `subrange`.
+func (_self *DbSnapshot) ScanPrefix(prefix []byte, subrange KeyRange) (*DbIterator, error) {
 	_pointer := _self.ffiObject.incrementPointer("*DbSnapshot")
 	defer _self.ffiObject.decrementPointer()
 	res, err := uniffiRustCallAsync[*Error](
@@ -5335,7 +5535,7 @@ func (_self *DbSnapshot) ScanPrefix(prefix []byte) (*DbIterator, error) {
 			return FfiConverterDbIteratorINSTANCE.Lift(ffi)
 		},
 		C.uniffi_slatedb_uniffi_fn_method_dbsnapshot_scan_prefix(
-			_pointer, FfiConverterBytesINSTANCE.Lower(prefix)),
+			_pointer, FfiConverterBytesINSTANCE.Lower(prefix), FfiConverterKeyRangeINSTANCE.Lower(subrange)),
 		// pollFn
 		func(handle C.uint64_t, continuation C.UniffiRustFutureContinuationCallback, data C.uint64_t) {
 			C.ffi_slatedb_uniffi_rust_future_poll_u64(handle, continuation, data)
@@ -5353,8 +5553,9 @@ func (_self *DbSnapshot) ScanPrefix(prefix []byte) (*DbIterator, error) {
 	return res, err
 }
 
-// Scans rows whose keys start with `prefix` as of this snapshot using custom options.
-func (_self *DbSnapshot) ScanPrefixWithOptions(prefix []byte, options ScanOptions) (*DbIterator, error) {
+// Scans rows whose keys start with `prefix` as of this snapshot,
+// restricted to `subrange`, using custom options.
+func (_self *DbSnapshot) ScanPrefixWithOptions(prefix []byte, subrange KeyRange, options ScanOptions) (*DbIterator, error) {
 	_pointer := _self.ffiObject.incrementPointer("*DbSnapshot")
 	defer _self.ffiObject.decrementPointer()
 	res, err := uniffiRustCallAsync[*Error](
@@ -5369,7 +5570,7 @@ func (_self *DbSnapshot) ScanPrefixWithOptions(prefix []byte, options ScanOption
 			return FfiConverterDbIteratorINSTANCE.Lift(ffi)
 		},
 		C.uniffi_slatedb_uniffi_fn_method_dbsnapshot_scan_prefix_with_options(
-			_pointer, FfiConverterBytesINSTANCE.Lower(prefix), FfiConverterScanOptionsINSTANCE.Lower(options)),
+			_pointer, FfiConverterBytesINSTANCE.Lower(prefix), FfiConverterKeyRangeINSTANCE.Lower(subrange), FfiConverterScanOptionsINSTANCE.Lower(options)),
 		// pollFn
 		func(handle C.uint64_t, continuation C.UniffiRustFutureContinuationCallback, data C.uint64_t) {
 			C.ffi_slatedb_uniffi_rust_future_poll_u64(handle, continuation, data)
@@ -5515,10 +5716,12 @@ type DbTransactionInterface interface {
 	Rollback() error
 	// Scans rows inside `range` as visible to this transaction.
 	Scan(varRange KeyRange) (*DbIterator, error)
-	// Scans rows whose keys start with `prefix` as visible to this transaction.
-	ScanPrefix(prefix []byte) (*DbIterator, error)
-	// Scans rows whose keys start with `prefix` as visible to this transaction using custom options.
-	ScanPrefixWithOptions(prefix []byte, options ScanOptions) (*DbIterator, error)
+	// Scans rows whose keys start with `prefix` as visible to this transaction,
+	// restricted to `subrange`.
+	ScanPrefix(prefix []byte, subrange KeyRange) (*DbIterator, error)
+	// Scans rows whose keys start with `prefix` as visible to this transaction,
+	// restricted to `subrange`, using custom options.
+	ScanPrefixWithOptions(prefix []byte, subrange KeyRange, options ScanOptions) (*DbIterator, error)
 	// Scans rows inside `range` as visible to this transaction using custom options.
 	ScanWithOptions(varRange KeyRange, options ScanOptions) (*DbIterator, error)
 	// Returns the sequence number assigned when the transaction started.
@@ -6025,8 +6228,9 @@ func (_self *DbTransaction) Scan(varRange KeyRange) (*DbIterator, error) {
 	return res, err
 }
 
-// Scans rows whose keys start with `prefix` as visible to this transaction.
-func (_self *DbTransaction) ScanPrefix(prefix []byte) (*DbIterator, error) {
+// Scans rows whose keys start with `prefix` as visible to this transaction,
+// restricted to `subrange`.
+func (_self *DbTransaction) ScanPrefix(prefix []byte, subrange KeyRange) (*DbIterator, error) {
 	_pointer := _self.ffiObject.incrementPointer("*DbTransaction")
 	defer _self.ffiObject.decrementPointer()
 	res, err := uniffiRustCallAsync[*Error](
@@ -6041,7 +6245,7 @@ func (_self *DbTransaction) ScanPrefix(prefix []byte) (*DbIterator, error) {
 			return FfiConverterDbIteratorINSTANCE.Lift(ffi)
 		},
 		C.uniffi_slatedb_uniffi_fn_method_dbtransaction_scan_prefix(
-			_pointer, FfiConverterBytesINSTANCE.Lower(prefix)),
+			_pointer, FfiConverterBytesINSTANCE.Lower(prefix), FfiConverterKeyRangeINSTANCE.Lower(subrange)),
 		// pollFn
 		func(handle C.uint64_t, continuation C.UniffiRustFutureContinuationCallback, data C.uint64_t) {
 			C.ffi_slatedb_uniffi_rust_future_poll_u64(handle, continuation, data)
@@ -6059,8 +6263,9 @@ func (_self *DbTransaction) ScanPrefix(prefix []byte) (*DbIterator, error) {
 	return res, err
 }
 
-// Scans rows whose keys start with `prefix` as visible to this transaction using custom options.
-func (_self *DbTransaction) ScanPrefixWithOptions(prefix []byte, options ScanOptions) (*DbIterator, error) {
+// Scans rows whose keys start with `prefix` as visible to this transaction,
+// restricted to `subrange`, using custom options.
+func (_self *DbTransaction) ScanPrefixWithOptions(prefix []byte, subrange KeyRange, options ScanOptions) (*DbIterator, error) {
 	_pointer := _self.ffiObject.incrementPointer("*DbTransaction")
 	defer _self.ffiObject.decrementPointer()
 	res, err := uniffiRustCallAsync[*Error](
@@ -6075,7 +6280,7 @@ func (_self *DbTransaction) ScanPrefixWithOptions(prefix []byte, options ScanOpt
 			return FfiConverterDbIteratorINSTANCE.Lift(ffi)
 		},
 		C.uniffi_slatedb_uniffi_fn_method_dbtransaction_scan_prefix_with_options(
-			_pointer, FfiConverterBytesINSTANCE.Lower(prefix), FfiConverterScanOptionsINSTANCE.Lower(options)),
+			_pointer, FfiConverterBytesINSTANCE.Lower(prefix), FfiConverterKeyRangeINSTANCE.Lower(subrange), FfiConverterScanOptionsINSTANCE.Lower(options)),
 		// pollFn
 		func(handle C.uint64_t, continuation C.UniffiRustFutureContinuationCallback, data C.uint64_t) {
 			C.ffi_slatedb_uniffi_rust_future_poll_u64(handle, continuation, data)
@@ -7961,7 +8166,7 @@ type WalFileInterface interface {
 	// Opens an iterator over raw row entries in this WAL file.
 	Iterator() (*WalFileIterator, error)
 	// Reads object-store metadata for this WAL file.
-	Metadata() (WalFileMetadata, error)
+	Metadata() (IdentifiedObjectMetadata, error)
 	// Returns a handle for the next WAL file ID without checking existence.
 	NextFile() *WalFile
 	// Returns the WAL ID immediately after this file.
@@ -8018,7 +8223,7 @@ func (_self *WalFile) Iterator() (*WalFileIterator, error) {
 }
 
 // Reads object-store metadata for this WAL file.
-func (_self *WalFile) Metadata() (WalFileMetadata, error) {
+func (_self *WalFile) Metadata() (IdentifiedObjectMetadata, error) {
 	_pointer := _self.ffiObject.incrementPointer("*WalFile")
 	defer _self.ffiObject.decrementPointer()
 	res, err := uniffiRustCallAsync[*Error](
@@ -8031,8 +8236,8 @@ func (_self *WalFile) Metadata() (WalFileMetadata, error) {
 			}
 		},
 		// liftFn
-		func(ffi RustBufferI) WalFileMetadata {
-			return FfiConverterWalFileMetadataINSTANCE.Lift(ffi)
+		func(ffi RustBufferI) IdentifiedObjectMetadata {
+			return FfiConverterIdentifiedObjectMetadataINSTANCE.Lift(ffi)
 		},
 		C.uniffi_slatedb_uniffi_fn_method_walfile_metadata(
 			_pointer),
@@ -8615,6 +8820,108 @@ func (_ FfiDestroyerCheckpoint) Destroy(value Checkpoint) {
 	value.Destroy()
 }
 
+type CheckpointCreateResult struct {
+	// The id of the created checkpoint.
+	Id string
+	// The manifest id referenced by the created checkpoint.
+	ManifestId uint64
+}
+
+func (r *CheckpointCreateResult) Destroy() {
+	FfiDestroyerString{}.Destroy(r.Id)
+	FfiDestroyerUint64{}.Destroy(r.ManifestId)
+}
+
+type FfiConverterCheckpointCreateResult struct{}
+
+var FfiConverterCheckpointCreateResultINSTANCE = FfiConverterCheckpointCreateResult{}
+
+func (c FfiConverterCheckpointCreateResult) Lift(rb RustBufferI) CheckpointCreateResult {
+	return LiftFromRustBuffer[CheckpointCreateResult](c, rb)
+}
+
+func (c FfiConverterCheckpointCreateResult) Read(reader io.Reader) CheckpointCreateResult {
+	return CheckpointCreateResult{
+		FfiConverterStringINSTANCE.Read(reader),
+		FfiConverterUint64INSTANCE.Read(reader),
+	}
+}
+
+func (c FfiConverterCheckpointCreateResult) Lower(value CheckpointCreateResult) C.RustBuffer {
+	return LowerIntoRustBuffer[CheckpointCreateResult](c, value)
+}
+
+func (c FfiConverterCheckpointCreateResult) LowerExternal(value CheckpointCreateResult) ExternalCRustBuffer {
+	return RustBufferFromC(LowerIntoRustBuffer[CheckpointCreateResult](c, value))
+}
+
+func (c FfiConverterCheckpointCreateResult) Write(writer io.Writer, value CheckpointCreateResult) {
+	FfiConverterStringINSTANCE.Write(writer, value.Id)
+	FfiConverterUint64INSTANCE.Write(writer, value.ManifestId)
+}
+
+type FfiDestroyerCheckpointCreateResult struct{}
+
+func (_ FfiDestroyerCheckpointCreateResult) Destroy(value CheckpointCreateResult) {
+	value.Destroy()
+}
+
+// Specify options to provide when creating a checkpoint.
+type CheckpointOptions struct {
+	// Optionally specifies the lifetime of the checkpoint to create. The expire time will be
+	// set to the current wallclock time plus the specified lifetime. If lifetime is None, then
+	// the checkpoint is created without an expiry time.
+	LifetimeMs *uint64
+	// Optionally specifies an existing checkpoint to use as the source for this checkpoint. This
+	// is useful for users to establish checkpoints from existing checkpoints, but with a different
+	// lifecycle and/or metadata.
+	Source *string
+	// Optionally specifies a name for the checkpoint. Can be used to list the checkpoints.
+	Name *string
+}
+
+func (r *CheckpointOptions) Destroy() {
+	FfiDestroyerOptionalUint64{}.Destroy(r.LifetimeMs)
+	FfiDestroyerOptionalString{}.Destroy(r.Source)
+	FfiDestroyerOptionalString{}.Destroy(r.Name)
+}
+
+type FfiConverterCheckpointOptions struct{}
+
+var FfiConverterCheckpointOptionsINSTANCE = FfiConverterCheckpointOptions{}
+
+func (c FfiConverterCheckpointOptions) Lift(rb RustBufferI) CheckpointOptions {
+	return LiftFromRustBuffer[CheckpointOptions](c, rb)
+}
+
+func (c FfiConverterCheckpointOptions) Read(reader io.Reader) CheckpointOptions {
+	return CheckpointOptions{
+		FfiConverterOptionalUint64INSTANCE.Read(reader),
+		FfiConverterOptionalStringINSTANCE.Read(reader),
+		FfiConverterOptionalStringINSTANCE.Read(reader),
+	}
+}
+
+func (c FfiConverterCheckpointOptions) Lower(value CheckpointOptions) C.RustBuffer {
+	return LowerIntoRustBuffer[CheckpointOptions](c, value)
+}
+
+func (c FfiConverterCheckpointOptions) LowerExternal(value CheckpointOptions) ExternalCRustBuffer {
+	return RustBufferFromC(LowerIntoRustBuffer[CheckpointOptions](c, value))
+}
+
+func (c FfiConverterCheckpointOptions) Write(writer io.Writer, value CheckpointOptions) {
+	FfiConverterOptionalUint64INSTANCE.Write(writer, value.LifetimeMs)
+	FfiConverterOptionalStringINSTANCE.Write(writer, value.Source)
+	FfiConverterOptionalStringINSTANCE.Write(writer, value.Name)
+}
+
+type FfiDestroyerCheckpointOptions struct{}
+
+func (_ FfiDestroyerCheckpointOptions) Destroy(value CheckpointOptions) {
+	value.Destroy()
+}
+
 type CloneSourceSpec struct {
 	// Path to the source database.
 	Path string
@@ -8844,11 +9151,17 @@ type DbStatus struct {
 	DurableSeq uint64
 	// Present once the handle has been closed.
 	CloseReason *CloseReason
+	// All segment prefixes (RFC-0024) as of this snapshot: those in the
+	// current manifest unioned with those touched in this handle's memtables
+	// but not yet flushed. Sorted ascending by prefix and deduplicated; empty
+	// when no segment extractor is configured.
+	Segments []SegmentPrefix
 }
 
 func (r *DbStatus) Destroy() {
 	FfiDestroyerUint64{}.Destroy(r.DurableSeq)
 	FfiDestroyerOptionalCloseReason{}.Destroy(r.CloseReason)
+	FfiDestroyerSequenceSegmentPrefix{}.Destroy(r.Segments)
 }
 
 type FfiConverterDbStatus struct{}
@@ -8863,6 +9176,7 @@ func (c FfiConverterDbStatus) Read(reader io.Reader) DbStatus {
 	return DbStatus{
 		FfiConverterUint64INSTANCE.Read(reader),
 		FfiConverterOptionalCloseReasonINSTANCE.Read(reader),
+		FfiConverterSequenceSegmentPrefixINSTANCE.Read(reader),
 	}
 }
 
@@ -8877,6 +9191,7 @@ func (c FfiConverterDbStatus) LowerExternal(value DbStatus) ExternalCRustBuffer 
 func (c FfiConverterDbStatus) Write(writer io.Writer, value DbStatus) {
 	FfiConverterUint64INSTANCE.Write(writer, value.DurableSeq)
 	FfiConverterOptionalCloseReasonINSTANCE.Write(writer, value.CloseReason)
+	FfiConverterSequenceSegmentPrefixINSTANCE.Write(writer, value.Segments)
 }
 
 type FfiDestroyerDbStatus struct{}
@@ -9093,6 +9408,53 @@ func (c FfiConverterHistogramMetricValue) Write(writer io.Writer, value Histogra
 type FfiDestroyerHistogramMetricValue struct{}
 
 func (_ FfiDestroyerHistogramMetricValue) Destroy(value HistogramMetricValue) {
+	value.Destroy()
+}
+
+// Metadata for an object plus the domain identifier parsed from its path.
+type IdentifiedObjectMetadata struct {
+	// Parsed domain identifier for the object.
+	Id uint64
+	// Object-store metadata.
+	Metadata ObjectMetadata
+}
+
+func (r *IdentifiedObjectMetadata) Destroy() {
+	FfiDestroyerUint64{}.Destroy(r.Id)
+	FfiDestroyerObjectMetadata{}.Destroy(r.Metadata)
+}
+
+type FfiConverterIdentifiedObjectMetadata struct{}
+
+var FfiConverterIdentifiedObjectMetadataINSTANCE = FfiConverterIdentifiedObjectMetadata{}
+
+func (c FfiConverterIdentifiedObjectMetadata) Lift(rb RustBufferI) IdentifiedObjectMetadata {
+	return LiftFromRustBuffer[IdentifiedObjectMetadata](c, rb)
+}
+
+func (c FfiConverterIdentifiedObjectMetadata) Read(reader io.Reader) IdentifiedObjectMetadata {
+	return IdentifiedObjectMetadata{
+		FfiConverterUint64INSTANCE.Read(reader),
+		FfiConverterObjectMetadataINSTANCE.Read(reader),
+	}
+}
+
+func (c FfiConverterIdentifiedObjectMetadata) Lower(value IdentifiedObjectMetadata) C.RustBuffer {
+	return LowerIntoRustBuffer[IdentifiedObjectMetadata](c, value)
+}
+
+func (c FfiConverterIdentifiedObjectMetadata) LowerExternal(value IdentifiedObjectMetadata) ExternalCRustBuffer {
+	return RustBufferFromC(LowerIntoRustBuffer[IdentifiedObjectMetadata](c, value))
+}
+
+func (c FfiConverterIdentifiedObjectMetadata) Write(writer io.Writer, value IdentifiedObjectMetadata) {
+	FfiConverterUint64INSTANCE.Write(writer, value.Id)
+	FfiConverterObjectMetadataINSTANCE.Write(writer, value.Metadata)
+}
+
+type FfiDestroyerIdentifiedObjectMetadata struct{}
+
+func (_ FfiDestroyerIdentifiedObjectMetadata) Destroy(value IdentifiedObjectMetadata) {
 	value.Destroy()
 }
 
@@ -9477,6 +9839,73 @@ func (_ FfiDestroyerMokaCacheOptions) Destroy(value MokaCacheOptions) {
 	value.Destroy()
 }
 
+// Metadata describing an object in object storage.
+type ObjectMetadata struct {
+	// Last-modified timestamp seconds component.
+	LastModifiedSeconds int64
+	// Last-modified timestamp nanoseconds component.
+	LastModifiedNanos uint32
+	// Object size in bytes.
+	Size uint64
+	// Object-store location.
+	Location string
+	// The object's ETag, when the object store provides one.
+	ETag *string
+	// The object version, when the object store provides one.
+	Version *string
+}
+
+func (r *ObjectMetadata) Destroy() {
+	FfiDestroyerInt64{}.Destroy(r.LastModifiedSeconds)
+	FfiDestroyerUint32{}.Destroy(r.LastModifiedNanos)
+	FfiDestroyerUint64{}.Destroy(r.Size)
+	FfiDestroyerString{}.Destroy(r.Location)
+	FfiDestroyerOptionalString{}.Destroy(r.ETag)
+	FfiDestroyerOptionalString{}.Destroy(r.Version)
+}
+
+type FfiConverterObjectMetadata struct{}
+
+var FfiConverterObjectMetadataINSTANCE = FfiConverterObjectMetadata{}
+
+func (c FfiConverterObjectMetadata) Lift(rb RustBufferI) ObjectMetadata {
+	return LiftFromRustBuffer[ObjectMetadata](c, rb)
+}
+
+func (c FfiConverterObjectMetadata) Read(reader io.Reader) ObjectMetadata {
+	return ObjectMetadata{
+		FfiConverterInt64INSTANCE.Read(reader),
+		FfiConverterUint32INSTANCE.Read(reader),
+		FfiConverterUint64INSTANCE.Read(reader),
+		FfiConverterStringINSTANCE.Read(reader),
+		FfiConverterOptionalStringINSTANCE.Read(reader),
+		FfiConverterOptionalStringINSTANCE.Read(reader),
+	}
+}
+
+func (c FfiConverterObjectMetadata) Lower(value ObjectMetadata) C.RustBuffer {
+	return LowerIntoRustBuffer[ObjectMetadata](c, value)
+}
+
+func (c FfiConverterObjectMetadata) LowerExternal(value ObjectMetadata) ExternalCRustBuffer {
+	return RustBufferFromC(LowerIntoRustBuffer[ObjectMetadata](c, value))
+}
+
+func (c FfiConverterObjectMetadata) Write(writer io.Writer, value ObjectMetadata) {
+	FfiConverterInt64INSTANCE.Write(writer, value.LastModifiedSeconds)
+	FfiConverterUint32INSTANCE.Write(writer, value.LastModifiedNanos)
+	FfiConverterUint64INSTANCE.Write(writer, value.Size)
+	FfiConverterStringINSTANCE.Write(writer, value.Location)
+	FfiConverterOptionalStringINSTANCE.Write(writer, value.ETag)
+	FfiConverterOptionalStringINSTANCE.Write(writer, value.Version)
+}
+
+type FfiDestroyerObjectMetadata struct{}
+
+func (_ FfiDestroyerObjectMetadata) Destroy(value ObjectMetadata) {
+	value.Destroy()
+}
+
 // Options applied to a put operation.
 type PutOptions struct {
 	// TTL policy for the inserted value.
@@ -9773,6 +10202,49 @@ func (c FfiConverterScanOptions) Write(writer io.Writer, value ScanOptions) {
 type FfiDestroyerScanOptions struct{}
 
 func (_ FfiDestroyerScanOptions) Destroy(value ScanOptions) {
+	value.Destroy()
+}
+
+// A segment (RFC-0024), identified by the key prefix it owns; the segment
+// spans the key interval `[prefix, prefix++)`.
+type SegmentPrefix struct {
+	// The key prefix owned by the segment.
+	Prefix []byte
+}
+
+func (r *SegmentPrefix) Destroy() {
+	FfiDestroyerBytes{}.Destroy(r.Prefix)
+}
+
+type FfiConverterSegmentPrefix struct{}
+
+var FfiConverterSegmentPrefixINSTANCE = FfiConverterSegmentPrefix{}
+
+func (c FfiConverterSegmentPrefix) Lift(rb RustBufferI) SegmentPrefix {
+	return LiftFromRustBuffer[SegmentPrefix](c, rb)
+}
+
+func (c FfiConverterSegmentPrefix) Read(reader io.Reader) SegmentPrefix {
+	return SegmentPrefix{
+		FfiConverterBytesINSTANCE.Read(reader),
+	}
+}
+
+func (c FfiConverterSegmentPrefix) Lower(value SegmentPrefix) C.RustBuffer {
+	return LowerIntoRustBuffer[SegmentPrefix](c, value)
+}
+
+func (c FfiConverterSegmentPrefix) LowerExternal(value SegmentPrefix) ExternalCRustBuffer {
+	return RustBufferFromC(LowerIntoRustBuffer[SegmentPrefix](c, value))
+}
+
+func (c FfiConverterSegmentPrefix) Write(writer io.Writer, value SegmentPrefix) {
+	FfiConverterBytesINSTANCE.Write(writer, value.Prefix)
+}
+
+type FfiDestroyerSegmentPrefix struct{}
+
+func (_ FfiDestroyerSegmentPrefix) Destroy(value SegmentPrefix) {
 	value.Destroy()
 }
 
@@ -10195,63 +10667,6 @@ func (c FfiConverterVersionedManifest) Write(writer io.Writer, value VersionedMa
 type FfiDestroyerVersionedManifest struct{}
 
 func (_ FfiDestroyerVersionedManifest) Destroy(value VersionedManifest) {
-	value.Destroy()
-}
-
-// Metadata describing a WAL file in object storage.
-type WalFileMetadata struct {
-	// Last-modified timestamp seconds component.
-	LastModifiedSeconds int64
-	// Last-modified timestamp nanoseconds component.
-	LastModifiedNanos uint32
-	// File size in bytes.
-	SizeBytes uint64
-	// Object-store location of the file.
-	Location string
-}
-
-func (r *WalFileMetadata) Destroy() {
-	FfiDestroyerInt64{}.Destroy(r.LastModifiedSeconds)
-	FfiDestroyerUint32{}.Destroy(r.LastModifiedNanos)
-	FfiDestroyerUint64{}.Destroy(r.SizeBytes)
-	FfiDestroyerString{}.Destroy(r.Location)
-}
-
-type FfiConverterWalFileMetadata struct{}
-
-var FfiConverterWalFileMetadataINSTANCE = FfiConverterWalFileMetadata{}
-
-func (c FfiConverterWalFileMetadata) Lift(rb RustBufferI) WalFileMetadata {
-	return LiftFromRustBuffer[WalFileMetadata](c, rb)
-}
-
-func (c FfiConverterWalFileMetadata) Read(reader io.Reader) WalFileMetadata {
-	return WalFileMetadata{
-		FfiConverterInt64INSTANCE.Read(reader),
-		FfiConverterUint32INSTANCE.Read(reader),
-		FfiConverterUint64INSTANCE.Read(reader),
-		FfiConverterStringINSTANCE.Read(reader),
-	}
-}
-
-func (c FfiConverterWalFileMetadata) Lower(value WalFileMetadata) C.RustBuffer {
-	return LowerIntoRustBuffer[WalFileMetadata](c, value)
-}
-
-func (c FfiConverterWalFileMetadata) LowerExternal(value WalFileMetadata) ExternalCRustBuffer {
-	return RustBufferFromC(LowerIntoRustBuffer[WalFileMetadata](c, value))
-}
-
-func (c FfiConverterWalFileMetadata) Write(writer io.Writer, value WalFileMetadata) {
-	FfiConverterInt64INSTANCE.Write(writer, value.LastModifiedSeconds)
-	FfiConverterUint32INSTANCE.Write(writer, value.LastModifiedNanos)
-	FfiConverterUint64INSTANCE.Write(writer, value.SizeBytes)
-	FfiConverterStringINSTANCE.Write(writer, value.Location)
-}
-
-type FfiDestroyerWalFileMetadata struct{}
-
-func (_ FfiDestroyerWalFileMetadata) Destroy(value WalFileMetadata) {
 	value.Destroy()
 }
 
@@ -13084,6 +13499,53 @@ type FfiDestroyerSequenceMetricLabel struct{}
 func (FfiDestroyerSequenceMetricLabel) Destroy(sequence []MetricLabel) {
 	for _, value := range sequence {
 		FfiDestroyerMetricLabel{}.Destroy(value)
+	}
+}
+
+type FfiConverterSequenceSegmentPrefix struct{}
+
+var FfiConverterSequenceSegmentPrefixINSTANCE = FfiConverterSequenceSegmentPrefix{}
+
+func (c FfiConverterSequenceSegmentPrefix) Lift(rb RustBufferI) []SegmentPrefix {
+	return LiftFromRustBuffer[[]SegmentPrefix](c, rb)
+}
+
+func (c FfiConverterSequenceSegmentPrefix) Read(reader io.Reader) []SegmentPrefix {
+	length := readInt32(reader)
+	if length == 0 {
+		return nil
+	}
+	result := make([]SegmentPrefix, 0, length)
+	for i := int32(0); i < length; i++ {
+		result = append(result, FfiConverterSegmentPrefixINSTANCE.Read(reader))
+	}
+	return result
+}
+
+func (c FfiConverterSequenceSegmentPrefix) Lower(value []SegmentPrefix) C.RustBuffer {
+	return LowerIntoRustBuffer[[]SegmentPrefix](c, value)
+}
+
+func (c FfiConverterSequenceSegmentPrefix) LowerExternal(value []SegmentPrefix) ExternalCRustBuffer {
+	return RustBufferFromC(LowerIntoRustBuffer[[]SegmentPrefix](c, value))
+}
+
+func (c FfiConverterSequenceSegmentPrefix) Write(writer io.Writer, value []SegmentPrefix) {
+	if len(value) > math.MaxInt32 {
+		panic("[]SegmentPrefix is too large to fit into Int32")
+	}
+
+	writeInt32(writer, int32(len(value)))
+	for _, item := range value {
+		FfiConverterSegmentPrefixINSTANCE.Write(writer, item)
+	}
+}
+
+type FfiDestroyerSequenceSegmentPrefix struct{}
+
+func (FfiDestroyerSequenceSegmentPrefix) Destroy(sequence []SegmentPrefix) {
+	for _, value := range sequence {
+		FfiDestroyerSegmentPrefix{}.Destroy(value)
 	}
 }
 
