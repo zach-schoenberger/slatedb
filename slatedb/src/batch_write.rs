@@ -383,15 +383,6 @@ impl DbInner {
         let _ = self.memtable_flusher().notify_memtable_frozen();
     }
 
-    /// Freeze the active memtable, acquiring the state write lock and using the
-    /// WAL buffer's most recently flushed WAL id as the replay boundary. Used by
-    /// the write buffer manager backpressure path to proactively drain memory.
-    pub(crate) fn freeze_current_memtable(&self) {
-        let replay_after_wal_id = self.wal_buffer.recent_flushed_wal_id();
-        let mut guard = self.state.write();
-        self.freeze_current_memtable_with_state_guard(&mut guard, replay_after_wal_id);
-    }
-
     /// Request a memtable freeze from the writer task. Sends a
     /// [`BatchWriterMessage::Flush`] to the writer event loop and waits for it to complete.
     #[instrument(level = "trace", skip_all, err(level = tracing::Level::DEBUG))]

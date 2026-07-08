@@ -7,7 +7,6 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use crossbeam_skiplist::map::Range;
 use crossbeam_skiplist::SkipMap;
-
 use ouroboros::self_referencing;
 use std::sync::atomic::AtomicI64;
 use std::sync::atomic::Ordering::SeqCst;
@@ -353,8 +352,8 @@ impl ImmutableMemtable {
     /// scratch — the same derivation the writer applies in
     /// [`WriteBatch::extract_entries`], via the shared
     /// [`extract_segment_prefix`]. Prefixes whose every row was filtered
-    /// its row. An empty/absent prefix is an `EmptySegmentPrefix` error,
     /// out are therefore dropped, and no row's prefix can survive without
+    /// its row. An empty/absent prefix is an `EmptySegmentPrefix` error,
     /// matching the write and replay paths. When `segment_extractor` is
     /// `None`, the new table records no segments.
     pub(crate) fn filter_after_seq(

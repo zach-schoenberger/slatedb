@@ -31,7 +31,6 @@ use bytes::Bytes;
 use fail_parallel::{fail_point, FailPointRegistry};
 use object_store::path::Path;
 use object_store::{parse_url_opts, ObjectStore};
-use tracing::trace;
 
 use crate::compactor::COMPACTOR_TASK_NAME;
 use crate::db_transaction::DbTransaction;
@@ -39,7 +38,7 @@ use crate::dispatcher::MessageHandlerExecutor;
 use crate::garbage_collector::GC_TASK_NAME;
 use crate::transaction_manager::IsolationLevel;
 use crate::CloseReason;
-use log::{info, warn};
+use log::{info, trace, warn};
 use parking_lot::RwLock;
 use std::time::Duration;
 
@@ -454,7 +453,9 @@ impl DbInner {
                 // exist, the flusher is already working on draining them and
                 // adding another would not help relieve pressure faster.
                 if imm_memtable_size_bytes == 0 {
-                    self.freeze_current_memtable();
+                    let replay_after_wal_id = self.wal_buffer.recent_flushed_wal_id();
+                    let mut guard = self.state.write();
+                    self.freeze_current_memtable_with_state_guard(&mut guard, replay_after_wal_id);
                 }
 
                 let timeout_fut = self.system_clock.sleep(Duration::from_secs(30));
