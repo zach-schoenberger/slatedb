@@ -142,6 +142,7 @@ mod mem_table;
 mod memtable_flusher;
 mod merge_iterator;
 mod merge_operator;
+mod object_store_tag;
 mod object_stores;
 mod ops;
 mod oracle;
@@ -161,7 +162,6 @@ mod sst_builder;
 mod sst_iter;
 mod sst_reader;
 mod sst_stats;
-mod store_provider;
 mod subcompaction;
 mod tablestore;
 #[cfg(test)]
