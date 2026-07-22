@@ -540,6 +540,7 @@ mod tests {
     use crate::tablestore::{TableStore, TableStoreKind};
     use crate::types::RowEntry;
     use crate::utils::{SafeSender, WatchableOnceCell};
+    use crate::wal_buffer::WalBufferManager;
     use bytes::Bytes;
     use fail_parallel::FailPointRegistry;
     use object_store::memory::InMemory;
@@ -606,6 +607,17 @@ mod tests {
             SafeSender::<BatchWriterMessage>::unbounded_channel(status_manager.result_reader());
         let write_buffer_manager =
             ByteBufferManager::new(settings.max_unflushed_bytes, settings.max_unflushed_bytes);
+        let recorder = Arc::new(DefaultMetricsRecorder::new());
+        let helper = MetricsRecorderHelper::new(recorder, MetricLevel::Info);
+        let wal_buffer = Arc::new(WalBufferManager::new(
+            status_manager.clone(),
+            &helper,
+            0,
+            table_store.clone(),
+            1024,
+            None,
+            write_buffer_manager.clone(),
+        ));
         let inner = Arc::new(
             DbInner::new(
                 settings,
@@ -615,6 +627,7 @@ mod tests {
                 stored_manifest.prepare_dirty().unwrap(),
                 Arc::new(MemtableFlusher::new(&status_manager)),
                 write_tx,
+                wal_buffer.observer(),
                 db_metrics,
                 fp_registry,
                 None,

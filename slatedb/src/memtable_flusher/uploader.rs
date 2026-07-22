@@ -291,13 +291,14 @@ mod tests {
     use crate::test_utils::FixedThreeBytePrefixExtractor;
     use crate::types::{RowEntry, ValueDeletable};
     use crate::utils::WatchableOnceCell;
+    use crate::wal_buffer::WalBufferManager;
     use bytes::Bytes;
     use fail_parallel::FailPointRegistry;
     use object_store::memory::InMemory;
     use object_store::path::Path;
     use object_store::ObjectStore;
     use slatedb_common::clock::{DefaultSystemClock, SystemClock};
-    use slatedb_common::metrics::MetricsRecorderHelper;
+    use slatedb_common::metrics::{DefaultMetricsRecorder, MetricLevel, MetricsRecorderHelper};
     use slatedb_common::DbRand;
     use std::sync::Arc;
     use std::time::Duration;
@@ -342,6 +343,17 @@ mod tests {
             crate::utils::SafeSender::unbounded_channel(status_manager.result_reader());
         let write_buffer_manager =
             ByteBufferManager::new(settings.max_unflushed_bytes, settings.max_unflushed_bytes);
+        let recorder = Arc::new(DefaultMetricsRecorder::new());
+        let helper = MetricsRecorderHelper::new(recorder, MetricLevel::Info);
+        let wal_buffer = Arc::new(WalBufferManager::new(
+            status_manager.clone(),
+            &helper,
+            0,
+            table_store.clone(),
+            1024,
+            None,
+            write_buffer_manager.clone(),
+        ));
         Arc::new(
             DbInner::new(
                 settings,
@@ -353,6 +365,7 @@ mod tests {
                     &status_manager,
                 )),
                 write_tx,
+                wal_buffer.observer(),
                 db_metrics,
                 fp_registry,
                 None,

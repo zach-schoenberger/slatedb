@@ -303,7 +303,7 @@ mod tests {
                 scheduler_options: Default::default(),
                 ..Default::default()
             }),
-            max_unflushed_bytes: 16 * 1024,
+            max_unflushed_bytes: 8 * 4096,
             min_filter_keys: 0,
             l0_sst_size_bytes: 4 * 4096,
             ..Default::default()
@@ -742,7 +742,7 @@ mod tests {
                 scheduler_options: Default::default(),
                 ..Default::default()
             }),
-            max_unflushed_bytes: 16 * 1024,
+            max_unflushed_bytes: 8 * 4096,
             min_filter_keys: 0,
             l0_sst_size_bytes: 4 * 4096,
             ..Default::default()
