@@ -36,16 +36,19 @@ use tracing::instrument;
 
 use std::collections::BTreeSet;
 
-use bytes::Bytes;
-
 use crate::config::WriteOptions;
+use crate::db_state::DbState;
 use crate::db_transaction::DbTransaction;
 use crate::dispatcher::MessageHandler;
 use crate::mem_table::KVTable;
 use crate::types::RowEntry;
 use crate::utils::WatchableOnceCellReader;
+use crate::wal_buffer::WalBufferManager;
 use crate::{batch::WriteBatch, db::DbInner, db::WriteHandle, error::SlateDBError};
+use bytes::Bytes;
+use parking_lot::RwLockWriteGuard;
 use slatedb_common::clock::SystemClock;
+use tokio::sync::oneshot;
 
 pub(crate) const WRITE_BATCH_TASK_NAME: &str = "writer";
 
@@ -57,77 +60,130 @@ pub(crate) type WriteBatchResult = Result<
     SlateDBError,
 >;
 
-pub(crate) struct WriteBatchMessage {
+/// A message processed by the batch writer event loop.
+#[allow(clippy::large_enum_variant)]
+pub(crate) enum BatchWriterMessage {
+    /// Apply a write batch to the WAL and memtable. This may trigger freezing the memtable.
+    WriteBatch(WriteBatchRequest),
+    /// Flush the wal if enabled, and optionally freeze the current active memtable.
+    Flush(BatchWriterFlush),
+}
+
+pub(crate) struct BatchWriterFlush {
+    /// If true, then also freeze the current active memtable.
+    freeze_memtable: bool,
+    /// Sends a message when the writer has processed the flush message. On successful receipt
+    /// of a message, the caller should wait on the received Receiver to get the result of the
+    /// wal flush.
+    done: oneshot::Sender<Result<oneshot::Receiver<Result<(), SlateDBError>>, SlateDBError>>,
+}
+
+pub(crate) struct WriteBatchRequest {
     pub(crate) batch: WriteBatch,
     pub(crate) options: WriteOptions,
-    pub(crate) done: tokio::sync::oneshot::Sender<WriteBatchResult>,
+    pub(crate) done: oneshot::Sender<WriteBatchResult>,
     /// Holds the committing transaction once it is enqueued, ownership
     /// transfers from the caller to the writer. `None` for
     /// non-transactional writes. Fix for #1732.
     pub(crate) txn: Option<DbTransaction>,
 }
 
-impl std::fmt::Debug for WriteBatchMessage {
+impl std::fmt::Debug for BatchWriterMessage {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let WriteBatchMessage { batch, options, .. } = self;
-        f.debug_struct("WriteBatch")
-            .field("batch", batch)
-            .field("options", options)
-            .finish()
+        match self {
+            BatchWriterMessage::WriteBatch(WriteBatchRequest { batch, options, .. }) => f
+                .debug_struct("WriteBatch")
+                .field("batch", batch)
+                .field("options", options)
+                .finish(),
+            BatchWriterMessage::Flush(BatchWriterFlush {
+                freeze_memtable, ..
+            }) => f
+                .debug_struct("Flush")
+                .field("freeze_memtable", freeze_memtable)
+                .finish(),
+        }
     }
 }
 
 pub(crate) struct WriteBatchEventHandler {
     db_inner: Arc<DbInner>,
     is_first_write: bool,
+    wal_buffer: WalBufferManager,
 }
 
 impl WriteBatchEventHandler {
-    pub(crate) fn new(db_inner: Arc<DbInner>) -> Self {
+    pub(crate) fn new(db_inner: Arc<DbInner>, wal_buffer: WalBufferManager) -> Self {
         Self {
             db_inner,
             is_first_write: true,
+            wal_buffer,
         }
     }
 }
 
 #[async_trait]
-impl MessageHandler<WriteBatchMessage> for WriteBatchEventHandler {
-    async fn handle(&mut self, message: WriteBatchMessage) -> Result<(), SlateDBError> {
-        let WriteBatchMessage {
-            batch,
-            options,
-            done,
-            txn,
-        } = message;
-        let result = self
-            .db_inner
-            .write_batch(batch, &options, txn.as_ref())
-            .await;
-        // if this is the first write and the WAL is disabled, make sure users are flushing
-        // their memtables in a timely manner.
-        if self.is_first_write && !self.db_inner.wal_enabled && options.await_durable {
-            if let Ok((_, this_watcher)) = &result {
-                let this_watcher = this_watcher.clone();
-                let this_clock = self.db_inner.system_clock.clone();
-                tokio::spawn(async move {
-                    monitor_first_write(this_watcher, this_clock).await;
-                });
+impl MessageHandler<BatchWriterMessage> for WriteBatchEventHandler {
+    async fn handle(&mut self, message: BatchWriterMessage) -> Result<(), SlateDBError> {
+        match message {
+            BatchWriterMessage::WriteBatch(WriteBatchRequest {
+                batch,
+                options,
+                done,
+                txn,
+            }) => {
+                let result = self
+                    .db_inner
+                    .write_batch(batch, &options, txn.as_ref(), &self.wal_buffer)
+                    .await;
+                // if this is the first write and the WAL is disabled, make sure users are flushing
+                // their memtables in a timely manner.
+                if self.is_first_write && !self.db_inner.wal_enabled && options.await_durable {
+                    if let Ok((_, this_watcher)) = &result {
+                        let this_watcher = this_watcher.clone();
+                        let this_clock = self.db_inner.system_clock.clone();
+                        tokio::spawn(async move {
+                            monitor_first_write(this_watcher, this_clock).await;
+                        });
+                    }
+                }
+                self.is_first_write = false;
+                _ = done.send(result);
+                Ok(())
+            }
+            BatchWriterMessage::Flush(flush_msg) => {
+                let BatchWriterFlush {
+                    freeze_memtable,
+                    done,
+                } = flush_msg;
+                let result = self
+                    .db_inner
+                    .flush_batch_writer(freeze_memtable, &self.wal_buffer);
+                let _ = done.send(result);
+                Ok(())
             }
         }
-        self.is_first_write = false;
-        _ = done.send(result);
-        Ok(())
     }
 
     async fn cleanup(
         &mut self,
-        mut messages: BoxStream<'async_trait, WriteBatchMessage>,
+        mut messages: BoxStream<'async_trait, BatchWriterMessage>,
         result: Result<(), SlateDBError>,
     ) -> Result<(), SlateDBError> {
         let error = result.clone().err().unwrap_or(SlateDBError::Closed);
         while let Some(msg) = messages.next().await {
-            let _ = msg.done.send(Err(error.clone()));
+            match msg {
+                BatchWriterMessage::WriteBatch(req) => {
+                    let _ = req.done.send(Err(error.clone()));
+                }
+                BatchWriterMessage::Flush(flush_msg) => {
+                    let BatchWriterFlush {
+                        freeze_memtable: _,
+                        done,
+                    } = flush_msg;
+                    let _ = done.send(Err(error.clone()));
+                }
+            }
         }
         Ok(())
     }
@@ -141,6 +197,7 @@ impl DbInner {
         batch: WriteBatch,
         options: &WriteOptions,
         txn: Option<&DbTransaction>,
+        wal_buffer: &WalBufferManager,
     ) -> WriteBatchResult {
         let _options = options;
         #[cfg(not(dst))]
@@ -198,8 +255,8 @@ impl DbInner {
             // would violate the guarantee that batches are written atomically. We do
             // this by appending the entire entry batch in a single call to the WAL buffer,
             // which holds a write lock during the append.
-            let wal_watcher = self.wal_buffer.append(&entries)?;
-            self.wal_buffer.maybe_trigger_flush()?;
+            let wal_watcher = wal_buffer.append(&entries)?;
+            wal_buffer.maybe_trigger_flush()?;
             // TODO: handle sync here, if sync is enabled, we can call `flush` here. let's put this
             // in another Pull Request.
             self.write_entries_to_memtable(entries, touched_segments);
@@ -211,10 +268,6 @@ impl DbInner {
         // increment memtable_write_bytes by the size of the keys and values inserted into the memtable
         // after merge operators and overwrites are collapsed
         self.db_stats.memtable_write_bytes.increment(entries_size);
-
-        // update the last_applied_seq to wal buffer. if a chunk of WAL entries are applied to the memtable
-        // and flushed to the remote storage, WAL buffer manager will recycle these WAL entries.
-        self.wal_buffer.track_last_applied_seq(commit_seq);
 
         // insert a fail point to make it easier to test the case where the last_committed_seq is not updated.
         // this is useful for testing the case where the reader is not able to see the writes.
@@ -248,11 +301,99 @@ impl DbInner {
         self.record_memtable_sequence(commit_seq);
 
         // maybe freeze the memtable.
-        self.maybe_freeze_current_memtable()?;
+        self.maybe_freeze_current_memtable(wal_buffer)?;
 
         let write_handle = WriteHandle::new(commit_seq, now);
 
         Ok((write_handle, durable_watcher))
+    }
+
+    fn maybe_freeze_current_memtable(
+        &self,
+        wal_buffer: &WalBufferManager,
+    ) -> Result<(), SlateDBError> {
+        let replay_after_wal_id = wal_buffer.last_flushed_wal_id();
+        let mut guard = self.state.write();
+        let meta = guard.memtable().metadata();
+
+        let last_freeze_wal_id = guard
+            .state()
+            .imm_memtable
+            .front()
+            .map(|imm| imm.recent_flushed_wal_id())
+            .unwrap_or(guard.state().core().replay_after_wal_id);
+
+        let l0_sst_size_est = self
+            .table_store
+            .estimate_encoded_size_compacted(meta.entry_num, meta.entries_size_in_bytes);
+
+        let wal_id_gap = replay_after_wal_id
+            .checked_sub(last_freeze_wal_id)
+            .ok_or_else(|| SlateDBError::InvalidDBState)?;
+
+        if wal_id_gap < self.settings.max_wal_flushes_before_l0_flush
+            && l0_sst_size_est < self.settings.l0_sst_size_bytes
+        {
+            return Ok(());
+        }
+        self.freeze_current_memtable_with_state_guard(&mut guard, replay_after_wal_id);
+        Ok(())
+    }
+
+    fn flush_batch_writer(
+        &self,
+        freeze_memtable: bool,
+        wal_buffer: &WalBufferManager,
+    ) -> Result<oneshot::Receiver<Result<(), SlateDBError>>, SlateDBError> {
+        let flush_rx = if self.wal_enabled {
+            wal_buffer.flush()?
+        } else {
+            let (flush_tx, flush_rx) = oneshot::channel();
+            flush_tx
+                .send(Ok(()))
+                .expect("unexpected oneshot send failure");
+            flush_rx
+        };
+        if freeze_memtable {
+            // Note that this likely won't reflect the result of the above flush call as we don't
+            // block until the flush completes. That's fine, as any earlier wal is still a safe
+            // replay point.
+            let replay_after_wal_id = wal_buffer.last_flushed_wal_id();
+            let mut guard = self.state.write();
+            self.freeze_current_memtable_with_state_guard(&mut guard, replay_after_wal_id);
+        }
+        Ok(flush_rx)
+    }
+
+    // TODO: this is only pub(crate) because currently the replay logic resides in db_common. We
+    //       should consolidate replay and the write path into one module and make this private
+    pub(crate) fn freeze_current_memtable_with_state_guard(
+        &self,
+        guard: &mut RwLockWriteGuard<'_, DbState>,
+        replay_after_wal_id: u64,
+    ) {
+        if guard.memtable().is_empty() {
+            return;
+        }
+
+        guard.freeze_memtable(replay_after_wal_id);
+        let _ = self.memtable_flusher().notify_memtable_frozen();
+    }
+
+    /// Request a memtable freeze from the writer task. Sends a
+    /// [`BatchWriterMessage::Flush`] to the writer event loop and waits for it to complete.
+    #[instrument(level = "trace", skip_all, err(level = tracing::Level::DEBUG))]
+    pub(crate) async fn request_batch_writer_flush(
+        &self,
+        freeze_memtable: bool,
+    ) -> Result<(), SlateDBError> {
+        let (done, rx) = tokio::sync::oneshot::channel();
+        self.write_notifier
+            .send(BatchWriterMessage::Flush(BatchWriterFlush {
+                freeze_memtable,
+                done,
+            }))?;
+        rx.await??.await?
     }
 
     /// RFC-0024 route-consistency check. Verifies that `batch_prefixes`,
@@ -269,7 +410,7 @@ impl DbInner {
     ///
     /// Read-only and runs before any durable side-effect, so a
     /// rejection leaves no trace.
-    pub(crate) fn validate_segment_antichain(
+    fn validate_segment_antichain(
         &self,
         batch_prefixes: &BTreeSet<Bytes>,
     ) -> Result<(), SlateDBError> {
@@ -389,17 +530,17 @@ mod tests {
         batch: WriteBatch,
         options: WriteOptions,
     ) -> (
-        WriteBatchMessage,
+        BatchWriterMessage,
         tokio::sync::oneshot::Receiver<WriteBatchResult>,
     ) {
         let (done, rx) = tokio::sync::oneshot::channel();
         (
-            WriteBatchMessage {
+            BatchWriterMessage::WriteBatch(WriteBatchRequest {
                 batch,
                 options,
                 done,
                 txn: None,
-            },
+            }),
             rx,
         )
     }
@@ -413,8 +554,16 @@ mod tests {
         )
         .await
         .unwrap();
+        let wal_buffer = WalBufferManager::new(
+            db.inner.status_manager.clone(),
+            &db.inner.recorder,
+            0,
+            db.inner.table_store.clone(),
+            1024,
+            None,
+        );
 
-        let mut handler = WriteBatchEventHandler::new(db.inner.clone());
+        let mut handler = WriteBatchEventHandler::new(db.inner.clone(), wal_buffer);
         assert!(handler.is_first_write);
 
         let mut batch = WriteBatch::new();
@@ -434,8 +583,16 @@ mod tests {
         let db = Db::open("/tmp/test_user_defined_seqnum", object_store)
             .await
             .unwrap();
+        let wal_buffer = WalBufferManager::new(
+            db.inner.status_manager.clone(),
+            &db.inner.recorder,
+            0,
+            db.inner.table_store.clone(),
+            1024,
+            None,
+        );
 
-        let mut handler = WriteBatchEventHandler::new(db.inner.clone());
+        let mut handler = WriteBatchEventHandler::new(db.inner.clone(), wal_buffer);
 
         // Write with a user-defined seqnum
         let mut batch = WriteBatch::new();
@@ -469,8 +626,16 @@ mod tests {
         )
         .await
         .unwrap();
+        let wal_buffer = WalBufferManager::new(
+            db.inner.status_manager.clone(),
+            &db.inner.recorder,
+            0,
+            db.inner.table_store.clone(),
+            1024,
+            None,
+        );
 
-        let mut handler = WriteBatchEventHandler::new(db.inner.clone());
+        let mut handler = WriteBatchEventHandler::new(db.inner.clone(), wal_buffer);
 
         // First, do a normal write to advance the oracle
         let mut batch = WriteBatch::new();

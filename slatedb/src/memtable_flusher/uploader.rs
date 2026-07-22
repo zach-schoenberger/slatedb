@@ -197,12 +197,9 @@ impl UploadHandler {
         // uploads that already landed before the abort are left for the
         // garbage collector to reclaim, since the worker allocates ids
         // internally and they are not visible here for explicit cleanup.
-        let segments = futures::future::try_join_all(
-            built
-                .iter()
-                .map(|sst| self.upload_segment_sst(&job.imm_memtable, sst)),
-        )
-        .await?;
+        let segments =
+            futures::future::try_join_all(built.iter().map(|sst| self.upload_segment_sst(sst)))
+                .await?;
 
         Ok(UploadedMemtable {
             imm_memtable: Arc::clone(&job.imm_memtable),
@@ -217,18 +214,13 @@ impl UploadHandler {
     /// memtable.
     async fn upload_segment_sst(
         &self,
-        imm_memtable: &Arc<ImmutableMemtable>,
         sst: &EncodedSegmentSst,
     ) -> Result<SegmentedSstHandle, SlateDBError> {
         let sst_id =
             SsTableId::Compacted(self.db.rand.rng().gen_ulid(self.db.system_clock.as_ref()));
         let written_bytes = sst.encoded.remaining_len() as u64;
         loop {
-            match self
-                .db
-                .upload_sst(&sst_id, imm_memtable.table(), &sst.encoded, true)
-                .await
-            {
+            match self.db.upload_sst(&sst_id, &sst.encoded, true).await {
                 Ok(sst_handle) => {
                     self.db.db_stats.l0_flush_bytes.increment(written_bytes);
                     return Ok(SegmentedSstHandle {
@@ -298,13 +290,14 @@ mod tests {
     use crate::test_utils::FixedThreeBytePrefixExtractor;
     use crate::types::{RowEntry, ValueDeletable};
     use crate::utils::WatchableOnceCell;
+    use crate::wal_buffer::WalBufferManager;
     use bytes::Bytes;
     use fail_parallel::FailPointRegistry;
     use object_store::memory::InMemory;
     use object_store::path::Path;
     use object_store::ObjectStore;
     use slatedb_common::clock::{DefaultSystemClock, SystemClock};
-    use slatedb_common::metrics::MetricsRecorderHelper;
+    use slatedb_common::metrics::{DefaultMetricsRecorder, MetricLevel, MetricsRecorderHelper};
     use slatedb_common::DbRand;
     use std::sync::Arc;
     use std::time::Duration;
@@ -347,6 +340,16 @@ mod tests {
         let status_manager = DbStatusManager::new(0);
         let (write_tx, _) =
             crate::utils::SafeSender::unbounded_channel(status_manager.result_reader());
+        let recorder = Arc::new(DefaultMetricsRecorder::new());
+        let helper = MetricsRecorderHelper::new(recorder, MetricLevel::Info);
+        let wal_buffer = Arc::new(WalBufferManager::new(
+            status_manager.clone(),
+            &helper,
+            0,
+            table_store.clone(),
+            1024,
+            None,
+        ));
         Arc::new(
             DbInner::new(
                 settings,
@@ -358,6 +361,7 @@ mod tests {
                     &status_manager,
                 )),
                 write_tx,
+                wal_buffer.observer(),
                 db_metrics,
                 fp_registry,
                 None,
