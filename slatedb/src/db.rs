@@ -318,24 +318,8 @@ impl DbInner {
     }
 
     #[inline]
-    pub(crate) async fn maybe_apply_backpressure(&self) -> Result<(), SlateDBError> {
-        // On the write path the active memtable's durable WAL boundary is the WAL
-        // buffer's most-recently-flushed id, so the BBM capacity branch derives its
-        // freeze boundary from the WAL status. During WAL replay the active memtable
-        // lags behind the WAL buffer (which is pre-seeded to the end of the replay
-        // range and does not advance while replaying), so replay callers must supply
-        // the active memtable's true boundary via
-        // `maybe_apply_backpressure_with_freeze_boundary`.
-        self.maybe_apply_backpressure_with_freeze_boundary(None)
-            .await
-    }
-
-    #[inline]
     #[allow(clippy::disallowed_macros)]
-    async fn maybe_apply_backpressure_with_freeze_boundary(
-        &self,
-        active_memtable_freeze_boundary: Option<u64>,
-    ) -> Result<(), SlateDBError> {
+    pub(crate) async fn maybe_apply_backpressure(&self) -> Result<(), SlateDBError> {
         loop {
             self.check_closed()?;
 
@@ -414,25 +398,13 @@ impl DbInner {
                     .wal_observer
                     .wait_until_wal_flushed(wal_status.last_flushed_wal_id);
 
-                let timeout_fut = self.system_clock.sleep(Duration::from_secs(30));
-                let await_closed = async {
-                    let mut watcher = self.status_manager.result_reader();
-                    match watcher.await_value().await {
-                        Ok(()) => Err(SlateDBError::Closed),
-                        Err(e) => Err(e),
+                self.await_backpressure_relief(async {
+                    tokio::select! {
+                        result = await_memtable_uploaded => result,
+                        result = await_flush_wal => result,
                     }
-                };
-
-                tokio::select! {
-                    biased;
-
-                    result = await_closed => result?,
-                    result = await_memtable_uploaded => result?,
-                    result = await_flush_wal => result?,
-                    _ = timeout_fut => {
-                        warn!("backpressure timeout: waited 30s, no memtable/WAL flushed yet");
-                    }
-                };
+                })
+                .await?;
 
                 continue;
             }
@@ -449,46 +421,57 @@ impl DbInner {
                     format_bytes_si(write_buffer_remaining as u64)
                 );
 
-                let await_capacity = self.write_buffer_manager.await_capacity();
-                // Only freeze the current memtable if there are no frozen
-                // memtables already queued for flushing. If frozen memtables
-                // exist, the flusher is already working on draining them and
-                // adding another would not help relieve pressure faster.
-                if imm_memtable_size_bytes == 0 {
-                    // During replay the active memtable's durable boundary is the
-                    // WAL id of the previously replayed table, not the WAL buffer's
-                    // (statically max) flushed id. Using the latter would stamp a
-                    // frozen table as durable past what it actually contains and
-                    // could cause WAL SSTs to be skipped on a crash mid-replay.
-                    let replay_after_wal_id =
-                        active_memtable_freeze_boundary.unwrap_or(wal_status.last_flushed_wal_id);
-                    let mut guard = self.state.write();
-                    self.freeze_current_memtable_with_state_guard(&mut guard, replay_after_wal_id);
-                }
-
-                let timeout_fut = self.system_clock.sleep(Duration::from_secs(30));
-                let await_closed = async {
-                    let mut watcher = self.status_manager.result_reader();
-                    match watcher.await_value().await {
-                        Ok(()) => Err(SlateDBError::Closed),
-                        Err(e) => Err(e),
-                    }
-                };
-
-                tokio::select! {
-                    _ = await_capacity => {
-                        return Ok(());
-                    }
-                    result = await_closed => result?,
-                    _ = timeout_fut => {
-                        warn!("backpressure timeout: waited 30s, no memtable/WAL flushed yet");
-                    }
-                };
+                // Mirror the size-based backpressure path above: wait for the
+                // write buffer to drain below its high watermark (or for the DB
+                // to close), then re-evaluate. Freezing the active memtable to
+                // relieve pressure is the batch writer's responsibility (see
+                // `maybe_freeze_current_memtable`); backpressure only waits.
+                self.await_backpressure_relief(async {
+                    self.write_buffer_manager.await_capacity().await;
+                    Ok(())
+                })
+                .await?;
 
                 continue;
             }
 
             return Ok(());
+        }
+    }
+
+    /// Waits for a backpressure-relief signal and returns once memory pressure
+    /// may have eased so the caller can re-evaluate its condition.
+    ///
+    /// Resolves when any of the following happens:
+    /// - `progress` completes — a memtable upload, WAL flush, or freed
+    ///   write-buffer capacity. Its `Result` is returned as-is so flush errors
+    ///   propagate to the caller.
+    /// - the DB is closed or fenced — returns the terminal error.
+    /// - a 30s watchdog fires — returns `Ok(())` to force a re-check rather than
+    ///   block indefinitely.
+    #[allow(clippy::disallowed_macros)]
+    async fn await_backpressure_relief(
+        &self,
+        progress: impl std::future::Future<Output = Result<(), SlateDBError>>,
+    ) -> Result<(), SlateDBError> {
+        let timeout_fut = self.system_clock.sleep(Duration::from_secs(30));
+        let await_closed = async {
+            let mut watcher = self.status_manager.result_reader();
+            match watcher.await_value().await {
+                Ok(()) => Err(SlateDBError::Closed),
+                Err(e) => Err(e),
+            }
+        };
+
+        tokio::select! {
+            biased;
+
+            result = await_closed => result,
+            result = progress => result,
+            _ = timeout_fut => {
+                warn!("backpressure timeout: waited 30s, no relief signal yet");
+                Ok(())
+            }
         }
     }
 
@@ -636,11 +619,7 @@ impl DbInner {
             // ensure the assertion holds true.
             assert!(self.oracle.last_remote_persisted_seq() <= replayed_table.last_seq);
             self.oracle.advance_durable_seq(replayed_table.last_seq);
-            // Pass the active memtable's true durable boundary so that, under a
-            // bounded write buffer, the BBM capacity branch freezes it with the
-            // correct replay_after_wal_id instead of the WAL buffer's static max.
-            self.maybe_apply_backpressure_with_freeze_boundary(Some(current_memtable_wal_id))
-                .await?;
+            self.maybe_apply_backpressure().await?;
             let replayed_table_last_wal_id = replayed_table.last_wal_id;
             self.replay_memtable(current_memtable_wal_id, replayed_table)?;
             current_memtable_wal_id = replayed_table_last_wal_id;

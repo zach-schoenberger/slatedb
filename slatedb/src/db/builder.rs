@@ -623,6 +623,21 @@ impl<P: Into<Path>> DbBuilder<P> {
                 )
             ));
         }
+        // The write buffer's high watermark must be at least `l0_sst_size_bytes`.
+        // Backpressure only waits for capacity to free up; freezing the active
+        // memtable is driven by the batch writer once it reaches
+        // `l0_sst_size_bytes`. If the watermark were below that threshold, the
+        // buffer could sit at capacity with only an (unfrozen) active memtable
+        // and no way to make progress until the next write arrives.
+        if write_buffer_manager.high_watermark < self.settings.l0_sst_size_bytes {
+            return Err(crate::Error::invalid(
+                format!(
+                    "invalid configuration: write_buffer_manager high watermark ({}) must be at least l0_sst_size_bytes ({})",
+                    write_buffer_manager.high_watermark,
+                    self.settings.l0_sst_size_bytes,
+                )
+            ));
+        }
         let mut wal_buffer = WalBufferManager::new(
             status_manager.clone(),
             &recorder,
@@ -2435,6 +2450,36 @@ mod tests {
         assert!(
             result.is_err(),
             "build should reject capacity below MIN_WRITE_BUFFER_SIZE"
+        );
+    }
+
+    /// Validates that a write-buffer high watermark below `l0_sst_size_bytes` is
+    /// rejected. Backpressure only waits for capacity to free up; the batch
+    /// writer won't freeze the active memtable until it reaches
+    /// `l0_sst_size_bytes`, so a lower watermark could sit at capacity with an
+    /// unfrozen active memtable and stall until the next write.
+    #[tokio::test]
+    async fn test_write_buffer_high_watermark_below_l0_sst_size_is_rejected() {
+        use crate::byte_buffer_manager::ByteBufferManager;
+
+        let result = crate::Db::builder(
+            "test_write_buffer_high_watermark_below_l0_sst_size_is_rejected",
+            Arc::new(InMemory::new()),
+        )
+        .with_settings(Settings {
+            l0_sst_size_bytes: 2 * 1024 * 1024,
+            max_unflushed_bytes: 8 * 1024 * 1024,
+            ..Settings::default()
+        })
+        // Capacity satisfies MIN_WRITE_BUFFER_SIZE, but the high watermark
+        // (1 MiB) is below l0_sst_size_bytes (2 MiB).
+        .with_write_buffer_manager(ByteBufferManager::new(8 * 1024 * 1024, 1024 * 1024))
+        .build()
+        .await;
+
+        assert!(
+            result.is_err(),
+            "build should reject high watermark below l0_sst_size_bytes"
         );
     }
 

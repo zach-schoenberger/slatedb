@@ -14,7 +14,7 @@ use tokio::sync::Notify;
 #[derive(Clone)]
 pub struct ByteBufferManager {
     inner: Arc<ByteBudgetSemaphore>,
-    high_watermark: usize,
+    pub(crate) high_watermark: usize,
 }
 
 impl ByteBufferManager {
