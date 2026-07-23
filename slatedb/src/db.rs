@@ -38,7 +38,7 @@ use crate::dispatcher::MessageHandlerExecutor;
 use crate::garbage_collector::GC_TASK_NAME;
 use crate::transaction_manager::IsolationLevel;
 use crate::CloseReason;
-use log::{debug, info, trace, warn};
+use log::{debug, info, warn};
 use parking_lot::RwLock;
 use std::time::Duration;
 
@@ -59,7 +59,6 @@ use crate::db_stats::DbStats;
 use crate::error::SlateDBError;
 use crate::iter::IterationOrder;
 use crate::manifest::{Manifest, VersionedManifest};
-use crate::mem_table::KVTableMetadata;
 use crate::memtable_flusher::{FlushResult, FlushTarget, MemtableFlusher};
 use crate::merge_operator::{instrument_merge_operator, MergeOperatorType};
 use crate::oracle::{DbOracle, Oracle};
@@ -111,6 +110,8 @@ pub(crate) struct DbInner {
     pub(crate) write_buffer_manager: ByteBufferManager,
     /// [`wal_observer`] inspects the status of WAL buffer. The WAL buffer itself is owned by
     /// the batch write task.
+    /// while not needed for standard operation it is conveinent to have for tests and for future usage.
+    #[allow(dead_code)]
     pub(crate) wal_observer: DbWalObserver,
     pub(crate) wal_enabled: bool,
     /// [`txn_manager`] tracks all the live transactions and related metadata.
@@ -326,97 +327,18 @@ impl DbInner {
             let write_buffer_remaining = self.write_buffer_manager.available();
             let write_buffer_allocated = self.write_buffer_manager.allocated();
 
-            let wal_status = self.wal_observer.status();
-            let (active_memtable_size_bytes, imm_memtable_size_bytes) = {
-                let guard = self.state.read();
-                let estimate = |metadata: KVTableMetadata| {
-                    self.table_store.estimate_encoded_size_compacted(
-                        metadata.entry_num,
-                        metadata.entries_size_in_bytes,
-                    )
-                };
-                let active_memtable_size_bytes = estimate(guard.memtable().table().metadata());
-                let imm_memtable_size_bytes = guard
-                    .state()
-                    .imm_memtable
-                    .iter()
-                    .map(|imm| estimate(imm.table().metadata()))
-                    .sum::<usize>();
-                (active_memtable_size_bytes, imm_memtable_size_bytes)
-            };
-            let total_mem_size_bytes = active_memtable_size_bytes + imm_memtable_size_bytes;
+            // The write buffer's allocated bytes are the accurate accounting of
+            // in-memory unflushed data (memtable overhead + key/value bytes).
             self.db_stats
                 .total_mem_size_bytes
-                .set(total_mem_size_bytes as i64);
-
-            trace!(
-                "checking backpressure [total_mem_size_bytes={}, active_memtable_size_bytes={}, imm_memtable_size_bytes={}, wal_size_bytes={}, max_unflushed_bytes={}, write_buffer_allocated={}, write_buffer_remaining={}]",
-                format_bytes_si(total_mem_size_bytes as u64),
-                format_bytes_si(active_memtable_size_bytes as u64),
-                format_bytes_si(imm_memtable_size_bytes as u64),
-                format_bytes_si(wal_status.estimated_bytes as u64),
-                format_bytes_si(self.settings.max_unflushed_bytes as u64),
-                format_bytes_si(write_buffer_allocated as u64),
-                format_bytes_si(write_buffer_remaining as u64)
-            );
-
-            if total_mem_size_bytes >= self.settings.max_unflushed_bytes {
-                self.db_stats.backpressure_count.increment(1);
-                fail_point!(Arc::clone(&self.fp_registry), "db-backpressure-applied");
-                warn!(
-                    "unflushed memtable size exceeds max_unflushed_bytes. applying backpressure. [total_mem_size_bytes={}, active_memtable_size_bytes={}, imm_memtable_size_bytes={}, wal_size_bytes={}, max_unflushed_bytes={}, write_buffer_allocated={}, write_buffer_remaining={}]",
-                    format_bytes_si(total_mem_size_bytes as u64),
-                    format_bytes_si(active_memtable_size_bytes as u64),
-                    format_bytes_si(imm_memtable_size_bytes as u64),
-                    format_bytes_si(wal_status.estimated_bytes as u64),
-                    format_bytes_si(self.settings.max_unflushed_bytes as u64),
-                    format_bytes_si(write_buffer_allocated as u64),
-                    format_bytes_si(write_buffer_remaining as u64)
-                );
-
-                let maybe_oldest_unflushed_memtable = {
-                    let guard = self.state.read();
-                    guard.state().imm_memtable.back().cloned()
-                };
-
-                // There is a window of time after mem_size_bytes is larger than max_unflushed_bytes
-                // but before we get the memtable. During that time, if the memtable is fully
-                // flushed out, we should short circuit to avoid blocking indefinitely.
-                if maybe_oldest_unflushed_memtable.is_none() && wal_status.estimated_bytes == 0 {
-                    continue;
-                }
-
-                let await_memtable_uploaded = async {
-                    if let Some(oldest_unflushed_memtable) = maybe_oldest_unflushed_memtable {
-                        oldest_unflushed_memtable.await_uploaded().await
-                    } else {
-                        std::future::pending().await
-                    }
-                };
-
-                let await_flush_wal = self
-                    .wal_observer
-                    .wait_until_wal_flushed(wal_status.last_flushed_wal_id);
-
-                self.await_backpressure_relief(async {
-                    tokio::select! {
-                        result = await_memtable_uploaded => result,
-                        result = await_flush_wal => result,
-                    }
-                })
-                .await?;
-
-                continue;
-            }
+                .set(write_buffer_allocated as i64);
 
             if self.write_buffer_manager.at_capacity() {
                 self.db_stats.backpressure_count.increment(1);
                 fail_point!(Arc::clone(&self.fp_registry), "db-backpressure-applied");
                 warn!(
-                    "write buffer capacity reached. applying backpressure. [total_mem_size_bytes={}, wal_size_bytes={}, imm_memtable_size_bytes={}, max_unflushed_bytes={}, write_buffer_remaining={}]",
-                    format_bytes_si(total_mem_size_bytes as u64),
-                    format_bytes_si(wal_status.estimated_bytes as u64),
-                    format_bytes_si(imm_memtable_size_bytes as u64),
+                    "write buffer capacity reached. applying backpressure. [max_unflushed_bytes={}, write_buffer_allocated={}, write_buffer_remaining={}]",
+                    format_bytes_si(write_buffer_allocated as u64),
                     format_bytes_si(self.settings.max_unflushed_bytes as u64),
                     format_bytes_si(write_buffer_remaining as u64)
                 );
@@ -2128,6 +2050,8 @@ impl WriteHandle {
 /// Wraps [`WalObserver`] and injects a [`crate::wal_buffer::WalStatusListener`]
 /// that updates the oracle and manifest, and drives cross-task notifications about wal events
 /// via a [`tokio::sync::watch`] channel.
+/// while not needed for standard operation it is conveinent to have for tests and for future usage.
+#[allow(dead_code)]
 #[derive(Clone)]
 pub(crate) struct DbWalObserver {
     status_rx: tokio::sync::watch::Receiver<WalStatus>,
@@ -2135,6 +2059,8 @@ pub(crate) struct DbWalObserver {
     wrapped: WalObserver,
 }
 
+/// while not needed for standard operation it is conveinent to have for tests and for future usage.
+#[allow(dead_code)]
 impl DbWalObserver {
     fn new(
         wrapped: WalObserver,
@@ -5054,21 +4980,24 @@ mod tests {
         let fp_registry = Arc::new(FailPointRegistry::new());
         let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let path = Path::from("/tmp/test_kv_store");
-        let mut options = test_db_options(0, 1, None);
-        // Must stay above l0_sst_size_bytes (1) but small enough that a single
-        // write exceeds it and triggers backpressure.
-        options.max_unflushed_bytes = 2;
+        // l0_sst_size_bytes > one value so the first write doesn't freeze (a
+        // freeze would create a second memtable, adding ~128 KiB overhead).
+        let mut options = test_db_options(0, 512 * 1024, None);
+        options.max_unflushed_bytes = 1024 * 1024;
         let metrics_recorder = Arc::new(DefaultMetricsRecorder::new());
+        // Per memtable, allocated = ~128 KiB overhead + key/value bytes. One
+        // 256 KiB write (~384 KiB) stays under the 512 KiB watermark; a second
+        // (~640 KiB) trips it. Capacity must be >= MIN_WRITE_BUFFER_SIZE (1 MiB).
+        let value_size = 256 * 1024;
         let db = Db::builder(path, object_store.clone())
             .with_settings(options)
             .with_fp_registry(fp_registry.clone())
             .with_metrics_recorder(metrics_recorder.clone())
-            // The write buffer capacity must be at least MIN_WRITE_BUFFER_SIZE;
-            // max_unflushed_bytes drives the size-based backpressure path under test.
-            .with_write_buffer_manager(ByteBufferManager::new(1024 * 1024, 1024 * 1024))
+            .with_write_buffer_manager(ByteBufferManager::new(1024 * 1024, 512 * 1024))
             .build()
             .await
             .unwrap();
+        let value = vec![b'x'; value_size];
         let metrics_recorder_clone = metrics_recorder.clone();
         let write_opts = WriteOptions {
             await_durable: false,
@@ -5088,7 +5017,7 @@ mod tests {
         };
 
         // 1 wal entry in memory
-        db.put_with_options(b"key1", b"val1", &PutOptions::default(), &write_opts)
+        db.put_with_options(b"key1", &value, &PutOptions::default(), &write_opts)
             .await
             .unwrap();
 
@@ -5106,7 +5035,7 @@ mod tests {
         // task since the put() is blocked until the WAL is flushed, which isn't happening
         // due to the fail point.
         let join_handle = tokio::spawn(async move {
-            db.put_with_options(b"key2", b"val2", &PutOptions::default(), &write_opts)
+            db.put_with_options(b"key2", &value, &PutOptions::default(), &write_opts)
                 .await
                 .unwrap();
         });
@@ -5131,96 +5060,6 @@ mod tests {
         // Shutdown the background task
         join_handle.abort();
         let _ = join_handle.await;
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_backpressure_waiter_exits_when_db_is_fenced() {
-        // Pause the L0 upload so a frozen memtable can't drain, keeping unflushed
-        // bytes above the backpressure threshold indefinitely.
-        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let fp_registry = Arc::new(FailPointRegistry::new());
-        fail_parallel::cfg(fp_registry.clone(), "write-compacted-sst-io-error", "pause").unwrap();
-
-        let mut options = test_db_options(0, 4 * 1024, None);
-        options.flush_interval = None;
-        options.max_unflushed_bytes = 8 * 1024;
-
-        // Use a metrics recorder so the test can observe when the spawned task
-        // has actually entered maybe_apply_backpressure().
-        let metrics_recorder = Arc::new(DefaultMetricsRecorder::new());
-        let db = Db::builder(
-            "/tmp/test_backpressure_waiter_exits_when_db_is_fenced",
-            object_store,
-        )
-        .with_settings(options)
-        .with_fp_registry(fp_registry.clone())
-        .with_metrics_recorder(metrics_recorder.clone())
-        // The write buffer capacity must be at least MIN_WRITE_BUFFER_SIZE;
-        // max_unflushed_bytes drives the size-based backpressure path under test.
-        .with_write_buffer_manager(ByteBufferManager::new(1024 * 1024, 1024 * 1024))
-        .build()
-        .await
-        .unwrap();
-        let write_opts = WriteOptions {
-            await_durable: false,
-            ..Default::default()
-        };
-
-        let large_value = vec![b'x'; 16 * 1024];
-        db.put_with_options(b"key1", &large_value, &PutOptions::default(), &write_opts)
-            .await
-            .unwrap();
-
-        // Start backpressure on a cloned inner handle. This parks the task on
-        // the same wait path used by writers before they enqueue a batch.
-        let inner = db.inner.clone();
-        let mut backpressure_task =
-            tokio::spawn(async move { inner.maybe_apply_backpressure().await });
-
-        // Wait until the task has observed the buffered WAL bytes and incremented
-        // the backpressure counter, proving it is inside the wait path.
-        tokio::time::timeout(Duration::from_secs(60), async {
-            loop {
-                if lookup_metric(&metrics_recorder, crate::db_stats::BACKPRESSURE_COUNT)
-                    .is_some_and(|v| v > 0)
-                {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("timed out waiting for backpressure to be applied");
-
-        // Simulate the DB being fenced while the writer is already parked in
-        // backpressure.
-        db.inner
-            .status_manager
-            .write_result(Err(SlateDBError::Fenced));
-
-        // The lifecycle signal should wake the waiter promptly even though no
-        // WAL flush or memtable upload will notify it.
-        let result = tokio::time::timeout(Duration::from_secs(5), &mut backpressure_task).await;
-        if result.is_err() {
-            backpressure_task.abort();
-            let _ = backpressure_task.await;
-        }
-
-        // Resume the L0 upload so the pending memtable can drain and close can
-        // complete cleanly.
-        fail_parallel::cfg(fp_registry.clone(), "write-compacted-sst-io-error", "off").unwrap();
-        let _ = db.close().await;
-
-        // Assert that the waiter exits with the terminal fenced error, not a
-        // successful write path or some unrelated task failure.
-        let backpressure_result = result
-            .expect("backpressure waiter did not exit after DB was fenced")
-            .expect("backpressure task panicked");
-        assert!(
-            matches!(backpressure_result, Err(SlateDBError::Fenced)),
-            "expected fenced error, got {:?}",
-            backpressure_result
-        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -10020,11 +9859,13 @@ mod tests {
                 .await
                 .unwrap();
             if i == 0 {
-                first_l0_flushed_wal_id = source.inner.wal_observer.status().last_flushed_wal_id;
+                first_l0_flushed_wal_id =
+                    source.inner.state.read().state().core().next_wal_sst_id - 1;
             }
             l0_flushed_seq = write.seqnum();
         }
-        let l0_flushed_boundary_wal_id = source.inner.wal_observer.status().last_flushed_wal_id;
+        let l0_flushed_boundary_wal_id =
+            source.inner.state.read().state().core().next_wal_sst_id - 1;
         assert!(l0_flushed_boundary_wal_id > first_l0_flushed_wal_id);
 
         // Write several smaller records, each flushed into a separate WAL. On
@@ -10048,7 +9889,7 @@ mod tests {
                 .await
                 .unwrap();
         }
-        let final_source_wal_id = source.inner.wal_observer.status().last_flushed_wal_id;
+        let final_source_wal_id = source.inner.state.read().state().core().next_wal_sst_id - 1;
         assert!(final_source_wal_id >= l0_flushed_boundary_wal_id + 2);
 
         // Recover with a much smaller replay target so WAL replay splits into
