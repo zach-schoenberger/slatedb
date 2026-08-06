@@ -160,6 +160,13 @@ impl MessageHandler<BatchWriterMessage> for WriteBatchEventHandler {
                 let result = self
                     .db_inner
                     .flush_batch_writer(freeze_memtable, &self.wal_buffer);
+                // Re-arm backpressure dedup once the flush has been issued so
+                // the next park re-requests a freeze. Both a memtable freeze and
+                // a WAL flush can release write-buffer bytes, so any flush is a
+                // valid point to re-arm (a redundant freeze is deduped anyway).
+                self.db_inner
+                    .backpressure_flush_pending
+                    .store(false, std::sync::atomic::Ordering::Release);
                 let _ = done.send(result);
                 Ok(())
             }
@@ -403,6 +410,34 @@ impl DbInner {
                 done,
             }))?;
         rx.await??.await?
+    }
+
+    /// Fire-and-forget freeze request for the backpressure path, deduplicated
+    /// so a wave of blocked writers enqueues at most one in-flight freeze.
+    /// Unlike [`Self::request_batch_writer_flush`], does not await the WAL
+    /// flush: the parked writer wakes when the write buffer drains.
+    pub(crate) fn notify_backpressure_flush(&self) {
+        // Only the writer that flips the flag false->true sends; others skip.
+        if self
+            .backpressure_flush_pending
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            return;
+        }
+        let (done, _rx) = tokio::sync::oneshot::channel();
+        if self
+            .write_notifier
+            .send(BatchWriterMessage::Flush(BatchWriterFlush {
+                freeze_memtable: true,
+                done,
+            }))
+            .is_err()
+        {
+            // Writer is gone (DB closing); clear so dedup never wedges. Parked
+            // writers are released by `await_closed`.
+            self.backpressure_flush_pending
+                .store(false, std::sync::atomic::Ordering::Release);
+        }
     }
 
     /// RFC-0024 route-consistency check. Verifies that `batch_prefixes`,

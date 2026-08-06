@@ -25,6 +25,7 @@ pub use crate::db_status::{DbStatus, SegmentPrefix};
 use crate::byte_buffer_manager::ByteBufferManager;
 use crate::db_cache_manager::{self, CacheTarget};
 use std::ops::Range;
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -108,6 +109,12 @@ pub(crate) struct DbInner {
     pub(crate) flush_merge_operator: Option<MergeOperatorType>,
     pub(crate) reader: Reader,
     pub(crate) write_buffer_manager: ByteBufferManager,
+    /// Dedup guard for backpressure-triggered freezes. A blocked writer flips
+    /// this `false`->`true` and fires a single fire-and-forget freeze; the
+    /// batch writer clears it once the freeze is issued, re-arming the next
+    /// wave. Ensures a burst of blocked writers enqueues at most one in-flight
+    /// freeze rather than flooding the writer with redundant WAL flushes.
+    pub(crate) backpressure_flush_pending: AtomicBool,
     /// [`wal_observer`] inspects the status of WAL buffer. The WAL buffer itself is owned by
     /// the batch write task.
     /// while not needed for standard operation it is conveinent to have for tests and for future usage.
@@ -208,6 +215,7 @@ impl DbInner {
             status_manager,
             segment_extractor,
             write_buffer_manager,
+            backpressure_flush_pending: AtomicBool::new(false),
         };
         Ok(db_inner)
     }
@@ -281,6 +289,7 @@ impl DbInner {
         return true;
     }
 
+    #[allow(clippy::disallowed_macros)]
     pub(crate) async fn write_with_options(
         &self,
         batch: WriteBatch,
@@ -301,11 +310,32 @@ impl DbInner {
             done: tx,
             txn,
         };
-        batch_req.batch.set_write_buffer(&self.write_buffer_manager);
+
+        let estimated_size = batch_req.batch.estimated_size();
+
+        // Reserve the write buffer budget before enqueueing. `acquire` blocks
+        // while the buffer is at capacity and invokes the callback before each
+        // park, so we record backpressure once (first park) but re-request a
+        // freeze on every park to keep the buffer draining until we reserve.
+        // Race against DB closure so a parked writer exits promptly if fenced.
+        let permit = tokio::select! {
+            biased;
+            err = self.await_closed() => return Err(err),
+            permit = self.write_buffer_manager.acquire(estimated_size, |first| {
+                if first {
+                    self.db_stats.backpressure_count.increment(1);
+                    fail_point!(Arc::clone(&self.fp_registry), "db-backpressure-applied");
+                }
+                self.notify_backpressure_flush();
+            }) => permit,
+        };
+        self.db_stats
+            .total_mem_size_bytes
+            .set(self.write_buffer_manager.allocated() as i64);
+        batch_req.batch.write_buffer_permit = Some(Arc::new(permit));
+
         let batch_msg = BatchWriterMessage::WriteBatch(batch_req);
         self.write_notifier.send(batch_msg)?;
-
-        self.maybe_apply_backpressure().await?;
 
         // TODO: this can be modified as awaiting the last_durable_seq watermark & fatal error.
 
@@ -361,6 +391,15 @@ impl DbInner {
         }
     }
 
+    /// Waits until the DB is closed or fenced, returning the terminal error.
+    async fn await_closed(&self) -> SlateDBError {
+        let mut watcher = self.status_manager.result_reader();
+        match watcher.await_value().await {
+            Ok(()) => SlateDBError::Closed,
+            Err(e) => e,
+        }
+    }
+
     /// Waits for a backpressure-relief signal and returns once memory pressure
     /// may have eased so the caller can re-evaluate its condition.
     ///
@@ -377,13 +416,7 @@ impl DbInner {
         progress: impl std::future::Future<Output = Result<(), SlateDBError>>,
     ) -> Result<(), SlateDBError> {
         let timeout_fut = self.system_clock.sleep(Duration::from_secs(30));
-        let await_closed = async {
-            let mut watcher = self.status_manager.result_reader();
-            match watcher.await_value().await {
-                Ok(()) => Err(SlateDBError::Closed),
-                Err(e) => Err(e),
-            }
-        };
+        let await_closed = async { Err(self.await_closed().await) };
 
         tokio::select! {
             biased;
@@ -4972,23 +5005,17 @@ mod tests {
         assert_eq!(retrieved_value1.as_ref(), value1);
     }
 
-    // 2 threads so we can can wait on the write_with_options (main) thread
-    // while the write_batch (background) thread is blocked on writing the
-    // WAL SST.
+    // 2 threads so we can wait on the metric (main task) while the second put
+    // is parked in write-buffer backpressure on a background task.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_apply_wal_memory_backpressure() {
         let fp_registry = Arc::new(FailPointRegistry::new());
         let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let path = Path::from("/tmp/test_kv_store");
-        // l0_sst_size_bytes > one value so the first write doesn't freeze (a
-        // freeze would create a second memtable, adding ~128 KiB overhead).
-        let mut options = test_db_options(0, 512 * 1024, None);
-        options.max_unflushed_bytes = 1024 * 1024;
+        // The high-watermark guard requires high_watermark >= l0_sst_size_bytes +
+        // per-memtable overhead; a tiny l0 keeps 512 KiB well above the floor.
+        let options = test_db_options(0, 4 * 1024, None);
         let metrics_recorder = Arc::new(DefaultMetricsRecorder::new());
-        // Per memtable, allocated = ~128 KiB overhead + key/value bytes. One
-        // 256 KiB write (~384 KiB) stays under the 512 KiB watermark; a second
-        // (~640 KiB) trips it. Capacity must be >= MIN_WRITE_BUFFER_SIZE (1 MiB).
-        let value_size = 256 * 1024;
         let db = Db::builder(path, object_store.clone())
             .with_settings(options)
             .with_fp_registry(fp_registry.clone())
@@ -4997,69 +5024,54 @@ mod tests {
             .build()
             .await
             .unwrap();
-        let value = vec![b'x'; value_size];
-        let metrics_recorder_clone = metrics_recorder.clone();
         let write_opts = WriteOptions {
             await_durable: false,
             ..Default::default()
         };
 
-        fail_parallel::cfg(fp_registry.clone(), "write-wal-sst-io-error", "pause").unwrap();
-
-        // Helper function to wait for a condition to be true.
-        let wait_for = async move |condition: Box<dyn Fn() -> bool>| {
-            for _ in 0..3000 {
-                if condition() {
-                    return;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        };
-
-        // 1 wal entry in memory
-        db.put_with_options(b"key1", &value, &PutOptions::default(), &write_opts)
+        // A first small write lands in the active memtable without tripping capacity.
+        db.put_with_options(b"key1", b"val1", &PutOptions::default(), &write_opts)
             .await
             .unwrap();
 
-        // Wait for put to end up in the WAL buffer
-        let this_wal_buffer = db.inner.wal_observer.clone();
-        wait_for(Box::new(move || {
-            this_wal_buffer.status().buffered_wal_entries_count > 0
-        }))
-        .await;
+        // Manually pin the write buffer at its high watermark so the next write
+        // must block in acquire. Holding the permit keeps it at capacity.
+        let pressure_permit = db.inner.write_buffer_manager.force_acquire(512 * 1024);
+        assert!(db.inner.write_buffer_manager.at_capacity());
 
-        // Verify that there is now 1 WAL entry in memory.
-        assert_eq!(db.inner.wal_observer.status().buffered_wal_entries_count, 1);
-
-        // Put another WAL entry, which should trigger backpressure. Do this in a separate
-        // task since the put() is blocked until the WAL is flushed, which isn't happening
-        // due to the fail point.
+        // The second write now blocks in the write path until capacity frees up.
+        let db_clone = db.clone();
         let join_handle = tokio::spawn(async move {
-            db.put_with_options(b"key2", &value, &PutOptions::default(), &write_opts)
+            db_clone
+                .put_with_options(b"key2", b"val2", &PutOptions::default(), &write_opts)
                 .await
                 .unwrap();
         });
 
-        let this_recorder = metrics_recorder_clone.clone();
-        // Wait up to 30s for backpressure to be applied to the second write.
-        wait_for(Box::new(move || {
-            lookup_metric(&this_recorder, crate::db_stats::BACKPRESSURE_COUNT)
+        // Wait up to 30s for backpressure to be recorded against the blocked write.
+        for _ in 0..3000 {
+            if lookup_metric(&metrics_recorder, crate::db_stats::BACKPRESSURE_COUNT)
                 .is_some_and(|v| v > 0)
-        }))
-        .await;
-
-        // Verify that backpressure is applied.
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         assert!(
-            lookup_metric(&metrics_recorder_clone, crate::db_stats::BACKPRESSURE_COUNT).unwrap()
-                >= 1
+            lookup_metric(&metrics_recorder, crate::db_stats::BACKPRESSURE_COUNT)
+                .is_some_and(|v| v >= 1),
+            "expected backpressure to be applied to the blocked write"
         );
 
-        // Unblock so put_with_options in join_handle can complete and join_handle.await returns
-        fail_parallel::cfg(fp_registry.clone(), "write-wal-sst-io-error", "off").unwrap();
+        // Relieve pressure. The parked write must resume and complete, proving
+        // the write path makes forward progress once capacity is available.
+        drop(pressure_permit);
+        tokio::time::timeout(Duration::from_secs(30), join_handle)
+            .await
+            .expect("backpressured write did not resume after pressure was relieved")
+            .expect("write task panicked");
 
-        // Shutdown the background task
-        join_handle.abort();
-        let _ = join_handle.await;
+        db.close().await.unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

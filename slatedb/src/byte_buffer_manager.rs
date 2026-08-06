@@ -3,7 +3,10 @@ use std::sync::{
     Arc,
 };
 
+use log::{info, warn};
 use tokio::sync::Notify;
+
+use crate::utils::format_bytes_si;
 
 /// Tracks and enforces a global memory budget for in-flight write data.
 ///
@@ -43,6 +46,42 @@ impl ByteBufferManager {
     /// because forward progress is needed to free the budget.
     pub fn force_acquire(&self, num_bytes: usize) -> ByteBufferPermit {
         self.inner.force_acquire(num_bytes);
+        ByteBufferPermit {
+            reserved_bytes: AtomicUsize::new(num_bytes),
+            semaphore: Arc::clone(&self.inner),
+        }
+    }
+
+    /// Reserves `num_bytes`, blocking while allocated bytes are at or above the
+    /// high watermark. Once below, the bytes are reserved atomically (no TOCTOU
+    /// gap), and the returned permit releases them on drop.
+    ///
+    /// `on_block` is invoked immediately before each park while the reservation
+    /// waits, receiving `true` only on the first park. It is *not* called when
+    /// the bytes are reserved without waiting, so callers can act on backpressure
+    /// only when a write actually has to wait.
+    pub async fn acquire(&self, num_bytes: usize, on_block: impl Fn(bool)) -> ByteBufferPermit {
+        let high_watermark = self.high_watermark;
+        let semaphore = &self.inner;
+        let blocked = semaphore
+            .acquire(num_bytes, high_watermark, |first| {
+                if first {
+                    warn!(
+                        "write buffer at capacity; blocking write [allocated={}, high_watermark={}, requested={}]",
+                        format_bytes_si(semaphore.allocated() as u64),
+                        format_bytes_si(high_watermark as u64),
+                        format_bytes_si(num_bytes as u64),
+                    );
+                }
+                on_block(first);
+            })
+            .await;
+        if blocked {
+            info!(
+                "write buffer drained; write unblocked [allocated={}]",
+                format_bytes_si(semaphore.allocated() as u64),
+            );
+        }
         ByteBufferPermit {
             reserved_bytes: AtomicUsize::new(num_bytes),
             semaphore: Arc::clone(&self.inner),
@@ -242,6 +281,61 @@ impl ByteBudgetSemaphore {
         self.allocated_bytes.load(Ordering::Acquire)
     }
 
+    /// Blocks until allocated bytes are below `watermark`, then atomically
+    /// reserves `num_bytes`. Reserving before returning closes the TOCTOU gap
+    /// that `wait_for_allocated_below` leaves open. May push allocated above
+    /// `watermark` (each caller reserves its full request once below).
+    ///
+    /// `on_block` fires immediately before *every* park while the reservation
+    /// waits, receiving `true` only on the first park. Firing on each park lets
+    /// callers re-assert relief (e.g. re-request a flush) rather than relying on
+    /// a single edge-triggered signal. It never fires when the bytes are
+    /// reserved without waiting. Returns `true` if it parked at least once.
+    async fn acquire(&self, num_bytes: usize, watermark: usize, on_block: impl Fn(bool)) -> bool {
+        let mut allocated = self.allocated_bytes.load(Ordering::Acquire);
+
+        // Fast path: reserve without parking when already below the watermark.
+        while allocated < watermark {
+            match self.allocated_bytes.compare_exchange_weak(
+                allocated,
+                allocated + num_bytes,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return false,
+                Err(cur) => allocated = cur,
+            }
+        }
+
+        // Slow path: park until a release drops allocated below the watermark,
+        // re-checking (with enable-before-check ordering) to avoid lost wakeups.
+        // `on_block` fires each time we are truly about to wait, so backpressure
+        // relief is re-asserted on every park, not just the first.
+        let _guard = WaiterGuard::new(self);
+        let notify_fut = self.notify.notified();
+        tokio::pin!(notify_fut);
+        let mut parked = false;
+        loop {
+            notify_fut.as_mut().enable();
+            allocated = self.allocated_bytes.load(Ordering::Acquire);
+            if allocated < watermark {
+                match self.allocated_bytes.compare_exchange_weak(
+                    allocated,
+                    allocated + num_bytes,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => return parked,
+                    Err(_) => continue,
+                }
+            }
+            on_block(!parked);
+            parked = true;
+            notify_fut.as_mut().await;
+            notify_fut.set(self.notify.notified());
+        }
+    }
+
     /// Blocks until allocated bytes drop below `num_bytes`. Does not reserve
     /// any capacity — callers must handle TOCTOU races.
     async fn wait_for_allocated_below(&self, num_bytes: usize) {
@@ -417,6 +511,150 @@ mod tests {
         drop(p3);
         drop(p1);
         assert_eq!(mgr.available(), 1024);
+    }
+
+    // ---------------------------------------------------------------
+    // acquire tests
+    // ---------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_acquire_reserves_when_below_watermark() {
+        let mgr = ByteBufferManager::new(1024, 500);
+        let permit = mgr.acquire(100, |_| {}).await;
+        assert_eq!(permit.size(), 100);
+        assert_eq!(mgr.allocated(), 100);
+    }
+
+    #[tokio::test]
+    async fn test_acquire_reserves_atomically() {
+        // Once below the watermark, acquire reserves before returning, so
+        // allocated reflects the reservation immediately (no TOCTOU gap).
+        let mgr = ByteBufferManager::new(1024, 200);
+        let _p = mgr.force_acquire(100);
+        let permit = mgr.acquire(50, |_| {}).await;
+        assert_eq!(mgr.allocated(), 150);
+        assert_eq!(permit.size(), 50);
+    }
+
+    #[tokio::test]
+    async fn test_acquire_blocks_when_at_watermark() {
+        let mgr = ByteBufferManager::new(1024, 500);
+        let _permit = mgr.force_acquire(500);
+
+        // allocated=500, high_watermark=500 => should block (not strictly below).
+        let result = timeout(Duration::from_millis(50), mgr.acquire(10, |_| {})).await;
+        assert!(result.is_err(), "acquire should have blocked");
+    }
+
+    #[tokio::test]
+    async fn test_acquire_unblocks_after_release() {
+        let mgr = ByteBufferManager::new(1024, 500);
+        let permit = mgr.force_acquire(600);
+
+        let mgr_clone = mgr.clone();
+        let handle = tokio::spawn(async move { mgr_clone.acquire(50, |_| {}).await });
+
+        // Give the spawned task a moment to park.
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        // Release enough to drop below the high watermark.
+        drop(permit);
+
+        let acquired = timeout(Duration::from_millis(100), handle)
+            .await
+            .expect("acquire should have completed")
+            .expect("task should not panic");
+        assert_eq!(acquired.size(), 50);
+    }
+
+    #[tokio::test]
+    async fn test_acquire_does_not_invoke_on_block_when_reserved_immediately() {
+        let mgr = ByteBufferManager::new(1024, 500);
+        let called = Arc::new(AtomicUsize::new(0));
+        let called_clone = Arc::clone(&called);
+
+        // allocated=0 < watermark=500 => reserves without parking, so the
+        // backpressure callback must not fire.
+        let _permit = mgr
+            .acquire(100, move |_| {
+                called_clone.fetch_add(1, Ordering::Relaxed);
+            })
+            .await;
+        assert_eq!(called.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn test_acquire_invokes_on_block_once_per_park() {
+        // A reservation that parks exactly once invokes on_block exactly once
+        // (with first=true) and does not fire again on the wake-up that reserves.
+        let mgr = ByteBufferManager::new(1024, 500);
+        let permit = mgr.force_acquire(600);
+        let called = Arc::new(AtomicUsize::new(0));
+        let first_flags = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        let mgr_clone = mgr.clone();
+        let called_clone = Arc::clone(&called);
+        let first_flags_clone = Arc::clone(&first_flags);
+        let handle = tokio::spawn(async move {
+            mgr_clone
+                .acquire(50, move |first| {
+                    called_clone.fetch_add(1, Ordering::Relaxed);
+                    first_flags_clone.lock().unwrap().push(first);
+                })
+                .await
+        });
+
+        // Let the task park and observe backpressure.
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert_eq!(called.load(Ordering::Relaxed), 1);
+        assert_eq!(first_flags.lock().unwrap().as_slice(), &[true]);
+
+        // Unblock; the single-park case does not fire again on wake-up.
+        drop(permit);
+        timeout(Duration::from_millis(100), handle)
+            .await
+            .expect("acquire should have completed")
+            .expect("task should not panic");
+        assert_eq!(called.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn test_acquire_invokes_on_block_each_park_when_reparked() {
+        // A reservation that must park more than once invokes on_block before
+        // every park, with first=true only on the first. This is what lets a
+        // blocked writer re-request relief on each park rather than once.
+        let mgr = ByteBufferManager::new(1024, 500);
+        let big = mgr.force_acquire(500);
+        let small = mgr.force_acquire(100); // allocated = 600, at capacity
+        let first_flags = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        let mgr_clone = mgr.clone();
+        let first_flags_clone = Arc::clone(&first_flags);
+        let handle = tokio::spawn(async move {
+            mgr_clone
+                .acquire(10, move |first| {
+                    first_flags_clone.lock().unwrap().push(first);
+                })
+                .await
+        });
+
+        // First park.
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert_eq!(first_flags.lock().unwrap().as_slice(), &[true]);
+
+        // Drop only the small permit: allocated 600 -> 500, still >= watermark,
+        // but below capacity so waiters are notified. The waiter wakes, still
+        // cannot reserve, and parks again -> on_block fires with first=false.
+        drop(small);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert_eq!(first_flags.lock().unwrap().as_slice(), &[true, false]);
+
+        // Drop the rest: allocated -> 0, the waiter reserves and returns.
+        drop(big);
+        timeout(Duration::from_millis(100), handle)
+            .await
+            .expect("acquire should have completed")
+            .expect("task should not panic");
     }
 
     // ---------------------------------------------------------------
