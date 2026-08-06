@@ -58,7 +58,6 @@ async fn test_replay_wal_then_write() {
             value.as_bytes(),
             &PutOptions::default(),
             &WriteOptions {
-                await_durable: false,
                 ..Default::default()
             },
         )
@@ -91,7 +90,6 @@ async fn test_replay_wal_then_write() {
         b"new_value",
         &PutOptions::default(),
         &WriteOptions {
-            await_durable: false,
             ..Default::default()
         },
     )
@@ -246,7 +244,6 @@ async fn test_concurrent_writers_and_readers() {
                         i.to_be_bytes().as_ref(),
                         &PutOptions::default(),
                         &WriteOptions {
-                            await_durable: false,
                             ..Default::default()
                         },
                     )
