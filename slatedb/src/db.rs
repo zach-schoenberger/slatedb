@@ -359,8 +359,8 @@ impl DbInner {
                 fail_point!(Arc::clone(&self.fp_registry), "db-backpressure-applied");
                 warn!(
                     "write buffer capacity reached. applying backpressure. [max_unflushed_bytes={}, write_buffer_allocated={}, write_buffer_remaining={}]",
-                    format_bytes_si(write_buffer_allocated as u64),
                     format_bytes_si(self.settings.max_unflushed_bytes as u64),
+                    format_bytes_si(write_buffer_allocated as u64),
                     format_bytes_si(write_buffer_remaining as u64)
                 );
 
@@ -551,11 +551,26 @@ impl DbInner {
             // ensure the assertion holds true.
             assert!(self.oracle.last_remote_persisted_seq() <= replayed_table.last_seq);
             self.oracle.advance_durable_seq(replayed_table.last_seq);
-            self.maybe_freeze_memtable(current_memtable_wal_id);
-            self.maybe_apply_backpressure().await?;
+            // Integrate before waiting on the write-buffer budget. `replay_memtable`
+            // freezes the previous active table into an imm the flusher can drain;
+            // waiting first would deadlock because the next table's `force_acquire`d
+            // bytes are still local and the active table is not yet frozen.
             let replayed_table_last_wal_id = replayed_table.last_wal_id;
             self.replay_memtable(current_memtable_wal_id, replayed_table)?;
             current_memtable_wal_id = replayed_table_last_wal_id;
+            // Freeze oversized (encoded-size) actives, and always freeze when the
+            // byte budget is at capacity so `maybe_apply_backpressure` has an imm
+            // to wait on. Without this, a single replayed table whose SkipMap /
+            // structural overhead alone hits the watermark would park forever.
+            self.maybe_freeze_memtable(current_memtable_wal_id);
+            if self.write_buffer_manager.at_capacity() {
+                let mut guard = self.state.write();
+                self.freeze_current_memtable_with_state_guard(
+                    &mut guard,
+                    current_memtable_wal_id,
+                );
+            }
+            self.maybe_apply_backpressure().await?;
         }
 
         let guard = self.state.read();
@@ -10422,24 +10437,26 @@ mod tests {
             .await
             .unwrap();
 
-        // On recovery, one complete WAL SST replays into a table that exceeds
-        // l0_sst_size_bytes. Replay must split/freeze oversized tables so open
-        // doesn't spin forever with an oversized active memtable and nothing for
-        // the flusher to drain.
-        //
-        // Backpressure in the merged write-buffer model is driven by the shared
-        // ByteBufferManager, whose permits for the final replayed (still active)
-        // memtable are only released once it is frozen and flushed after open.
-        // Sizing the buffer below MIN_WRITE_BUFFER_SIZE is rejected by the
-        // builder, so recovery uses the default (ample) buffer derived from
-        // max_unflushed_bytes; the small l0_sst_size_bytes still exercises the
-        // replay-time freeze path.
-        let mut replay_settings = test_db_options(0, 1024, None);
+        // On recovery, one complete WAL SST replays into a table whose write-
+        // buffer charge (base KVTable overhead + payload) exceeds a tight high
+        // watermark. Replay must integrate and freeze that table *before*
+        // waiting on `await_capacity`; otherwise open deadlocks with the budget
+        // held by an unfrozen active/local table and nothing for the flusher to
+        // drain.
+        let l0_sst_size_bytes = 1024;
+        let mut replay_settings = test_db_options(0, l0_sst_size_bytes, None);
         replay_settings.flush_interval = None;
+        let high_watermark = l0_sst_size_bytes
+            + crate::mem_table::KVTable::SEQ_TRACKER_OVERHEAD
+            + crate::mem_table::KVTable::KVTABLE_SIZE;
         let recovered = tokio::time::timeout(
             Duration::from_secs(5),
             Db::builder(path, object_store)
                 .with_settings(replay_settings)
+                .with_write_buffer_manager(ByteBufferManager::new(
+                    MIN_WRITE_BUFFER_SIZE,
+                    high_watermark,
+                ))
                 .build(),
         )
         .await

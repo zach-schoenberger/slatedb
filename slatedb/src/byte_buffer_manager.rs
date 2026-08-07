@@ -185,10 +185,24 @@ impl ByteBufferPermit {
             .fetch_add(other_bytes, Ordering::Relaxed);
     }
 
+    /// Splits `num_bytes` off this permit into a new permit. If fewer than
+    /// `num_bytes` remain, takes only what is available (never underflows).
     pub fn take(&self, num_bytes: usize) -> Self {
-        self.reserved_bytes.fetch_sub(num_bytes, Ordering::Relaxed);
+        let taken = loop {
+            let current = self.reserved_bytes.load(Ordering::Relaxed);
+            let take = current.min(num_bytes);
+            match self.reserved_bytes.compare_exchange_weak(
+                current,
+                current - take,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break take,
+                Err(_) => continue,
+            }
+        };
         Self {
-            reserved_bytes: AtomicUsize::new(num_bytes),
+            reserved_bytes: AtomicUsize::new(taken),
             semaphore: self.semaphore.clone(),
         }
     }
@@ -252,7 +266,11 @@ impl ByteBudgetSemaphore {
     }
 
     /// Releases `num_bytes` back to the budget and wakes any blocked
-    /// acquirers or capacity waiters if allocated bytes are now below capacity.
+    /// acquirers or capacity waiters.
+    ///
+    /// Waiters may be parked on the high watermark (not `capacity`), so every
+    /// release with outstanding waiters must notify — gating on `capacity`
+    /// alone can miss wakes when `high_watermark != capacity`.
     ///
     /// # Panics
     ///
@@ -264,7 +282,7 @@ impl ByteBudgetSemaphore {
             "cannot release more bytes than were reserved"
         );
 
-        if self.waiter_cnt.load(Ordering::Acquire) > 0 && (prev - num_bytes) < self.capacity {
+        if self.waiter_cnt.load(Ordering::Acquire) > 0 {
             self.notify.notify_waiters();
         }
     }
@@ -339,24 +357,23 @@ impl ByteBudgetSemaphore {
     /// Blocks until allocated bytes drop below `num_bytes`. Does not reserve
     /// any capacity — callers must handle TOCTOU races.
     async fn wait_for_allocated_below(&self, num_bytes: usize) {
-        let mut current = self.allocated_bytes.load(Ordering::Acquire);
-        if current < num_bytes {
+        if self.allocated_bytes.load(Ordering::Acquire) < num_bytes {
             return;
         }
 
         let _guard = WaiterGuard::new(self);
 
+        // Enable-before-check (same pattern as `acquire`) so a release that
+        // lands between the initial load and `enable` cannot be missed.
         let notify_fut = self.notify.notified();
         tokio::pin!(notify_fut);
         loop {
             notify_fut.as_mut().enable();
-            if current < num_bytes {
+            if self.allocated_bytes.load(Ordering::Acquire) < num_bytes {
                 break;
-            } else {
-                notify_fut.as_mut().await;
-                notify_fut.set(self.notify.notified());
-                current = self.allocated_bytes.load(Ordering::Acquire);
             }
+            notify_fut.as_mut().await;
+            notify_fut.set(self.notify.notified());
         }
     }
 }
@@ -420,6 +437,31 @@ mod tests {
         let mgr = ByteBufferManager::new(1024, 0);
         let permit = mgr.force_acquire(42);
         assert_eq!(permit.size(), 42);
+    }
+
+    #[tokio::test]
+    async fn test_take_splits_bytes() {
+        let mgr = ByteBufferManager::new(1024, 0);
+        let permit = mgr.force_acquire(100);
+        let taken = permit.take(40);
+        assert_eq!(taken.size(), 40);
+        assert_eq!(permit.size(), 60);
+        drop(taken);
+        assert_eq!(mgr.allocated(), 60);
+        drop(permit);
+        assert_eq!(mgr.allocated(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_take_saturates_when_request_exceeds_reserved() {
+        let mgr = ByteBufferManager::new(1024, 0);
+        let permit = mgr.force_acquire(50);
+        let taken = permit.take(100);
+        assert_eq!(taken.size(), 50);
+        assert_eq!(permit.size(), 0);
+        drop(taken);
+        drop(permit);
+        assert_eq!(mgr.allocated(), 0);
     }
 
     // ---------------------------------------------------------------
@@ -718,6 +760,27 @@ mod tests {
 
         let result = timeout(Duration::from_millis(100), handle).await;
         assert!(result.is_ok(), "await_capacity should have completed");
+    }
+
+    #[tokio::test]
+    async fn test_await_capacity_observes_release_before_park() {
+        // Regression: wait_for_allocated_below must re-read allocated after
+        // enable(). Otherwise a release between the initial load and park is
+        // missed (no waiter was registered yet, so release does not notify)
+        // and the waiter hangs forever.
+        for _ in 0..200 {
+            let mgr = ByteBufferManager::new(1024, 500);
+            let permit = mgr.force_acquire(600);
+            let mgr_clone = mgr.clone();
+            let handle = tokio::spawn(async move {
+                mgr_clone.await_capacity().await;
+            });
+            drop(permit);
+            timeout(Duration::from_millis(200), handle)
+                .await
+                .expect("await_capacity missed a wakeup")
+                .expect("task should not panic");
+        }
     }
 
     #[tokio::test]

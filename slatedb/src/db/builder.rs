@@ -646,6 +646,15 @@ impl<P: Into<Path>> DbBuilder<P> {
                 )
             ));
         }
+        if write_buffer_manager.high_watermark > write_buffer_manager.capacity() {
+            return Err(crate::Error::invalid(
+                format!(
+                    "invalid configuration: write_buffer_manager high watermark ({}) must not exceed capacity ({})",
+                    write_buffer_manager.high_watermark,
+                    write_buffer_manager.capacity(),
+                )
+            ));
+        }
         // The write buffer's high watermark must leave room for a single active
         // memtable to reach `l0_sst_size_bytes` of encoded entries (which is what
         // triggers a freeze) before the byte budget hits the watermark. The
@@ -2495,6 +2504,32 @@ mod tests {
         assert!(
             result.is_err(),
             "build should reject capacity below MIN_WRITE_BUFFER_SIZE"
+        );
+    }
+
+    /// High watermark above capacity is rejected: waiters park on the watermark
+    /// while the budget's hard ceiling is `capacity`, so HW > capacity is a
+    /// nonsensical configuration.
+    #[tokio::test]
+    async fn test_write_buffer_high_watermark_above_capacity_is_rejected() {
+        use crate::byte_buffer_manager::ByteBufferManager;
+
+        let result = crate::Db::builder(
+            "test_write_buffer_high_watermark_above_capacity_is_rejected",
+            Arc::new(InMemory::new()),
+        )
+        .with_settings(Settings {
+            l0_sst_size_bytes: 256 * 1024,
+            max_unflushed_bytes: 8 * 1024 * 1024,
+            ..Settings::default()
+        })
+        .with_write_buffer_manager(ByteBufferManager::new(1024 * 1024, 8 * 1024 * 1024))
+        .build()
+        .await;
+
+        assert!(
+            result.is_err(),
+            "build should reject high watermark above capacity"
         );
     }
 

@@ -623,9 +623,11 @@ impl KVTable {
         });
         if let Some(size) = previous_size.take() {
             // Overwrite (same SequencedKey): no new SkipMap node was created.
-            // Release the pre-allocated structural overhead that wasn't needed,
-            // plus the old entry's data budget (now replaced by the new entry).
-            let excess = Self::SKIPMAP_ENTRY_OVERHEAD + Self::SEQUENCED_KEY_SIZE + size;
+            // Return the structural overhead we just force_expanded (exact match)
+            // plus the old entry's data budget (now replaced by the new entry's
+            // bytes, which the caller already charged via add_write_permit).
+            // `take` saturates if the permit is somehow short.
+            let excess = entry_overhead + size;
             let _ = self.write_buffer_permit.take(excess);
             match size.cmp(&row_size) {
                 std::cmp::Ordering::Less => {
