@@ -26,6 +26,7 @@ use crate::byte_buffer_manager::ByteBufferManager;
 use crate::db_cache::CacheTarget;
 use std::fmt;
 use std::future::Future;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -107,6 +108,14 @@ pub(crate) struct DbInner {
     pub(crate) flush_merge_operator: Option<MergeOperatorType>,
     pub(crate) reader: Reader,
     pub(crate) write_buffer_manager: ByteBufferManager,
+    /// Largest single-tree L0 SST count observed on the last manifest
+    /// mutation (local upload or remote compaction pickup). Maintained
+    /// lock-free by the memtable flusher's manifest writer so the write
+    /// path can cheaply gate on L0 backpressure without taking the state
+    /// lock. `l0_max_ssts` is enforced per tree (RFC-0024), so this tracks
+    /// the per-tree maximum — the same quantity the flush-dispatch gate
+    /// (`FlushTracker::can_dispatch`) uses.
+    pub(crate) max_l0_sst_count: Arc<AtomicUsize>,
     /// [`wal_observer`] inspects the status of WAL buffer. The WAL buffer itself is owned by
     /// the batch write task.
     /// while not needed for standard operation it is conveinent to have for tests and for future usage.
@@ -156,6 +165,15 @@ impl DbInner {
         ));
 
         // state are mostly manifest, including IMM, L0, etc.
+        let max_l0_sst_count = Arc::new(AtomicUsize::new(
+            manifest
+                .value
+                .core
+                .trees()
+                .map(|tree| tree.l0.len())
+                .max()
+                .unwrap_or(0),
+        ));
         let db_state = DbState::new(manifest, write_buffer_manager.clone());
         let state = Arc::new(RwLock::new(db_state));
 
@@ -207,6 +225,7 @@ impl DbInner {
             status_manager,
             segment_extractor,
             write_buffer_manager,
+            max_l0_sst_count,
         };
         Ok(db_inner)
     }
@@ -320,14 +339,33 @@ impl DbInner {
         self.write_notifier.send(batch_msg)?;
 
         let result = rx.await?;
-        // Only wait when over the watermark. Always calling
+        // Only wait when over a backpressure watermark. Always calling
         // `maybe_apply_backpressure` would `check_closed()` after every write and
         // can turn a successful apply into an error if a background task fails
-        // in the race window (e.g. WAL flush panic after freeze).
-        if self.write_buffer_manager.at_capacity() {
+        // in the race window (e.g. WAL flush panic after freeze). Gate on either
+        // the byte budget (memory) or the L0 SST count (compaction lag): a small-
+        // value / fast-flush workload can keep the byte budget well under its
+        // watermark while L0 grows unbounded because compaction can't keep up.
+        if self.write_buffer_manager.at_capacity() || self.l0_at_capacity() {
             self.maybe_apply_backpressure().await?;
         }
         result
+    }
+
+    /// Returns `true` when the largest single tree's L0 SST count has reached
+    /// `l0_max_ssts`. This mirrors the flush-dispatch gate
+    /// (`FlushTracker::can_dispatch`), which enforces `l0_max_ssts` per tree
+    /// (RFC-0024). Reads a lock-free atomic maintained by the manifest writer.
+    ///
+    /// Only reports capacity when a compactor is configured to drain L0.
+    /// Without one, stalling the writer on L0 count could never be relieved
+    /// (nothing removes L0 SSTs), and a single tree's L0 is already bounded by
+    /// the flush-dispatch gate plus the byte-budget backpressure. This keeps
+    /// the writer from deadlocking in no-compactor deployments and tests.
+    #[inline]
+    pub(crate) fn l0_at_capacity(&self) -> bool {
+        self.settings.compactor_options.is_some()
+            && self.max_l0_sst_count.load(Ordering::Relaxed) >= self.settings.l0_max_ssts
     }
 
     #[inline]
@@ -362,6 +400,40 @@ impl DbInner {
                 // after apply; WAL replay freezes before calling this.
                 self.await_backpressure_relief(async {
                     self.write_buffer_manager.await_capacity().await;
+                    Ok(())
+                })
+                .await?;
+
+                continue;
+            }
+
+            // L0-count backpressure. `l0_max_ssts` is enforced per tree by the
+            // flush-dispatch gate (`FlushTracker::can_dispatch`), which stops
+            // *adding* to a full tree's L0. Only compaction *removes* L0 SSTs, so
+            // when compaction falls behind we must also stall writers here —
+            // otherwise a workload that flushes faster than it compacts (and
+            // never trips the byte budget) drives L0 up without bound. Scoped to
+            // a configured compactor by `l0_at_capacity` so it can be relieved.
+            if self.l0_at_capacity() {
+                let max_l0_sst_count = self.max_l0_sst_count.load(Ordering::Relaxed);
+                self.db_stats.backpressure_count.increment(1);
+                self.db_stats.l0_stall_count_num_ssts.increment(1);
+                fail_point!(Arc::clone(&self.fp_registry), "db-backpressure-applied");
+                warn!(
+                    "l0 sst count reached l0_max_ssts. applying backpressure. [max_l0_sst_count={}, l0_max_ssts={}]",
+                    max_l0_sst_count, self.settings.l0_max_ssts
+                );
+
+                // Relief comes from compaction draining L0, which the writer
+                // observes when the manifest writer's poll picks up the compacted
+                // manifest and refreshes `max_l0_sst_count`. There is no direct
+                // completion signal to await (a memtable *upload* would only add
+                // to L0), so re-check after one poll interval, bounded by the
+                // close/fence watchdog in `await_backpressure_relief`.
+                self.await_backpressure_relief(async {
+                    self.system_clock
+                        .sleep(self.settings.manifest_poll_interval)
+                        .await;
                     Ok(())
                 })
                 .await?;
@@ -556,10 +628,7 @@ impl DbInner {
             self.maybe_freeze_memtable(current_memtable_wal_id);
             if self.write_buffer_manager.at_capacity() {
                 let mut guard = self.state.write();
-                self.freeze_current_memtable_with_state_guard(
-                    &mut guard,
-                    current_memtable_wal_id,
-                );
+                self.freeze_current_memtable_with_state_guard(&mut guard, current_memtable_wal_id);
             }
             self.maybe_apply_backpressure().await?;
         }
@@ -5505,6 +5574,65 @@ mod tests {
 
         let db_state = db.inner.state.read().view();
         assert_eq!(db_state.state.imm_memtable.len(), 1);
+    }
+
+    // `maybe_apply_backpressure` gates L0-count backpressure on
+    // `DbInner::l0_at_capacity`. Verify that decision directly: it must only
+    // engage when a compactor is configured to drain L0 (otherwise a stalled
+    // writer could never be relieved) and only at/above `l0_max_ssts`.
+    //
+    // The current-thread test runtime guarantees no background task (e.g. the
+    // manifest poll that maintains `max_l0_sst_count`) runs between the
+    // synchronous `store` and the `assert`, so these checks are deterministic.
+    #[tokio::test]
+    async fn test_l0_at_capacity_gates_on_compactor_and_threshold() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+
+        // Without a compactor, L0-count backpressure never engages — nothing
+        // would relieve it — even far above the limit.
+        let mut no_compactor = test_db_options(0, 1024, None);
+        no_compactor.l0_max_ssts = 4;
+        let db_no_compactor = Db::builder("/tmp/test_l0_bp_no_compactor", object_store.clone())
+            .with_settings(no_compactor)
+            .build()
+            .await
+            .unwrap();
+        db_no_compactor
+            .inner
+            .max_l0_sst_count
+            .store(100, Ordering::SeqCst);
+        assert!(
+            !db_no_compactor.inner.l0_at_capacity(),
+            "L0 backpressure must not engage without a compactor to drain L0"
+        );
+        db_no_compactor.close().await.unwrap();
+
+        // With a compactor, L0-count backpressure engages at/above `l0_max_ssts`
+        // and clears below it.
+        let mut with_compactor = test_db_options(0, 1024, Some(fast_compactor_options()));
+        with_compactor.l0_max_ssts = 4;
+        let db = Db::builder("/tmp/test_l0_bp_with_compactor", object_store.clone())
+            .with_settings(with_compactor)
+            .build()
+            .await
+            .unwrap();
+
+        db.inner.max_l0_sst_count.store(4, Ordering::SeqCst);
+        assert!(
+            db.inner.l0_at_capacity(),
+            "L0 backpressure must engage at l0_max_ssts"
+        );
+        db.inner.max_l0_sst_count.store(5, Ordering::SeqCst);
+        assert!(
+            db.inner.l0_at_capacity(),
+            "L0 backpressure must engage above l0_max_ssts"
+        );
+        db.inner.max_l0_sst_count.store(3, Ordering::SeqCst);
+        assert!(
+            !db.inner.l0_at_capacity(),
+            "L0 backpressure must clear below l0_max_ssts"
+        );
+        db.close().await.unwrap();
     }
 
     #[tokio::test]

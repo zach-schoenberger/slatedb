@@ -34,6 +34,7 @@ use futures::StreamExt;
 use parking_lot::RwLockWriteGuard;
 use std::cmp;
 use std::collections::{BTreeMap, HashSet};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::runtime::Handle;
@@ -543,6 +544,21 @@ impl ManifestWriterHandler {
             Ok(modifier.state.manifest.clone())
         })?;
 
+        // Uploads just pushed new views onto one or more trees' L0. Refresh the
+        // write-path backpressure signal immediately (the per-tree maximum) so
+        // writers stall as soon as a tree reaches `l0_max_ssts`, rather than
+        // waiting for the next remote manifest poll.
+        let max_l0_sst_count = guard
+            .state()
+            .core()
+            .trees()
+            .map(|tree| tree.l0.len())
+            .max()
+            .unwrap_or(0);
+        self.db
+            .max_l0_sst_count
+            .store(max_l0_sst_count, Ordering::Relaxed);
+
         self.report_to_status_manager(&guard, manifest.into());
         Ok(())
     }
@@ -699,6 +715,12 @@ impl ManifestWriterHandler {
             .db_stats
             .segment_max_l0_sst_count
             .set(segment_max_l0_ssts as i64);
+        // Keep the write-path L0 backpressure signal in sync with the manifest
+        // we just merged (which may reflect compaction draining L0). This is the
+        // per-tree maximum that `DbInner::l0_at_capacity` gates on.
+        self.db
+            .max_l0_sst_count
+            .store(segment_max_l0_ssts, Ordering::Relaxed);
         self.db.db_stats.sorted_run_count.set(sorted_runs as i64);
         self.db.db_stats.sst_view_count.set(sst_views as i64);
         self.db.db_stats.sst_count.set(distinct_ssts.len() as i64);
