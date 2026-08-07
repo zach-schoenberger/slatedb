@@ -26,7 +26,6 @@ use crate::byte_buffer_manager::ByteBufferManager;
 use crate::db_cache::CacheTarget;
 use std::fmt;
 use std::future::Future;
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -108,12 +107,6 @@ pub(crate) struct DbInner {
     pub(crate) flush_merge_operator: Option<MergeOperatorType>,
     pub(crate) reader: Reader,
     pub(crate) write_buffer_manager: ByteBufferManager,
-    /// Dedup guard for backpressure-triggered freezes. A blocked writer flips
-    /// this `false`->`true` and fires a single fire-and-forget freeze; the
-    /// batch writer clears it once the freeze is issued, re-arming the next
-    /// wave. Ensures a burst of blocked writers enqueues at most one in-flight
-    /// freeze rather than flooding the writer with redundant WAL flushes.
-    pub(crate) backpressure_flush_pending: AtomicBool,
     /// [`wal_observer`] inspects the status of WAL buffer. The WAL buffer itself is owned by
     /// the batch write task.
     /// while not needed for standard operation it is conveinent to have for tests and for future usage.
@@ -214,7 +207,6 @@ impl DbInner {
             status_manager,
             segment_extractor,
             write_buffer_manager,
-            backpressure_flush_pending: AtomicBool::new(false),
         };
         Ok(db_inner)
     }
@@ -312,22 +304,13 @@ impl DbInner {
 
         let estimated_size = batch_req.batch.estimated_size();
 
-        // Reserve the write buffer budget before enqueueing. `acquire` blocks
-        // while the buffer is at capacity and invokes the callback before each
-        // park, so we record backpressure once (first park) but re-request a
-        // freeze on every park to keep the buffer draining until we reserve.
-        // Race against DB closure so a parked writer exits promptly if fenced.
-        let permit = tokio::select! {
-            biased;
-            err = self.await_closed() => return Err(err),
-            permit = self.write_buffer_manager.acquire(estimated_size, |first| {
-                if first {
-                    self.db_stats.backpressure_count.increment(1);
-                    fail_point!(Arc::clone(&self.fp_registry), "db-backpressure-applied");
-                }
-                self.notify_backpressure_flush();
-            }) => permit,
-        };
+        // Non-blocking reserve before enqueue. Blocking in `acquire` here is
+        // unsafe with a shared `ByteBufferManager`: a freeze requested while
+        // parked can run before this batch is applied (or on the wrong DB
+        // instance), after which nothing re-arms relief and the waiter hangs.
+        // Soft-overshoot with `force_acquire`, apply the write into a freezeable
+        // memtable, then wait in `maybe_apply_backpressure`.
+        let permit = self.write_buffer_manager.force_acquire(estimated_size);
         self.db_stats
             .total_mem_size_bytes
             .set(self.write_buffer_manager.allocated() as i64);
@@ -336,7 +319,15 @@ impl DbInner {
         let batch_msg = BatchWriterMessage::WriteBatch(batch_req);
         self.write_notifier.send(batch_msg)?;
 
-        rx.await?
+        let result = rx.await?;
+        // Only wait when over the watermark. Always calling
+        // `maybe_apply_backpressure` would `check_closed()` after every write and
+        // can turn a successful apply into an error if a background task fails
+        // in the race window (e.g. WAL flush panic after freeze).
+        if self.write_buffer_manager.at_capacity() {
+            self.maybe_apply_backpressure().await?;
+        }
+        result
     }
 
     #[inline]
@@ -364,11 +355,11 @@ impl DbInner {
                     format_bytes_si(write_buffer_remaining as u64)
                 );
 
-                // Mirror the size-based backpressure path above: wait for the
-                // write buffer to drain below its high watermark (or for the DB
-                // to close), then re-evaluate. Freezing the active memtable to
-                // relieve pressure is the batch writer's responsibility (see
-                // `maybe_freeze_current_memtable`); backpressure only waits.
+                // Wait for the write buffer to drain below its high watermark
+                // (or for the DB to close), then re-evaluate. Freezing so that
+                // budget becomes releasable is the caller's responsibility:
+                // the live write path freezes in `write_batch` when at capacity
+                // after apply; WAL replay freezes before calling this.
                 self.await_backpressure_relief(async {
                     self.write_buffer_manager.await_capacity().await;
                     Ok(())
@@ -5327,7 +5318,7 @@ mod tests {
     }
 
     // 2 threads so we can wait on the metric (main task) while the second put
-    // is parked in write-buffer backpressure on a background task.
+    // is parked in maybe_apply_backpressure on a background task.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_apply_wal_memory_backpressure() {
         let fp_registry = Arc::new(FailPointRegistry::new());
@@ -5355,11 +5346,11 @@ mod tests {
             .unwrap();
 
         // Manually pin the write buffer at its high watermark so the next write
-        // must block in acquire. Holding the permit keeps it at capacity.
+        // applies (force_acquire soft-overshoots) then blocks in
+        // maybe_apply_backpressure until capacity frees.
         let pressure_permit = db.inner.write_buffer_manager.force_acquire(512 * 1024);
         assert!(db.inner.write_buffer_manager.at_capacity());
 
-        // The second write now blocks in the write path until capacity frees up.
         let db_clone = db.clone();
         let join_handle = tokio::spawn(async move {
             db_clone
@@ -5383,8 +5374,7 @@ mod tests {
             "expected backpressure to be applied to the blocked write"
         );
 
-        // Relieve pressure. The parked write must resume and complete, proving
-        // the write path makes forward progress once capacity is available.
+        // Relieve pressure. The parked write must resume and complete.
         drop(pressure_permit);
         tokio::time::timeout(Duration::from_secs(30), join_handle)
             .await

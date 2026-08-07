@@ -583,16 +583,17 @@ impl KVTable {
     /// Inserts a row entry into the table.
     ///
     /// Acquires the per-entry structural overhead (`SKIPMAP_ENTRY_OVERHEAD +
-    /// SEQUENCED_KEY_SIZE`) from the buffer manager. The caller is responsible
-    /// for ensuring the key/value data bytes are already covered by the
-    /// table's `write_buffer_permit` (via `add_write_permit`).
+    /// SEQUENCED_KEY_SIZE + size_of::<RowEntry>()`) from the buffer manager.
+    /// The caller is responsible for ensuring the key/value data bytes are
+    /// already covered by the table's `write_buffer_permit` (via
+    /// `add_write_permit`).
     ///
     /// For the rare overwrite case (same SequencedKey already exists),
     /// excess pre-allocated overhead is released back to the semaphore.
     pub(crate) fn put(&self, row: RowEntry) {
         // Acquire per-entry skiplist overhead from the buffer manager.
         let entry_overhead = Self::SKIPMAP_ENTRY_OVERHEAD
-            + std::mem::size_of::<SequencedKey>()
+            + Self::SEQUENCED_KEY_SIZE
             + std::mem::size_of::<RowEntry>();
         self.write_buffer_manager
             .force_expand(&self.write_buffer_permit, entry_overhead);
