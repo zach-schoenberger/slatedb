@@ -116,6 +116,13 @@ pub(crate) struct DbInner {
     /// the per-tree maximum — the same quantity the flush-dispatch gate
     /// (`FlushTracker::can_dispatch`) uses.
     pub(crate) max_l0_sst_count: Arc<AtomicUsize>,
+    /// Largest single-tree per-key L0 overlap (the peak number of L0 SST
+    /// views covering any one key) observed on the last manifest mutation.
+    /// The per-key analogue of [`Self::max_l0_sst_count`]: it is gated on
+    /// `l0_max_ssts_per_key` and mirrors the `max_l0_overlap` check the
+    /// flush-dispatch gate applies per tree. Maintained lock-free by the
+    /// memtable flusher's manifest writer alongside `max_l0_sst_count`.
+    pub(crate) max_l0_overlap: Arc<AtomicUsize>,
     /// [`wal_observer`] inspects the status of WAL buffer. The WAL buffer itself is owned by
     /// the batch write task.
     /// while not needed for standard operation it is conveinent to have for tests and for future usage.
@@ -174,6 +181,15 @@ impl DbInner {
                 .max()
                 .unwrap_or(0),
         ));
+        let max_l0_overlap = Arc::new(AtomicUsize::new(
+            manifest
+                .value
+                .core
+                .trees()
+                .map(|tree| crate::db_state::max_l0_overlap(&tree.l0))
+                .max()
+                .unwrap_or(0),
+        ));
         let db_state = DbState::new(manifest, write_buffer_manager.clone());
         let state = Arc::new(RwLock::new(db_state));
 
@@ -226,6 +242,7 @@ impl DbInner {
             segment_extractor,
             write_buffer_manager,
             max_l0_sst_count,
+            max_l0_overlap,
         };
         Ok(db_inner)
     }
@@ -339,16 +356,8 @@ impl DbInner {
         self.write_notifier.send(batch_msg)?;
 
         let result = rx.await?;
-        // Only wait when over a backpressure watermark. Always calling
-        // `maybe_apply_backpressure` would `check_closed()` after every write and
-        // can turn a successful apply into an error if a background task fails
-        // in the race window (e.g. WAL flush panic after freeze). Gate on either
-        // the byte budget (memory) or the L0 SST count (compaction lag): a small-
-        // value / fast-flush workload can keep the byte budget well under its
-        // watermark while L0 grows unbounded because compaction can't keep up.
-        if self.write_buffer_manager.at_capacity() || self.l0_at_capacity() {
-            self.maybe_apply_backpressure().await?;
-        }
+        self.maybe_apply_backpressure().await?;
+
         result
     }
 
@@ -368,9 +377,38 @@ impl DbInner {
             && self.max_l0_sst_count.load(Ordering::Relaxed) >= self.settings.l0_max_ssts
     }
 
+    /// Returns `true` when the largest single tree's per-key L0 overlap has
+    /// reached `l0_max_ssts_per_key`. The per-key analogue of
+    /// [`Self::l0_at_capacity`], mirroring the `max_l0_overlap` half of the
+    /// flush-dispatch gate (`FlushTracker::can_dispatch`). Reads a lock-free
+    /// atomic maintained by the manifest writer.
+    ///
+    /// Same compactor guard as [`Self::l0_at_capacity`]: only compaction
+    /// removes L0 SSTs, so without a compactor this stall could never be
+    /// relieved.
+    #[inline]
+    pub(crate) fn l0_overlap_at_capacity(&self) -> bool {
+        self.settings.compactor_options.is_some()
+            && self.max_l0_overlap.load(Ordering::Relaxed) >= self.settings.l0_max_ssts_per_key
+    }
+
     #[inline]
     #[allow(clippy::disallowed_macros)]
     pub(crate) async fn maybe_apply_backpressure(&self) -> Result<(), SlateDBError> {
+        // Only wait when over a backpressure watermark. Without this check
+        // `maybe_apply_backpressure` would `check_closed()` after every write and
+        // can turn a successful apply into an error if a background task fails
+        // in the race window (e.g. WAL flush panic after freeze). Gate on either
+        // the byte budget (memory) or the L0 SST count (compaction lag): a small-
+        // value / fast-flush workload can keep the byte budget well under its
+        // watermark while L0 grows unbounded because compaction can't keep up.
+        if !(self.write_buffer_manager.at_capacity()
+            || self.l0_at_capacity()
+            || self.l0_overlap_at_capacity())
+        {
+            return Ok(());
+        }
+
         loop {
             self.check_closed()?;
 
@@ -393,11 +431,27 @@ impl DbInner {
                     format_bytes_si(write_buffer_remaining as u64)
                 );
 
+                // Seed a drainable imm so the budget can be released. This is the
+                // single place that freezes for byte-budget backpressure: the
+                // write and replay paths just apply into the active memtable and
+                // call here. Only freeze when the flush queue is empty. Existing
+                // imms will drain and release budget on their own, and freezing an
+                // under-full active memtable just manufactures an extra small L0
+                // SST. If draining the existing imm(s) is not enough, the loop
+                // re-enters with an empty queue and freezes then.
+                {
+                    let replay_after_wal_id = self.wal_observer.status()?.last_flushed_wal_id;
+                    let mut guard = self.state.write();
+                    if guard.state().imm_memtable.is_empty() {
+                        self.freeze_current_memtable_with_state_guard(
+                            &mut guard,
+                            replay_after_wal_id,
+                        );
+                    }
+                }
+
                 // Wait for the write buffer to drain below its high watermark
-                // (or for the DB to close), then re-evaluate. Freezing so that
-                // budget becomes releasable is the caller's responsibility:
-                // the live write path freezes in `write_batch` when at capacity
-                // after apply; WAL replay freezes before calling this.
+                // (or for the DB to close), then re-evaluate.
                 self.await_backpressure_relief(async {
                     self.write_buffer_manager.await_capacity().await;
                     Ok(())
@@ -430,6 +484,39 @@ impl DbInner {
                 // completion signal to await (a memtable *upload* would only add
                 // to L0), so re-check after one poll interval, bounded by the
                 // close/fence watchdog in `await_backpressure_relief`.
+                self.await_backpressure_relief(async {
+                    self.system_clock
+                        .sleep(self.settings.manifest_poll_interval)
+                        .await;
+                    Ok(())
+                })
+                .await?;
+
+                continue;
+            }
+
+            // Per-key L0-overlap backpressure. The per-key analogue of the count
+            // gate above: `l0_max_ssts_per_key` bounds how many L0 SSTs may cover
+            // any single key (read amplification). The flush-dispatch gate stops
+            // *adding* overlap to a full tree, but only compaction *removes* it,
+            // so a workload that flushes overlapping ranges faster than it
+            // compacts drives per-key overlap up without bound unless we stall
+            // writers here too. Scoped to a configured compactor by
+            // `l0_overlap_at_capacity` so it can be relieved.
+            if self.l0_overlap_at_capacity() {
+                let max_l0_overlap = self.max_l0_overlap.load(Ordering::Relaxed);
+                self.db_stats.backpressure_count.increment(1);
+                self.db_stats.l0_stall_count_num_ssts_per_key.increment(1);
+                fail_point!(Arc::clone(&self.fp_registry), "db-backpressure-applied");
+                warn!(
+                    "l0 per-key overlap reached l0_max_ssts_per_key. applying backpressure. [max_l0_overlap={}, l0_max_ssts_per_key={}]",
+                    max_l0_overlap, self.settings.l0_max_ssts_per_key
+                );
+
+                // Same relief mechanism as the count gate: compaction draining L0
+                // reduces overlap, observed when the manifest writer refreshes
+                // `max_l0_overlap`. Re-check after one poll interval, bounded by
+                // the close/fence watchdog in `await_backpressure_relief`.
                 self.await_backpressure_relief(async {
                     self.system_clock
                         .sleep(self.settings.manifest_poll_interval)
@@ -621,15 +708,11 @@ impl DbInner {
             let replayed_table_last_wal_id = replayed_table.last_wal_id;
             self.replay_memtable(current_memtable_wal_id, replayed_table)?;
             current_memtable_wal_id = replayed_table_last_wal_id;
-            // Freeze oversized (encoded-size) actives, and always freeze when the
-            // byte budget is at capacity so `maybe_apply_backpressure` has an imm
-            // to wait on. Without this, a single replayed table whose SkipMap /
-            // structural overhead alone hits the watermark would park forever.
+            // Freeze oversized (encoded-size) actives so an over-watermark
+            // single replayed table can't park forever. Byte-budget backpressure
+            // (and the freeze that seeds a drainable imm) is handled centrally by
+            // `maybe_apply_backpressure`.
             self.maybe_freeze_memtable(current_memtable_wal_id);
-            if self.write_buffer_manager.at_capacity() {
-                let mut guard = self.state.write();
-                self.freeze_current_memtable_with_state_guard(&mut guard, current_memtable_wal_id);
-            }
             self.maybe_apply_backpressure().await?;
         }
 
@@ -5631,6 +5714,64 @@ mod tests {
         assert!(
             !db.inner.l0_at_capacity(),
             "L0 backpressure must clear below l0_max_ssts"
+        );
+        db.close().await.unwrap();
+    }
+
+    // Per-key analogue of `test_l0_at_capacity_gates_on_compactor_and_threshold`.
+    // `maybe_apply_backpressure` gates per-key L0-overlap backpressure on
+    // `DbInner::l0_overlap_at_capacity`, which must only engage with a compactor
+    // configured to drain L0 and only at/above `l0_max_ssts_per_key`.
+    #[tokio::test]
+    async fn test_l0_overlap_at_capacity_gates_on_compactor_and_threshold() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+
+        // Without a compactor, per-key overlap backpressure never engages.
+        let mut no_compactor = test_db_options(0, 1024, None);
+        no_compactor.l0_max_ssts_per_key = 4;
+        let db_no_compactor =
+            Db::builder("/tmp/test_l0_overlap_bp_no_compactor", object_store.clone())
+                .with_settings(no_compactor)
+                .build()
+                .await
+                .unwrap();
+        db_no_compactor
+            .inner
+            .max_l0_overlap
+            .store(100, Ordering::SeqCst);
+        assert!(
+            !db_no_compactor.inner.l0_overlap_at_capacity(),
+            "per-key overlap backpressure must not engage without a compactor to drain L0"
+        );
+        db_no_compactor.close().await.unwrap();
+
+        // With a compactor, per-key overlap backpressure engages at/above
+        // `l0_max_ssts_per_key` and clears below it.
+        let mut with_compactor = test_db_options(0, 1024, Some(fast_compactor_options()));
+        with_compactor.l0_max_ssts_per_key = 4;
+        let db = Db::builder(
+            "/tmp/test_l0_overlap_bp_with_compactor",
+            object_store.clone(),
+        )
+        .with_settings(with_compactor)
+        .build()
+        .await
+        .unwrap();
+
+        db.inner.max_l0_overlap.store(4, Ordering::SeqCst);
+        assert!(
+            db.inner.l0_overlap_at_capacity(),
+            "per-key overlap backpressure must engage at l0_max_ssts_per_key"
+        );
+        db.inner.max_l0_overlap.store(5, Ordering::SeqCst);
+        assert!(
+            db.inner.l0_overlap_at_capacity(),
+            "per-key overlap backpressure must engage above l0_max_ssts_per_key"
+        );
+        db.inner.max_l0_overlap.store(3, Ordering::SeqCst);
+        assert!(
+            !db.inner.l0_overlap_at_capacity(),
+            "per-key overlap backpressure must clear below l0_max_ssts_per_key"
         );
         db.close().await.unwrap();
     }

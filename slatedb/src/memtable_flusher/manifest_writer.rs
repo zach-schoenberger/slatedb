@@ -545,19 +545,27 @@ impl ManifestWriterHandler {
         })?;
 
         // Uploads just pushed new views onto one or more trees' L0. Refresh the
-        // write-path backpressure signal immediately (the per-tree maximum) so
-        // writers stall as soon as a tree reaches `l0_max_ssts`, rather than
-        // waiting for the next remote manifest poll.
-        let max_l0_sst_count = guard
+        // write-path backpressure signals immediately (the per-tree maxima) so
+        // writers stall as soon as a tree reaches `l0_max_ssts` or
+        // `l0_max_ssts_per_key`, rather than waiting for the next remote manifest
+        // poll.
+        let (max_l0_sst_count, max_l0_overlap) = guard
             .state()
             .core()
             .trees()
-            .map(|tree| tree.l0.len())
-            .max()
-            .unwrap_or(0);
+            .map(|tree| (tree.l0.len(), crate::db_state::max_l0_overlap(&tree.l0)))
+            .fold(
+                (0usize, 0usize),
+                |(max_count, max_overlap), (count, overlap)| {
+                    (max_count.max(count), max_overlap.max(overlap))
+                },
+            );
         self.db
             .max_l0_sst_count
             .store(max_l0_sst_count, Ordering::Relaxed);
+        self.db
+            .max_l0_overlap
+            .store(max_l0_overlap, Ordering::Relaxed);
 
         self.report_to_status_manager(&guard, manifest.into());
         Ok(())
@@ -690,6 +698,7 @@ impl ManifestWriterHandler {
     fn update_stats_for_manifest(&self, cow: &COWDbState) {
         let mut l0_ssts = 0usize;
         let mut segment_max_l0_ssts = 0usize;
+        let mut segment_max_l0_overlap = 0usize;
         let mut sorted_runs = 0usize;
         let mut sst_views = 0usize;
         let mut distinct_ssts: HashSet<SsTableId> = HashSet::new();
@@ -698,6 +707,11 @@ impl ManifestWriterHandler {
             // Track the largest single tree: backpressure is driven by `segment_max_l0_sst_count`
             // because `l0_max_ssts` is enforced per-tree.
             segment_max_l0_ssts = segment_max_l0_ssts.max(tree.l0.len());
+            // Per-tree peak per-key overlap drives the `l0_max_ssts_per_key`
+            // backpressure signal, the same way `segment_max_l0_ssts` drives the
+            // count signal.
+            segment_max_l0_overlap =
+                segment_max_l0_overlap.max(crate::db_state::max_l0_overlap(&tree.l0));
             sorted_runs += tree.compacted.len();
             let all_views = tree
                 .l0
@@ -721,6 +735,10 @@ impl ManifestWriterHandler {
         self.db
             .max_l0_sst_count
             .store(segment_max_l0_ssts, Ordering::Relaxed);
+        // Per-key overlap analogue, gated on by `DbInner::l0_overlap_at_capacity`.
+        self.db
+            .max_l0_overlap
+            .store(segment_max_l0_overlap, Ordering::Relaxed);
         self.db.db_stats.sorted_run_count.set(sorted_runs as i64);
         self.db.db_stats.sst_view_count.set(sst_views as i64);
         self.db.db_stats.sst_count.set(distinct_ssts.len() as i64);

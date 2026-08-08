@@ -313,16 +313,6 @@ impl DbInner {
 
         // maybe freeze the memtable (encoded-size / WAL thresholds).
         self.maybe_freeze_current_memtable(wal_writer.as_deref())?;
-        // If the shared write-buffer budget is at capacity after this apply,
-        // freeze unconditionally so `maybe_apply_backpressure` (called by the
-        // writer after the oneshot completes) has an imm that can drain. The
-        // bytes for this batch are already in the memtable here — unlike an
-        // acquire-time freeze, which can race ahead of enqueue/apply.
-        if self.write_buffer_manager.at_capacity() {
-            let replay_after_wal_id = self.wal_observer.status()?.last_flushed_wal_id;
-            let mut guard = self.state.write();
-            self.freeze_current_memtable_with_state_guard(&mut guard, replay_after_wal_id);
-        }
 
         let write_handle =
             WriteHandle::new_with_waiter(commit_seq, now, self.status_manager.durability_waiter());
