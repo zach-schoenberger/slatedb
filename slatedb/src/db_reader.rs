@@ -13,7 +13,6 @@ use {
         db_status::{ClosedResultWriter, DbStatus, DbStatusManager},
         dispatcher::{MessageHandler, MessageHandlerExecutor, MessageTickerDef},
         error::SlateDBError,
-        iter::IterationOrder,
         manifest::{
             store::{ManifestStore, StoredManifest},
             Manifest, ManifestCore, VersionedManifest,
@@ -24,11 +23,11 @@ use {
         paths::PathResolver,
         prefix_extractor::PrefixExtractor,
         reader::{DbStateReader, Reader, ScanContext},
-        sst_iter::SstIteratorOptions,
         tablestore::TableStore,
         types::KeyValue,
         utils::IdGenerator,
-        wal_replay::{WalIteratorOptions, WalReplayIterator, WalReplayOptions},
+        wal::WalReader as WalReaderTrait,
+        wal_replay::{WalReplayIterator, WalReplayOptions},
         Checkpoint, DbCacheManagerOps, DbIterator, DbMetadataOps, DbReadOps,
     },
     async_trait::async_trait,
@@ -84,7 +83,7 @@ enum WalReplayEnd {
     /// the manifest itself records as durable.
     Manifest,
 
-    /// Probe the object store for the newest WAL file and replay through it,
+    /// Ask the configured WAL reader for the newest WAL file and replay through it,
     /// picking up writes made after the manifest was written.
     Latest,
 }
@@ -116,6 +115,7 @@ pub struct DbReader {
 struct DbReaderInner {
     manifest_store: Arc<ManifestStore>,
     table_store: Arc<TableStore>,
+    wal_reader: Arc<dyn WalReaderTrait>,
     options: DbReaderOptions,
     mode: DbReaderMode,
     state: RwLock<Arc<ReaderState>>,
@@ -175,6 +175,7 @@ impl DbReaderInner {
     async fn new(
         manifest_store: Arc<ManifestStore>,
         table_store: Arc<TableStore>,
+        wal_reader: Option<Arc<dyn WalReaderTrait>>,
         options: DbReaderOptions,
         mode: DbReaderMode,
         merge_operator: Option<MergeOperatorType>,
@@ -185,6 +186,11 @@ impl DbReaderInner {
         write_buffer_manager: ByteBufferManager,
         mut manifest: StoredManifest,
     ) -> Result<Self, SlateDBError> {
+        let wal_reader = wal_reader.unwrap_or_else(|| {
+            Arc::new(crate::wal::reader::SlateDbWalReader::new(Arc::clone(
+                &table_store,
+            )))
+        });
         let checkpoint =
             Self::get_or_create_checkpoint(&mut manifest, mode, &options, rand.clone()).await?;
         let (manifest_id, initial_manifest) = if let Some(checkpoint) = checkpoint.as_ref() {
@@ -203,6 +209,7 @@ impl DbReaderInner {
                 VecDeque::new(),
                 WalReplayEnd::for_reader(mode, &options),
                 Arc::clone(&table_store),
+                wal_reader.as_ref(),
                 &options,
                 segment_extractor.as_ref(),
                 write_buffer_manager.clone(),
@@ -244,6 +251,7 @@ impl DbReaderInner {
         let inner = Self {
             manifest_store,
             table_store,
+            wal_reader,
             options,
             mode,
             state,
@@ -390,26 +398,32 @@ impl DbReaderInner {
         if self.options.skip_wal_replay {
             return Ok(());
         }
+        // Cheaply probe for newly-appeared WAL files before doing any replay work.
+        // Using the WAL reader abstraction keeps this compatible with pluggable WALs.
         let last_replayed_wal_id = self.state.read().last_wal_id;
         let last_seen_wal_id = self
-            .table_store
-            .last_seen_wal_id(last_replayed_wal_id)
+            .wal_reader
+            .last_wal_file_id(last_replayed_wal_id)
             .await?;
-        if last_seen_wal_id > last_replayed_wal_id {
-            let current_state = Arc::clone(&self.state.read());
-            let mut imm_memtable = current_state.imm_memtable().clone();
+        if last_seen_wal_id <= last_replayed_wal_id {
+            return Ok(());
+        }
 
-            let (last_wal_id, last_committed_seq) = Self::replay_wal_into(
-                Arc::clone(&self.table_store),
-                &self.options,
-                current_state.core(),
-                &mut imm_memtable,
-                WalReplayEnd::Latest,
-                self.segment_extractor.as_ref(),
-                self.write_buffer_manager.clone(),
-            )
-            .await?;
+        let current_state = Arc::clone(&self.state.read());
+        let mut imm_memtable = current_state.imm_memtable().clone();
+        let (last_wal_id, last_committed_seq) = Self::replay_wal_into(
+            Arc::clone(&self.table_store),
+            self.wal_reader.as_ref(),
+            &self.options,
+            current_state.core(),
+            &mut imm_memtable,
+            WalReplayEnd::Latest,
+            self.segment_extractor.as_ref(),
+            self.write_buffer_manager.clone(),
+        )
+        .await?;
 
+        if last_wal_id > current_state.last_wal_id {
             self.oracle.advance_durable_seq(last_committed_seq);
             let mut write_guard = self.state.write();
             *write_guard = Arc::new(ReaderState {
@@ -477,6 +491,7 @@ impl DbReaderInner {
             imm_memtable,
             WalReplayEnd::for_reader(self.mode, &self.options),
             Arc::clone(&self.table_store),
+            self.wal_reader.as_ref(),
             &self.options,
             self.segment_extractor.as_ref(),
             self.write_buffer_manager.clone(),
@@ -491,6 +506,7 @@ impl DbReaderInner {
         mut imm_memtable: VecDeque<Arc<ImmutableMemtable>>,
         replay_wals: Option<WalReplayEnd>,
         table_store: Arc<TableStore>,
+        wal_reader: &dyn WalReaderTrait,
         options: &DbReaderOptions,
         segment_extractor: Option<&Arc<dyn PrefixExtractor>>,
         write_buffer_manager: ByteBufferManager,
@@ -499,6 +515,7 @@ impl DbReaderInner {
             Some(replay_end) => {
                 Self::replay_wal_into(
                     Arc::clone(&table_store),
+                    wal_reader,
                     options,
                     &manifest.core,
                     &mut imm_memtable,
@@ -647,6 +664,7 @@ impl DbReaderInner {
 
     async fn replay_wal_into(
         table_store: Arc<TableStore>,
+        wal_reader: &dyn WalReaderTrait,
         reader_options: &DbReaderOptions,
         core: &ManifestCore,
         into_tables: &mut VecDeque<Arc<ImmutableMemtable>>,
@@ -654,28 +672,23 @@ impl DbReaderInner {
         segment_extractor: Option<&Arc<dyn PrefixExtractor>>,
         write_buffer_manager: ByteBufferManager,
     ) -> Result<(u64, u64), SlateDBError> {
-        let sst_iter_options = SstIteratorOptions {
-            max_fetch_tasks: 1,
-            blocks_to_fetch: 256,
-            cache_blocks: true,
-            cache_metadata: false,
-            eager_spawn: true,
-            order: IterationOrder::Ascending,
-            prefix: None,
-            filter_context: None,
-        };
-
         let (mut replay_after_wal_id, mut last_committed_seq) =
             Self::replayed_watermark(core, into_tables);
+        let wal_id_start = replay_after_wal_id
+            .checked_add(1)
+            .ok_or(SlateDBError::InvalidDBState)?;
         let wal_id_end = match replay_end {
             WalReplayEnd::Manifest => core.next_wal_sst_id,
-            WalReplayEnd::Latest => table_store.last_seen_wal_id(replay_after_wal_id).await? + 1,
+            WalReplayEnd::Latest => wal_reader
+                .last_wal_file_id(replay_after_wal_id)
+                .await?
+                .checked_add(1)
+                .ok_or(SlateDBError::InvalidDBState)?,
         };
+        if wal_id_start >= wal_id_end {
+            return Ok((replay_after_wal_id, last_committed_seq));
+        }
 
-        let iterator_options = WalIteratorOptions {
-            sst_batch_size: 4,
-            sst_iter_options,
-        };
         let replay_options = WalReplayOptions {
             max_memtable_bytes: reader_options.max_memtable_bytes as usize,
             // Skip entries that we already have in `imm_memtable` (that might be above
@@ -683,10 +696,12 @@ impl DbReaderInner {
             min_seq: Some(last_committed_seq),
         };
 
-        let mut replay_iter = WalReplayIterator::range(
-            (replay_after_wal_id + 1)..wal_id_end,
+        let wal_iter = wal_reader
+            .iterator((wal_id_start..wal_id_end).into())
+            .await?;
+        let mut replay_iter = WalReplayIterator::for_wal_iterator(
+            wal_iter,
             core,
-            iterator_options,
             replay_options,
             Arc::clone(&table_store),
             write_buffer_manager,
@@ -957,6 +972,7 @@ impl DbReader {
         manifest_store: Arc<ManifestStore>,
         table_store: Arc<TableStore>,
         mode: DbReaderMode,
+        wal_reader: Option<Arc<dyn WalReaderTrait>>,
         merge_operator: Option<MergeOperatorType>,
         segment_extractor: Option<Arc<dyn PrefixExtractor>>,
         options: DbReaderOptions,
@@ -984,6 +1000,7 @@ impl DbReader {
             DbReaderInner::new(
                 manifest_store,
                 table_store,
+                wal_reader,
                 options,
                 mode,
                 merge_operator,
@@ -1501,6 +1518,7 @@ mod tests {
             tablestore::{TableStore, TableStoreKind},
             test_utils,
             types::RowEntry,
+            wal::{WalError, WalFileRange, WalIterator, WalReader as WalReaderTrait, WalRows},
             CloseReason, Db,
         },
         bytes::Bytes,
@@ -1513,11 +1531,45 @@ mod tests {
         },
         std::{
             collections::{BTreeMap, VecDeque},
-            sync::Arc,
+            sync::{
+                atomic::{AtomicUsize, Ordering},
+                Arc,
+            },
             time::Duration,
         },
         uuid::Uuid,
     };
+
+    struct EmptyTestWalIterator;
+
+    #[async_trait::async_trait]
+    impl WalIterator for EmptyTestWalIterator {
+        async fn next(&mut self) -> Result<Option<WalRows>, WalError> {
+            Ok(None)
+        }
+    }
+
+    #[derive(Default)]
+    struct CountingWalReader {
+        iterator_calls: AtomicUsize,
+        last_wal_file_id_calls: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl WalReaderTrait for CountingWalReader {
+        async fn iterator(
+            &self,
+            _wal_file_id_range: WalFileRange,
+        ) -> Result<Box<dyn WalIterator>, WalError> {
+            self.iterator_calls.fetch_add(1, Ordering::Relaxed);
+            Ok(Box::new(EmptyTestWalIterator))
+        }
+
+        async fn last_wal_file_id(&self, _replay_after_wal_id: u64) -> Result<u64, WalError> {
+            self.last_wal_file_id_calls.fetch_add(1, Ordering::Relaxed);
+            Ok(10)
+        }
+    }
 
     #[tokio::test]
     async fn should_get_value_from_db() {
@@ -1550,6 +1602,32 @@ mod tests {
             reader.get(key).await.unwrap(),
             Some(Bytes::from_static(value))
         );
+    }
+
+    #[tokio::test]
+    async fn db_reader_builder_should_use_custom_wal_reader() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let path = Path::from("/tmp/test_custom_wal_reader");
+        let db = Db::open(path.clone(), Arc::clone(&object_store))
+            .await
+            .unwrap();
+        db.close().await.unwrap();
+
+        let wal_reader = Arc::new(CountingWalReader::default());
+        let reader = DbReader::builder(path, object_store)
+            .with_reader_mode(DbReaderMode::FollowLatest)
+            .with_wal_reader(wal_reader.clone())
+            .with_options(DbReaderOptions {
+                manifest_poll_interval: Duration::from_secs(60 * 60),
+                ..DbReaderOptions::default()
+            })
+            .build()
+            .await
+            .unwrap();
+
+        assert!(wal_reader.last_wal_file_id_calls.load(Ordering::Relaxed) > 0);
+        assert!(wal_reader.iterator_calls.load(Ordering::Relaxed) > 0);
+        reader.close().await.unwrap();
     }
 
     #[tokio::test]
@@ -1600,6 +1678,7 @@ mod tests {
             test_provider.manifest_store(),
             test_provider.table_store(),
             DbReaderMode::Checkpoint(checkpoint_result.id),
+            None,
             None,
             None,
             DbReaderOptions::default(),
@@ -1961,6 +2040,7 @@ mod tests {
             DbReaderMode::FollowLatest,
             None,
             None,
+            None,
             DbReaderOptions {
                 manifest_poll_interval: Duration::from_secs(60 * 60),
                 ..DbReaderOptions::default()
@@ -2154,6 +2234,7 @@ mod tests {
         let inner = DbReaderInner::new(
             Arc::clone(&manifest_store),
             table_store,
+            None,
             DbReaderOptions {
                 manifest_poll_interval: Duration::from_millis(100),
                 checkpoint_lifetime: Duration::from_millis(1000),
@@ -2250,6 +2331,7 @@ mod tests {
         let inner = DbReaderInner::new(
             Arc::clone(&manifest_store),
             table_store,
+            None,
             DbReaderOptions {
                 manifest_poll_interval: Duration::from_millis(100),
                 checkpoint_lifetime: Duration::from_millis(1000),
@@ -2367,6 +2449,7 @@ mod tests {
 
         let (last_wal_id, last_committed_seq) = DbReaderInner::replay_wal_into(
             Arc::clone(&table_store),
+            &native_wal_reader(&table_store),
             &DbReaderOptions::default(),
             &core,
             &mut into_tables,
@@ -2413,6 +2496,7 @@ mod tests {
 
         let (last_wal_id, last_committed_seq) = DbReaderInner::replay_wal_into(
             Arc::clone(&table_store),
+            &native_wal_reader(&table_store),
             &DbReaderOptions::default(),
             &core,
             &mut into_tables,
@@ -2469,6 +2553,7 @@ mod tests {
 
         let (last_wal_id, last_committed_seq) = DbReaderInner::replay_wal_into(
             Arc::clone(&table_store),
+            &native_wal_reader(&table_store),
             &reader_options,
             &core,
             &mut into_tables,
@@ -2506,6 +2591,7 @@ mod tests {
 
         let (last_wal_id, last_committed_seq) = DbReaderInner::replay_wal_into(
             Arc::clone(&table_store),
+            &native_wal_reader(&table_store),
             &DbReaderOptions::default(),
             &core,
             &mut into_tables,
@@ -2538,6 +2624,7 @@ mod tests {
 
         let (last_wal_id, last_committed_seq) = DbReaderInner::replay_wal_into(
             Arc::clone(&table_store),
+            &native_wal_reader(&table_store),
             &DbReaderOptions::default(),
             &core,
             &mut into_tables,
@@ -2585,6 +2672,7 @@ mod tests {
 
         let (last_wal_id, last_committed_seq) = DbReaderInner::replay_wal_into(
             Arc::clone(&table_store),
+            &native_wal_reader(&table_store),
             &DbReaderOptions::default(),
             &core,
             &mut into_tables,
@@ -2624,7 +2712,10 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(20)).await;
         let result = reader.get(b"key").await.unwrap_err();
         dbg!(&result);
-        assert_eq!(result.to_string(), "Unavailable error: io error (oops)");
+        assert_eq!(
+            result.to_string(),
+            "Unavailable error: wal unavailable (io error)"
+        );
     }
 
     #[tokio::test]
@@ -2742,9 +2833,9 @@ mod tests {
 
         // Inject a failpoint on WAL probing before flushing so it is active
         // when the poller fires. With the buggy replay_new_wals=true,
-        // reestablish_checkpoint calls last_seen_wal_id() which probes WAL SSTs
+        // reestablish_checkpoint resolves the last WAL file by probing WAL SSTs
         // and hits this failpoint. With the fix (replay_new_wals=false), the
-        // WAL probing is skipped entirely.
+        // WAL probe is skipped entirely.
         fail_parallel::cfg(
             Arc::clone(&test_provider.fp_registry),
             "probe-wal-ssts",
@@ -2765,7 +2856,7 @@ mod tests {
 
         // Wait for the manifest poller to see the changed L0 state and
         // reestablish the checkpoint. Without the fix, the poller crashes
-        // on the WAL listing failpoint.
+        // on the WAL probing failpoint.
         let timeout = Duration::from_secs(5);
         let start = tokio::time::Instant::now();
         loop {
@@ -3013,6 +3104,7 @@ mod tests {
                 self.manifest_store(),
                 self.table_store(),
                 mode,
+                None,
                 merge_operator,
                 None,
                 options,
@@ -3022,6 +3114,10 @@ mod tests {
             )
             .await
         }
+    }
+
+    fn native_wal_reader(table_store: &Arc<TableStore>) -> crate::wal::reader::SlateDbWalReader {
+        crate::wal::reader::SlateDbWalReader::new(Arc::clone(table_store))
     }
 
     fn immutable_memtable(
@@ -3198,9 +3294,11 @@ mod tests {
             oracle.clone(),
             None,
         );
+        let wal_reader = Arc::new(native_wal_reader(&table_store));
         let inner = DbReaderInner {
             manifest_store,
             table_store,
+            wal_reader,
             options: DbReaderOptions {
                 skip_wal_replay: true,
                 ..DbReaderOptions::default()
@@ -3285,9 +3383,11 @@ mod tests {
             oracle.clone(),
             None,
         );
+        let wal_reader = Arc::new(native_wal_reader(&table_store));
         DbReaderInner {
             manifest_store,
             table_store,
+            wal_reader,
             options: DbReaderOptions::default(),
             mode: DbReaderMode::ManagedCheckpoint,
             state: parking_lot::RwLock::new(Arc::new(prior_state)),
