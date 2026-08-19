@@ -1,3 +1,4 @@
+use crate::wal::slatedb::reader::SlateDbWalReaderOptions;
 use {
     crate::{
         byte_buffer_manager::ByteBufferManager,
@@ -186,11 +187,6 @@ impl DbReaderInner {
         write_buffer_manager: ByteBufferManager,
         mut manifest: StoredManifest,
     ) -> Result<Self, SlateDBError> {
-        let wal_reader = wal_reader.unwrap_or_else(|| {
-            Arc::new(crate::wal::reader::SlateDbWalReader::new(Arc::clone(
-                &table_store,
-            )))
-        });
         let checkpoint =
             Self::get_or_create_checkpoint(&mut manifest, mode, &options, rand.clone()).await?;
         let (manifest_id, initial_manifest) = if let Some(checkpoint) = checkpoint.as_ref() {
@@ -201,6 +197,22 @@ impl DbReaderInner {
         } else {
             (manifest.id(), manifest.manifest().clone())
         };
+        let status_manager = DbStatusManager::new_with_initial_values(
+            initial_manifest.core.last_l0_seq,
+            VersionedManifest::from_manifest(manifest_id, initial_manifest.clone()),
+            BTreeSet::default(),
+        );
+        let wal_reader = wal_reader.unwrap_or_else(|| {
+            Arc::new(
+                crate::wal::slatedb::reader::SlateDbWalReader::new_with_status_manager(
+                    Arc::clone(&table_store),
+                    &status_manager,
+                    Arc::clone(&system_clock),
+                    SlateDbWalReaderOptions::default(),
+                ),
+            )
+        });
+
         let initial_state = Arc::new(
             Self::build_reader_state(
                 checkpoint,
@@ -222,13 +234,15 @@ impl DbReaderInner {
             initial_state.core().last_l0_clock_tick,
         ));
 
-        // initial_state contains the last_committed_seq after WAL replay. in no-wal mode, we can
-        // simply fallback to last_l0_seq.
         let initial_durable_seq = initial_state
             .last_remote_persisted_seq
             .max(initial_state.core().last_l0_seq);
-        let status_manager = DbStatusManager::new_with_initial_values(
-            initial_durable_seq,
+        status_manager.report_durable_seq(
+            initial_state
+                .last_remote_persisted_seq
+                .max(initial_state.core().last_l0_seq),
+        );
+        status_manager.report_manifest_and_memtable_segments(
             VersionedManifest::from(initial_state.as_ref()),
             collect_touched_segments(initial_state.as_ref()),
         );
@@ -894,7 +908,7 @@ impl DbReader {
     pub(crate) async fn preload_cache(
         &self,
         cached_obj_store: &CachedObjectStore,
-        path: object_store::path::Path,
+        path: Path,
     ) -> Result<(), SlateDBError> {
         let state = Arc::clone(&self.inner.state.read());
         let external_ssts = state.manifest.external_ssts();
@@ -1486,6 +1500,7 @@ impl DbCacheManagerOps for DbReader {
 
 #[cfg(test)]
 mod tests {
+    use crate::wal::slatedb::reader::SlateDbWalReaderOptions;
     use {
         super::{DbReaderMessage, ManifestPoller, ReaderState, WalReplayEnd},
         crate::{
@@ -1530,7 +1545,7 @@ mod tests {
             DbRand, MockSystemClock,
         },
         std::{
-            collections::{BTreeMap, VecDeque},
+            collections::{BTreeMap, BTreeSet, VecDeque},
             sync::{
                 atomic::{AtomicUsize, Ordering},
                 Arc,
@@ -1884,7 +1899,7 @@ mod tests {
 
         let parent_manifest = Manifest::initial(ManifestCore::new());
         let parent_path = "/tmp/parent_store".to_string();
-        let source_checkpoint_id = uuid::Uuid::new_v4();
+        let source_checkpoint_id = Uuid::new_v4();
 
         let _ = StoredManifest::store_uninitialized_clone(
             Arc::clone(&manifest_store),
@@ -2446,10 +2461,11 @@ mod tests {
 
         let mut core = ManifestCore::new();
         core.next_wal_sst_id = 5;
+        let status_manager = status_manager_for_core(&core);
 
         let (last_wal_id, last_committed_seq) = DbReaderInner::replay_wal_into(
             Arc::clone(&table_store),
-            &native_wal_reader(&table_store),
+            &native_wal_reader(&table_store, &status_manager),
             &DbReaderOptions::default(),
             &core,
             &mut into_tables,
@@ -2493,10 +2509,11 @@ mod tests {
         let mut into_tables = VecDeque::new();
         let mut core = ManifestCore::new();
         core.next_wal_sst_id = 3;
+        let status_manager = status_manager_for_core(&core);
 
         let (last_wal_id, last_committed_seq) = DbReaderInner::replay_wal_into(
             Arc::clone(&table_store),
-            &native_wal_reader(&table_store),
+            &native_wal_reader(&table_store, &status_manager),
             &DbReaderOptions::default(),
             &core,
             &mut into_tables,
@@ -2550,10 +2567,11 @@ mod tests {
             max_memtable_bytes,
             ..DbReaderOptions::default()
         };
+        let status_manager = status_manager_for_core(&core);
 
         let (last_wal_id, last_committed_seq) = DbReaderInner::replay_wal_into(
             Arc::clone(&table_store),
-            &native_wal_reader(&table_store),
+            &native_wal_reader(&table_store, &status_manager),
             &reader_options,
             &core,
             &mut into_tables,
@@ -2588,10 +2606,11 @@ mod tests {
 
         let mut into_tables = VecDeque::new();
         let core = ManifestCore::new();
+        let status_manager = status_manager_for_core(&core);
 
         let (last_wal_id, last_committed_seq) = DbReaderInner::replay_wal_into(
             Arc::clone(&table_store),
-            &native_wal_reader(&table_store),
+            &native_wal_reader(&table_store, &status_manager),
             &DbReaderOptions::default(),
             &core,
             &mut into_tables,
@@ -2621,10 +2640,11 @@ mod tests {
 
         let mut into_tables = VecDeque::new();
         let core = ManifestCore::new();
+        let status_manager = status_manager_for_core(&core);
 
         let (last_wal_id, last_committed_seq) = DbReaderInner::replay_wal_into(
             Arc::clone(&table_store),
-            &native_wal_reader(&table_store),
+            &native_wal_reader(&table_store, &status_manager),
             &DbReaderOptions::default(),
             &core,
             &mut into_tables,
@@ -2669,10 +2689,11 @@ mod tests {
         let mut core = ManifestCore::new();
         core.last_l0_seq = 8;
         core.next_wal_sst_id = 5;
+        let status_manager = status_manager_for_core(&core);
 
         let (last_wal_id, last_committed_seq) = DbReaderInner::replay_wal_into(
             Arc::clone(&table_store),
-            &native_wal_reader(&table_store),
+            &native_wal_reader(&table_store, &status_manager),
             &DbReaderOptions::default(),
             &core,
             &mut into_tables,
@@ -3116,8 +3137,24 @@ mod tests {
         }
     }
 
-    fn native_wal_reader(table_store: &Arc<TableStore>) -> crate::wal::reader::SlateDbWalReader {
-        crate::wal::reader::SlateDbWalReader::new(Arc::clone(table_store))
+    fn status_manager_for_core(core: &ManifestCore) -> DbStatusManager {
+        DbStatusManager::new_with_initial_values(
+            core.last_l0_seq,
+            VersionedManifest::from_manifest(1, Manifest::initial(core.clone())),
+            BTreeSet::default(),
+        )
+    }
+
+    fn native_wal_reader(
+        table_store: &Arc<TableStore>,
+        status_manager: &DbStatusManager,
+    ) -> crate::wal::slatedb::reader::SlateDbWalReader {
+        crate::wal::slatedb::reader::SlateDbWalReader::new_with_status_manager(
+            Arc::clone(table_store),
+            status_manager,
+            Arc::new(DefaultSystemClock::new()),
+            SlateDbWalReaderOptions::default(),
+        )
     }
 
     fn immutable_memtable(
@@ -3294,7 +3331,8 @@ mod tests {
             oracle.clone(),
             None,
         );
-        let wal_reader = Arc::new(native_wal_reader(&table_store));
+        let status_manager = status_manager_for_core(&stored_manifest.manifest().core);
+        let wal_reader = Arc::new(native_wal_reader(&table_store, &status_manager));
         let inner = DbReaderInner {
             manifest_store,
             table_store,
@@ -3308,7 +3346,7 @@ mod tests {
             system_clock: test_provider.system_clock.clone(),
             oracle,
             reader,
-            status_manager: DbStatusManager::new(0),
+            status_manager,
             segment_extractor: None,
             rand: test_provider.rand.clone(),
             write_buffer_manager: ByteBufferManager::unbounded(),
@@ -3358,6 +3396,7 @@ mod tests {
     ) -> DbReaderInner {
         let manifest_store = test_provider.manifest_store();
         let table_store = test_provider.table_store();
+        let status_manager = status_manager_for_core(current_core);
 
         let prior_state = ReaderState {
             manifest_id: 1,
@@ -3383,7 +3422,7 @@ mod tests {
             oracle.clone(),
             None,
         );
-        let wal_reader = Arc::new(native_wal_reader(&table_store));
+        let wal_reader = Arc::new(native_wal_reader(&table_store, &status_manager));
         DbReaderInner {
             manifest_store,
             table_store,
@@ -3394,7 +3433,7 @@ mod tests {
             system_clock: test_provider.system_clock.clone(),
             oracle,
             reader,
-            status_manager: DbStatusManager::new(0),
+            status_manager,
             segment_extractor: None,
             rand: test_provider.rand.clone(),
             write_buffer_manager: ByteBufferManager::unbounded(),
@@ -3646,8 +3685,7 @@ mod tests {
         let mut test_provider = TestProvider::new(path.clone(), Arc::clone(&object_store));
         test_provider.system_clock = clock.clone();
 
-        let merge_operator: crate::merge_operator::MergeOperatorType =
-            Arc::new(crate::test_utils::StringConcatMergeOperator);
+        let merge_operator: MergeOperatorType = Arc::new(test_utils::StringConcatMergeOperator);
 
         let db = Db::builder(path.clone(), Arc::clone(&object_store))
             .with_settings(Settings {

@@ -152,7 +152,7 @@ impl DbInner {
         wal_observer: Box<dyn WalObserver>,
         recorder: MetricsRecorderHelper,
         fp_registry: Arc<FailPointRegistry>,
-        merge_operator: Option<crate::merge_operator::MergeOperatorType>,
+        merge_operator: Option<MergeOperatorType>,
         status_manager: Arc<DbStatusManager>,
         segment_extractor: Option<Arc<dyn PrefixExtractor>>,
         write_buffer_manager: ByteBufferManager,
@@ -2315,7 +2315,7 @@ impl WriteHandle {
     }
 }
 
-/// Wraps [`WalObserver`] and injects a [`crate::wal_buffer::WalStatusListener`]
+/// Wraps [`WalObserver`] and injects a [`crate::wal::WalStatusListener`]
 /// that updates the oracle and manifest, and drives cross-task notifications about wal events
 /// via a [`tokio::sync::watch`] channel.
 /// while not needed for standard operation it is conveinent to have for tests and for future usage.
@@ -2432,8 +2432,7 @@ mod tests {
         OnDemandCompactionSchedulerSupplier, StringConcatMergeOperator,
     };
     use crate::types::RowEntry;
-    use crate::wal::WalError;
-    use crate::wal_reader::WalReader;
+    use crate::wal::{SlateDbWalReaderBuilder, WalError, WalReader as _};
     use crate::{proptest_util, test_utils, CloseReason, CompactorBuilder, KeyValue};
     use async_trait::async_trait;
     use chrono::{TimeZone, Utc};
@@ -2906,7 +2905,7 @@ mod tests {
         kv_store.close().await.unwrap();
     }
 
-    fn assert_value(entry: &crate::types::RowEntry, expected: &[u8]) {
+    fn assert_value(entry: &RowEntry, expected: &[u8]) {
         match &entry.value {
             crate::types::ValueDeletable::Value(v) => assert_eq!(v.as_ref(), expected),
             other => panic!("expected Value({expected:?}), got {other:?}"),
@@ -3444,7 +3443,7 @@ mod tests {
         assert_eq!(
             lookup_metric(
                 &metrics_recorder,
-                crate::wal_buffer::stats::WAL_BUFFER_FLUSHES
+                crate::wal_buffer_stats::WAL_BUFFER_FLUSHES
             )
             .unwrap(),
             0
@@ -3465,7 +3464,7 @@ mod tests {
         assert_eq!(
             lookup_metric(
                 &metrics_recorder,
-                crate::wal_buffer::stats::WAL_BUFFER_FLUSHES
+                crate::wal_buffer_stats::WAL_BUFFER_FLUSHES
             )
             .unwrap(),
             1
@@ -3522,7 +3521,7 @@ mod tests {
         assert_eq!(
             lookup_metric(
                 &metrics_recorder,
-                crate::wal_buffer::stats::WAL_BUFFER_FLUSHES
+                crate::wal_buffer_stats::WAL_BUFFER_FLUSHES
             )
             .unwrap(),
             0
@@ -3531,7 +3530,7 @@ mod tests {
         // Simulate a failed state (e.g. fenced).
         db.inner
             .status_manager
-            .write_result(Err(crate::error::SlateDBError::Fenced));
+            .write_result(Err(SlateDBError::Fenced));
 
         // close() should succeed but not flush when failed.
         db.close().await.unwrap();
@@ -3542,7 +3541,7 @@ mod tests {
         assert_eq!(
             lookup_metric(
                 &metrics_recorder,
-                crate::wal_buffer::stats::WAL_BUFFER_FLUSHES
+                crate::wal_buffer_stats::WAL_BUFFER_FLUSHES
             )
             .unwrap(),
             0
@@ -3586,7 +3585,7 @@ mod tests {
         assert_eq!(
             lookup_metric(
                 &metrics_recorder,
-                crate::wal_buffer::stats::WAL_BUFFER_FLUSHES
+                crate::wal_buffer_stats::WAL_BUFFER_FLUSHES
             )
             .unwrap(),
             0
@@ -3600,7 +3599,7 @@ mod tests {
         assert_eq!(
             lookup_metric(
                 &metrics_recorder,
-                crate::wal_buffer::stats::WAL_BUFFER_FLUSHES
+                crate::wal_buffer_stats::WAL_BUFFER_FLUSHES
             )
             .unwrap(),
             1
@@ -3747,7 +3746,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            lookup_metric(&metrics_recorder, crate::wal_buffer::stats::WAL_FLUSH_BYTES)
+            lookup_metric(&metrics_recorder, crate::wal_buffer_stats::WAL_FLUSH_BYTES,)
                 .unwrap_or(0),
             0
         );
@@ -3908,7 +3907,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(
-            lookup_metric(&metrics_recorder, crate::wal_buffer::stats::WAL_FLUSH_BYTES)
+            lookup_metric(&metrics_recorder, crate::wal_buffer_stats::WAL_FLUSH_BYTES,)
                 .unwrap_or(0),
             0,
         );
@@ -3916,7 +3915,7 @@ mod tests {
         db.flush().await.unwrap();
 
         let wal_bytes =
-            lookup_metric(&metrics_recorder, crate::wal_buffer::stats::WAL_FLUSH_BYTES).unwrap();
+            lookup_metric(&metrics_recorder, crate::wal_buffer_stats::WAL_FLUSH_BYTES).unwrap();
         let memtable_bytes =
             lookup_metric(&metrics_recorder, crate::db_stats::MEMTABLE_WRITE_BYTES).unwrap();
         // WAL SST framing/footer makes the encoded payload at least as large as
@@ -3942,7 +3941,7 @@ mod tests {
         tokio::time::timeout(
             Duration::from_secs(1),
             db.task_executor
-                .join_task(crate::wal_buffer::WAL_BUFFER_TASK_NAME),
+                .join_task(crate::wal::slatedb::writer::WAL_BUFFER_TASK_NAME),
         )
         .await
         .expect("native WAL task should not run when the WAL is disabled")
@@ -5001,7 +5000,7 @@ mod tests {
         let mut settings = test_db_options(0, 1024, None);
         settings.flush_interval = None;
 
-        let kv_store = Db::builder(path, main_object_store)
+        let kv_store = Db::builder(path, Arc::clone(&main_object_store))
             .with_settings(settings)
             .with_wal_object_store(wal_object_store.clone())
             .build()
@@ -5049,20 +5048,25 @@ mod tests {
             0
         );
 
-        let wal_reader = WalReader::new(path, wal_object_store);
-        let wal_files = wal_reader.list(..).await.unwrap();
-        assert_eq!(wal_files.len(), 2); // first file is the fencing operation
+        let wal_reader = SlateDbWalReaderBuilder::new()
+            .with_object_store(main_object_store)
+            .with_wal_object_store(wal_object_store)
+            .with_path(Path::from(path))
+            .build()
+            .unwrap();
+        let tail = wal_reader.last_wal_file_id(0).await.unwrap();
+        assert_eq!(tail, 2); // first file is the fencing operation
         let mut rows = Vec::new();
-        let mut wal_iter = wal_files[1] // second file contains the actual write
-            .iterator()
+        let mut wal_iter = wal_reader
+            .iterator((1..tail.checked_add(1).unwrap()).into())
             .await
             .expect("expected successful WAL iterator call");
-        while let Some(entry) = wal_iter
+        while let Some(batch) = wal_iter
             .next()
             .await
             .expect("expected successful WAL rows read")
         {
-            rows.push(entry);
+            rows.extend(batch.rows);
         }
         assert_eq!(rows.len(), 1);
         let row = &rows[0];
@@ -7887,9 +7891,7 @@ mod tests {
         // freeze the job after its first output SSTs upload. Manifest and
         // `.compactions` I/O use the ungated store passed to `Db::builder`,
         // so the worker's heartbeats keep flowing while the job is frozen.
-        let gated = Arc::new(crate::test_utils::GatedObjectStore::new(
-            object_store.clone(),
-        ));
+        let gated = Arc::new(GatedObjectStore::new(object_store.clone()));
         let gated_store: Arc<dyn ObjectStore> = gated.clone();
 
         let db = Db::builder(path, object_store.clone())
@@ -8053,19 +8055,13 @@ mod tests {
         }
 
         db.put(b"key1", b"value1").await.unwrap();
-        db.inner
-            .flush_memtables(crate::memtable_flusher::FlushTarget::All)
-            .await
-            .unwrap();
+        db.inner.flush_memtables(FlushTarget::All).await.unwrap();
 
         let txn = db.begin(IsolationLevel::Snapshot).await.unwrap();
         let txn_seq = txn.seqnum();
 
         db.put(b"key2", b"value2").await.unwrap();
-        db.inner
-            .flush_memtables(crate::memtable_flusher::FlushTarget::All)
-            .await
-            .unwrap();
+        db.inner.flush_memtables(FlushTarget::All).await.unwrap();
 
         let min_active_seq = db.inner.txn_manager.min_active_seq();
         assert_eq!(min_active_seq, Some(txn_seq));
@@ -8082,10 +8078,7 @@ mod tests {
         drop(txn);
 
         db.put(b"key3", b"value3").await.unwrap();
-        db.inner
-            .flush_memtables(crate::memtable_flusher::FlushTarget::All)
-            .await
-            .unwrap();
+        db.inner.flush_memtables(FlushTarget::All).await.unwrap();
 
         {
             let state = db.inner.state.read();
@@ -8106,19 +8099,13 @@ mod tests {
         let db = Db::builder(path, object_store).build().await.unwrap();
 
         db.put(b"key1", b"value1").await.unwrap();
-        db.inner
-            .flush_memtables(crate::memtable_flusher::FlushTarget::All)
-            .await
-            .unwrap();
+        db.inner.flush_memtables(FlushTarget::All).await.unwrap();
 
         let snapshot = db.snapshot().await.unwrap();
         let snapshot_seq = snapshot.seq();
 
         db.put(b"key2", b"value2").await.unwrap();
-        db.inner
-            .flush_memtables(crate::memtable_flusher::FlushTarget::All)
-            .await
-            .unwrap();
+        db.inner.flush_memtables(FlushTarget::All).await.unwrap();
 
         let txn = db.begin(IsolationLevel::Snapshot).await.unwrap();
         let txn_seq = txn.seqnum();
@@ -8131,10 +8118,7 @@ mod tests {
         assert!(snapshot_seq < txn_seq);
 
         db.put(b"key3", b"value3").await.unwrap();
-        db.inner
-            .flush_memtables(crate::memtable_flusher::FlushTarget::All)
-            .await
-            .unwrap();
+        db.inner.flush_memtables(FlushTarget::All).await.unwrap();
 
         {
             let state = db.inner.state.read();
@@ -8149,10 +8133,7 @@ mod tests {
         drop(snapshot);
 
         db.put(b"key4", b"value4").await.unwrap();
-        db.inner
-            .flush_memtables(crate::memtable_flusher::FlushTarget::All)
-            .await
-            .unwrap();
+        db.inner.flush_memtables(FlushTarget::All).await.unwrap();
 
         assert_eq!(db.inner.snapshot_manager.min_active_seq(), None);
         assert_eq!(db.inner.txn_manager.min_active_seq(), Some(txn_seq));
@@ -8176,19 +8157,13 @@ mod tests {
         let db = Db::builder(path, object_store).build().await.unwrap();
 
         db.put(b"key1", b"value1").await.unwrap();
-        db.inner
-            .flush_memtables(crate::memtable_flusher::FlushTarget::All)
-            .await
-            .unwrap();
+        db.inner.flush_memtables(FlushTarget::All).await.unwrap();
 
         let txn = db.begin(IsolationLevel::Snapshot).await.unwrap();
         let txn_seq = txn.seqnum();
 
         db.put(b"key2", b"value2").await.unwrap();
-        db.inner
-            .flush_memtables(crate::memtable_flusher::FlushTarget::All)
-            .await
-            .unwrap();
+        db.inner.flush_memtables(FlushTarget::All).await.unwrap();
 
         let snapshot = db.snapshot().await.unwrap();
         let snapshot_seq = snapshot.seq();
@@ -8201,10 +8176,7 @@ mod tests {
         assert!(txn_seq < snapshot_seq);
 
         db.put(b"key3", b"value3").await.unwrap();
-        db.inner
-            .flush_memtables(crate::memtable_flusher::FlushTarget::All)
-            .await
-            .unwrap();
+        db.inner.flush_memtables(FlushTarget::All).await.unwrap();
 
         {
             let state = db.inner.state.read();
@@ -8219,10 +8191,7 @@ mod tests {
         drop(txn);
 
         db.put(b"key4", b"value4").await.unwrap();
-        db.inner
-            .flush_memtables(crate::memtable_flusher::FlushTarget::All)
-            .await
-            .unwrap();
+        db.inner.flush_memtables(FlushTarget::All).await.unwrap();
 
         assert_eq!(db.inner.txn_manager.min_active_seq(), None);
         assert_eq!(
@@ -9538,7 +9507,7 @@ mod tests {
         // When: the DB is fenced (simulated via closed_result)
         db.inner
             .status_manager
-            .write_result(Err(crate::error::SlateDBError::Fenced));
+            .write_result(Err(SlateDBError::Fenced));
 
         // Then: the watcher should report close_reason = Fenced
         let status = tokio::time::timeout(
@@ -10370,7 +10339,7 @@ mod tests {
         // then:
         let estimated = lookup_metric(
             &metrics_recorder,
-            crate::wal_buffer::stats::WAL_BUFFER_ESTIMATED_BYTES,
+            crate::wal_buffer_stats::WAL_BUFFER_ESTIMATED_BYTES,
         );
         assert!(
             estimated.is_some_and(|v| v > 0),
@@ -10932,7 +10901,7 @@ mod tests {
     async fn test_wal_replay_rejects_empty_extractor_prefix() {
         #[derive(Debug)]
         struct AliasedAlwaysEmptyExtractor;
-        impl crate::PrefixExtractor for AliasedAlwaysEmptyExtractor {
+        impl PrefixExtractor for AliasedAlwaysEmptyExtractor {
             fn name(&self) -> &str {
                 "fixed-3"
             }
@@ -11151,10 +11120,10 @@ mod tests {
     }
 
     impl ExtractorConfig {
-        fn to_extractor(self) -> Option<Arc<dyn crate::PrefixExtractor>> {
+        fn to_extractor(self) -> Option<Arc<dyn PrefixExtractor>> {
             #[derive(Debug)]
             struct OtherExtractor;
-            impl crate::PrefixExtractor for OtherExtractor {
+            impl PrefixExtractor for OtherExtractor {
                 fn name(&self) -> &str {
                     "other"
                 }
@@ -12132,12 +12101,12 @@ mod tests {
             }
 
             /// A path under the db root, e.g. `sub_path("wal/00..002.sst")`.
-            fn sub_path(&self, suffix: &str) -> object_store::path::Path {
-                object_store::path::Path::from(format!("{}/{}", self.db_path, suffix))
+            fn sub_path(&self, suffix: &str) -> Path {
+                Path::from(format!("{}/{}", self.db_path, suffix))
             }
 
             /// Number of cached part files for an object.
-            fn cached_part_count(&self, path: &object_store::path::Path) -> usize {
+            fn cached_part_count(&self, path: &Path) -> usize {
                 let dir = self.cache_root.join(path.to_string());
                 let Ok(entries) = std::fs::read_dir(dir) else {
                     return 0;
@@ -12153,7 +12122,7 @@ mod tests {
                     .count()
             }
 
-            fn assert_cached(&self, path: &object_store::path::Path, expected_parts: usize) {
+            fn assert_cached(&self, path: &Path, expected_parts: usize) {
                 assert_eq!(
                     self.cached_part_count(path),
                     expected_parts,
@@ -12174,7 +12143,7 @@ mod tests {
             }
 
             /// Lists the compacted SSTs currently in the object store.
-            async fn compacted_locations(&self) -> Vec<object_store::path::Path> {
+            async fn compacted_locations(&self) -> Vec<Path> {
                 let prefix = self.sub_path("compacted");
                 self.upstream
                     .list(Some(&prefix))
@@ -12184,13 +12153,13 @@ mod tests {
             }
 
             /// The size of an object as stored upstream, in bytes.
-            async fn object_size(&self, path: &object_store::path::Path) -> u64 {
+            async fn object_size(&self, path: &Path) -> u64 {
                 self.upstream.head(path).await.unwrap().size
             }
 
             /// The upstream path of a compacted SST id.
-            fn compacted_sst_path(&self, id: &SsTableId) -> object_store::path::Path {
-                crate::paths::PathResolver::from_root(self.db_path.as_str()).sst_path(id)
+            fn compacted_sst_path(&self, id: &SsTableId) -> Path {
+                PathResolver::from_root(self.db_path.as_str()).sst_path(id)
             }
 
             fn l0_ids(&self) -> Vec<SsTableId> {

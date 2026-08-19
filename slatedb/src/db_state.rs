@@ -93,8 +93,8 @@ impl SsTableView {
     /// where no `DbRand` is available and the id is not stored in the manifest.
     pub(crate) fn identity(sst: SsTableHandle) -> Self {
         let id = match &sst.id {
-            SsTableId::Compacted(ulid) => *ulid,
-            SsTableId::Wal(wal_id) => Ulid::from_parts(*wal_id, 0),
+            Compacted(ulid) => *ulid,
+            Wal(wal_id) => Ulid::from_parts(*wal_id, 0),
         };
         Self::new(id, sst)
     }
@@ -386,7 +386,7 @@ impl SsTableId {
 }
 
 impl Debug for SsTableId {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> Result<(), std::fmt::Error> {
+    fn fmt(&self, f: &mut Formatter) -> Result<(), std::fmt::Error> {
         match self {
             Wal(id) => write!(f, "SsTableId::Wal({})", id),
             Compacted(id) => write!(f, "SsTableId::Compacted({})", id.to_string()),
@@ -407,8 +407,8 @@ pub enum SstType {
 impl From<&SsTableId> for SstType {
     fn from(id: &SsTableId) -> Self {
         match id {
-            SsTableId::Wal(_) => SstType::Wal,
-            SsTableId::Compacted(_) => SstType::Compacted,
+            Wal(_) => SstType::Wal,
+            Compacted(_) => SstType::Compacted,
         }
     }
 }
@@ -871,8 +871,8 @@ mod tests {
     use proptest::proptest;
     use slatedb_common::clock::{DefaultSystemClock, SystemClock};
     use std::collections::BTreeSet;
-    use std::collections::Bound::Included;
     use std::collections::VecDeque;
+    use std::ops::Bound::{Excluded, Included, Unbounded};
     use std::ops::RangeBounds;
     use std::sync::Arc;
 
@@ -1281,7 +1281,7 @@ mod tests {
 
     #[test]
     fn max_l0_overlap_empty_is_zero() {
-        let l0: std::collections::VecDeque<SsTableView> = std::collections::VecDeque::new();
+        let l0: VecDeque<SsTableView> = VecDeque::new();
         assert_eq!(super::max_l0_overlap(&l0), 0);
     }
 
@@ -1289,7 +1289,7 @@ mod tests {
     fn max_l0_overlap_disjoint_ranges_is_one() {
         // Simulates a post-union manifest where each source's L0s cover
         // disjoint key ranges — the peak per-point count stays at 1.
-        let mut l0 = std::collections::VecDeque::new();
+        let mut l0 = VecDeque::new();
         l0.push_back(create_compacted_sst_view_with_bounds(b"a", Some(b"b")));
         l0.push_back(create_compacted_sst_view_with_bounds(b"c", Some(b"d")));
         l0.push_back(create_compacted_sst_view_with_bounds(b"e", Some(b"f")));
@@ -1299,7 +1299,7 @@ mod tests {
 
     #[test]
     fn max_l0_overlap_full_overlap_counts_all() {
-        let mut l0 = std::collections::VecDeque::new();
+        let mut l0 = VecDeque::new();
         for _ in 0..4 {
             l0.push_back(create_compacted_sst_view_with_bounds(b"a", Some(b"z")));
         }
@@ -1309,7 +1309,7 @@ mod tests {
     #[test]
     fn max_l0_overlap_partial_overlap() {
         // A: [a, c], B: [b, d]. At B.start=b, both A and B contain b.
-        let mut l0 = std::collections::VecDeque::new();
+        let mut l0 = VecDeque::new();
         l0.push_back(create_compacted_sst_view_with_bounds(b"a", Some(b"c")));
         l0.push_back(create_compacted_sst_view_with_bounds(b"b", Some(b"d")));
         assert_eq!(super::max_l0_overlap(&l0), 2);
@@ -1318,7 +1318,7 @@ mod tests {
     #[test]
     fn max_l0_overlap_mixed_disjoint_groups() {
         // Two disjoint groups of 3 overlapping SSTs each. Peak is 3, not 6.
-        let mut l0 = std::collections::VecDeque::new();
+        let mut l0 = VecDeque::new();
         for _ in 0..3 {
             l0.push_back(create_compacted_sst_view_with_bounds(b"a", Some(b"c")));
         }
@@ -1331,7 +1331,7 @@ mod tests {
     #[test]
     fn max_l0_overlap_single_point_range_is_one() {
         // A view whose first_entry == last_entry covers exactly one key.
-        let mut l0 = std::collections::VecDeque::new();
+        let mut l0 = VecDeque::new();
         l0.push_back(create_compacted_sst_view_with_bounds(b"k", Some(b"k")));
         assert_eq!(super::max_l0_overlap(&l0), 1);
     }
@@ -1339,7 +1339,7 @@ mod tests {
     #[test]
     fn max_l0_overlap_many_point_ranges_same_key() {
         // N coincident point ranges [k, k] all cover key k → peak N.
-        let mut l0 = std::collections::VecDeque::new();
+        let mut l0 = VecDeque::new();
         for _ in 0..5 {
             l0.push_back(create_compacted_sst_view_with_bounds(b"k", Some(b"k")));
         }
@@ -1350,7 +1350,7 @@ mod tests {
     fn max_l0_overlap_mixed_point_and_longer_ranges_at_same_key() {
         // Two point ranges [k, k] and two longer ranges [k, z] all cover k.
         // Peak at k is 4; past k, only the two longer ranges remain.
-        let mut l0 = std::collections::VecDeque::new();
+        let mut l0 = VecDeque::new();
         l0.push_back(create_compacted_sst_view_with_bounds(b"k", Some(b"k")));
         l0.push_back(create_compacted_sst_view_with_bounds(b"k", Some(b"k")));
         l0.push_back(create_compacted_sst_view_with_bounds(b"k", Some(b"z")));
@@ -1361,7 +1361,7 @@ mod tests {
     #[test]
     fn max_l0_overlap_edge_touching_inclusive_counts_both() {
         // [a, b] and [b, c]: both contain b → peak 2.
-        let mut l0 = std::collections::VecDeque::new();
+        let mut l0 = VecDeque::new();
         l0.push_back(create_compacted_sst_view_with_bounds(b"a", Some(b"b")));
         l0.push_back(create_compacted_sst_view_with_bounds(b"b", Some(b"c")));
         assert_eq!(super::max_l0_overlap(&l0), 2);
@@ -1373,14 +1373,10 @@ mod tests {
         // First view has an Excluded end at b via a visible_range projection.
         let a = Bytes::copy_from_slice(b"a");
         let b = Bytes::copy_from_slice(b"b");
-        let v1 = create_compacted_sst_view_with_bounds(b"a", Some(b"b")).with_visible_range(
-            BytesRange::new(
-                std::ops::Bound::Included(a),
-                std::ops::Bound::Excluded(b.clone()),
-            ),
-        );
+        let v1 = create_compacted_sst_view_with_bounds(b"a", Some(b"b"))
+            .with_visible_range(BytesRange::new(Included(a), Excluded(b.clone())));
         let v2 = create_compacted_sst_view_with_bounds(b"b", Some(b"c"));
-        let mut l0 = std::collections::VecDeque::new();
+        let mut l0 = VecDeque::new();
         l0.push_back(v1);
         l0.push_back(v2);
         assert_eq!(super::max_l0_overlap(&l0), 1);
@@ -1390,7 +1386,7 @@ mod tests {
     fn max_l0_overlap_unbounded_end_single_view() {
         // A view with first_entry but no last_entry has effective_range
         // [first, Unbounded) — still one view, peak 1.
-        let mut l0 = std::collections::VecDeque::new();
+        let mut l0 = VecDeque::new();
         l0.push_back(create_compacted_sst_view_with_bounds(b"a", None));
         assert_eq!(super::max_l0_overlap(&l0), 1);
     }
@@ -1399,7 +1395,7 @@ mod tests {
     fn max_l0_overlap_unbounded_ends_share_tail() {
         // [a, ∞) and [b, ∞) both extend to +∞, so they overlap at every
         // point ≥ b. Peak is 2.
-        let mut l0 = std::collections::VecDeque::new();
+        let mut l0 = VecDeque::new();
         l0.push_back(create_compacted_sst_view_with_bounds(b"a", None));
         l0.push_back(create_compacted_sst_view_with_bounds(b"b", None));
         assert_eq!(super::max_l0_overlap(&l0), 2);
@@ -1409,7 +1405,7 @@ mod tests {
     fn max_l0_overlap_mixed_bounded_and_unbounded_end() {
         // [a, m] ends at m; [b, ∞) starts before m and extends past it.
         // They coexist on [b, m]. Peak is 2.
-        let mut l0 = std::collections::VecDeque::new();
+        let mut l0 = VecDeque::new();
         l0.push_back(create_compacted_sst_view_with_bounds(b"a", Some(b"m")));
         l0.push_back(create_compacted_sst_view_with_bounds(b"b", None));
         assert_eq!(super::max_l0_overlap(&l0), 2);
@@ -1421,11 +1417,10 @@ mod tests {
         // Effective range becomes [m, z] (physical end clamps the Unbounded).
         // Pair with [n, ∞): overlap on [n, z]. Peak is 2.
         let m = Bytes::copy_from_slice(b"m");
-        let projected = create_compacted_sst_view_with_bounds(b"a", Some(b"z")).with_visible_range(
-            BytesRange::new(std::ops::Bound::Included(m), std::ops::Bound::Unbounded),
-        );
+        let projected = create_compacted_sst_view_with_bounds(b"a", Some(b"z"))
+            .with_visible_range(BytesRange::new(Included(m), Unbounded));
         let open = create_compacted_sst_view_with_bounds(b"n", None);
-        let mut l0 = std::collections::VecDeque::new();
+        let mut l0 = VecDeque::new();
         l0.push_back(projected);
         l0.push_back(open);
         assert_eq!(super::max_l0_overlap(&l0), 2);
@@ -1438,19 +1433,11 @@ mod tests {
         let lo = Bytes::copy_from_slice(b"a");
         let mid = Bytes::copy_from_slice(b"m");
         let hi = Bytes::copy_from_slice(b"z");
-        let v1 = create_compacted_sst_view_with_bounds(b"a", Some(b"z")).with_visible_range(
-            BytesRange::new(
-                std::ops::Bound::Included(lo.clone()),
-                std::ops::Bound::Excluded(mid.clone()),
-            ),
-        );
-        let v2 = create_compacted_sst_view_with_bounds(b"a", Some(b"z")).with_visible_range(
-            BytesRange::new(
-                std::ops::Bound::Included(mid),
-                std::ops::Bound::Included(hi),
-            ),
-        );
-        let mut l0 = std::collections::VecDeque::new();
+        let v1 = create_compacted_sst_view_with_bounds(b"a", Some(b"z"))
+            .with_visible_range(BytesRange::new(Included(lo.clone()), Excluded(mid.clone())));
+        let v2 = create_compacted_sst_view_with_bounds(b"a", Some(b"z"))
+            .with_visible_range(BytesRange::new(Included(mid), Included(hi)));
+        let mut l0 = VecDeque::new();
         l0.push_back(v1);
         l0.push_back(v2);
         assert_eq!(super::max_l0_overlap(&l0), 1);
@@ -1490,7 +1477,7 @@ mod tests {
             });
 
         proptest!(ProptestConfig::with_cases(256), |(specs in vec(spec, 0..=8))| {
-            let mut l0 = std::collections::VecDeque::new();
+            let mut l0 = VecDeque::new();
             for s in &specs {
                 let view = match &s.end {
                     EndKind::Inclusive(end) => {
@@ -1503,8 +1490,8 @@ mod tests {
                         &s.start, None,
                     )
                     .with_visible_range(BytesRange::new(
-                        std::ops::Bound::Included(s.start.clone()),
-                        std::ops::Bound::Excluded(end.clone()),
+                        Included(s.start.clone()),
+                        Excluded(end.clone()),
                     )),
                 };
                 l0.push_back(view);

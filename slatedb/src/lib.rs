@@ -77,7 +77,7 @@ pub use sst_stats::{BlockStats, SstStats};
 pub use transaction_manager::IsolationLevel;
 pub use types::KeyValue;
 pub use types::{RowEntry, ValueDeletable};
-pub use wal_buffer::stats as wal_buffer_stats;
+pub use wal::slatedb::writer::stats as wal_buffer_stats;
 pub use wal_reader::{WalFile, WalFileIterator, WalReader};
 
 pub mod admin;
@@ -176,7 +176,6 @@ mod types;
 mod utils;
 
 mod fence;
-mod wal_buffer;
 mod wal_reader;
 mod wal_replay;
 
@@ -186,5 +185,5 @@ mod wal_replay;
 #[cfg(test)]
 #[ctor::ctor]
 fn init_test_infrastructure() {
-    crate::test_utils::init_test_infrastructure();
+    test_utils::init_test_infrastructure();
 }

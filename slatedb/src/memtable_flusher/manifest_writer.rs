@@ -1409,7 +1409,7 @@ mod tests {
             Duration::from_secs(3600),
         );
 
-        let (tx, rx) = tokio::sync::oneshot::channel();
+        let (tx, rx) = oneshot::channel();
         started
             .send_checkpoint(None, CheckpointOptions::default(), tx)
             .unwrap();
@@ -1866,7 +1866,7 @@ mod tests {
             // manifest writer routes by `prefix` from the surrounding
             // `SegmentedSstHandle`, not by the SST's keys.
             let mut builder = inner.table_store.table_builder();
-            let row = crate::types::RowEntry::new_value(prefix, value, first_seq);
+            let row = RowEntry::new_value(prefix, value, first_seq);
             builder.add(row).await.unwrap();
             let encoded_sst = builder.build().await.unwrap();
             let id = crate::db_state::SsTableId::Compacted(

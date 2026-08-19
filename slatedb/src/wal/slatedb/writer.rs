@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use self::stats::WalBufferStats;
 use crate::byte_buffer_manager::{ByteBufferManager, ByteBufferPermit};
 use crate::db_state::SsTableId;
 use crate::dispatcher::{MessageHandler, MessageHandlerExecutor, MessageTickerDef};
@@ -14,7 +15,6 @@ use crate::utils::SafeSender;
 use crate::utils::{format_bytes_si, WatchableOnceCellReader};
 use crate::wal;
 use crate::wal::{FlushResultFuture, WalError, WalEvent, WalStatus, WalWriter};
-use crate::wal_buffer_stats::WalBufferStats;
 use async_trait::async_trait;
 use futures::{stream::BoxStream, FutureExt, StreamExt};
 use log::{error, trace, warn};
@@ -24,7 +24,7 @@ use tracing::instrument;
 
 pub(crate) const WAL_BUFFER_TASK_NAME: &str = "wal_writer";
 
-/// [`WalBufferManager`] buffers write operations in memory before flushing them to persistent storage.
+/// [`SlateDbWalWriter`] buffers write operations in memory before flushing them to persistent storage.
 /// The flush operation only targets Remote storage right now, later we can add an option to flush to local
 /// storage.
 ///
@@ -37,7 +37,7 @@ pub(crate) const WAL_BUFFER_TASK_NAME: &str = "wal_writer";
 /// - `max_wal_flushes_before_l0_flush`: Requests a memtable flush when this many WAL files have
 ///   been flushed since the latest memtable replay point
 ///
-/// For strict durability requirements on synchronous writes, use [`WalBufferManager::flush()`] to explicitly
+/// For strict durability requirements on synchronous writes, use [`SlateDbWalWriter::flush()`] to explicitly
 /// trigger a flush operation and await the result. This will flush ALL the in memory WALs (including the
 /// current WAL) to remote storage.
 ///
@@ -49,8 +49,8 @@ pub(crate) const WAL_BUFFER_TASK_NAME: &str = "wal_writer";
 ///   guaranteed to be written atomically to the same WAL file.
 /// - Fatal errors during flush operations are stored internally and propagated to all subsequent
 ///   operations. The manager becomes unusable after encountering a fatal error.
-pub(crate) struct WalBufferManager {
-    inner: Arc<parking_lot::RwLock<WalBufferManagerInner>>,
+pub(crate) struct SlateDbWalWriter {
+    inner: Arc<parking_lot::RwLock<SlateDbWalWriterInner>>,
     stats: Arc<WalBufferStats>,
     table_store: Arc<TableStore>,
     max_wal_bytes_size: usize,
@@ -63,7 +63,7 @@ pub(crate) struct WalBufferManager {
     task_executor: Arc<MessageHandlerExecutor>,
 }
 
-struct WalBufferManagerInner {
+struct SlateDbWalWriterInner {
     current_wal: WalBuffer,
     /// Write buffer budget used to allocate permits for new WAL buffers as
     /// they are frozen and replaced.
@@ -115,7 +115,7 @@ struct WalBufferIterator {
     entries: std::vec::IntoIter<RowEntry>,
 }
 
-impl WalBufferManager {
+impl SlateDbWalWriter {
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn start_new(
         closed_result_reader: WatchableOnceCellReader<Result<(), SlateDBError>>,
@@ -136,7 +136,7 @@ impl WalBufferManager {
         let current_wal = WalBuffer::new(&write_buffer_manager);
         let immutable_wals = VecDeque::new();
         let (flush_tx, flush_rx) = SafeSender::unbounded_channel(closed_result_reader);
-        let inner = WalBufferManagerInner {
+        let inner = SlateDbWalWriterInner {
             current_wal,
             write_buffer_manager,
             immutable_wals,
@@ -219,7 +219,7 @@ impl WalBufferManager {
 }
 
 #[async_trait]
-impl WalWriter for WalBufferManager {
+impl WalWriter for SlateDbWalWriter {
     fn status(&self) -> Result<WalStatus, WalStatus> {
         self.inner.read().status(&self.table_store)
     }
@@ -240,7 +240,7 @@ impl WalWriter for WalBufferManager {
     }
 
     fn observer(&self) -> Box<dyn wal::WalObserver> {
-        Box::new(WalObserver {
+        Box::new(SlateDbWalObserver {
             inner: self.inner.clone(),
             table_store: self.table_store.clone(),
         })
@@ -272,7 +272,7 @@ impl WalWriter for WalBufferManager {
     }
 }
 
-impl WalBufferManagerInner {
+impl SlateDbWalWriterInner {
     fn check_exited(&self) -> Result<(), WalError> {
         match self.flush_task_exited_reason.as_ref() {
             Some(err) => Err(err.clone()),
@@ -498,7 +498,7 @@ impl Debug for WalFlushWork {
 
 struct WalFlushHandler {
     max_flush_interval: Option<Duration>,
-    inner: Arc<parking_lot::RwLock<WalBufferManagerInner>>,
+    inner: Arc<parking_lot::RwLock<SlateDbWalWriterInner>>,
     table_store: Arc<TableStore>,
     stats: Arc<WalBufferStats>,
     listener: Option<wal::WalStatusListener>,
@@ -534,7 +534,7 @@ impl WalFlushHandler {
                 warn!("outstanding references to wal id {} after flushing", wal_id);
             }
             drop(wal);
-            self.notify_listener(wal::WalEvent::WalFlushed(status));
+            self.notify_listener(WalEvent::WalFlushed(status));
         }
 
         Ok(())
@@ -558,7 +558,7 @@ impl WalFlushHandler {
         Ok(())
     }
 
-    fn notify_listener(&self, event: wal::WalEvent) {
+    fn notify_listener(&self, event: WalEvent) {
         if let Some(l) = self.listener.as_ref() {
             (*l)(event);
         }
@@ -633,12 +633,12 @@ impl MessageHandler<WalFlushWork> for WalFlushHandler {
 
 /// Interface for getting information about the current state of the Wal
 #[derive(Clone)]
-struct WalObserver {
-    inner: Arc<parking_lot::RwLock<WalBufferManagerInner>>,
+struct SlateDbWalObserver {
+    inner: Arc<parking_lot::RwLock<SlateDbWalWriterInner>>,
     table_store: Arc<TableStore>,
 }
 
-impl wal::WalObserver for WalObserver {
+impl wal::WalObserver for SlateDbWalObserver {
     /// Gets information about the Wal buffer's current state
     fn status(&self) -> Result<WalStatus, WalStatus> {
         self.inner.read().status(self.table_store.as_ref())
@@ -839,7 +839,7 @@ mod tests {
     }
 
     async fn setup_wal_buffer() -> (
-        WalBufferManager,
+        SlateDbWalWriter,
         Arc<TableStore>,
         Arc<DbStatusManager>,
         Arc<DefaultMetricsRecorder>,
@@ -850,7 +850,7 @@ mod tests {
     async fn setup_wal_buffer_with_flush_interval(
         flush_interval: Duration,
     ) -> (
-        WalBufferManager,
+        SlateDbWalWriter,
         Arc<TableStore>,
         Arc<DbStatusManager>,
         Arc<DefaultMetricsRecorder>,
@@ -862,7 +862,7 @@ mod tests {
         flush_interval: Duration,
         listener: wal::WalStatusListener,
     ) -> (
-        WalBufferManager,
+        SlateDbWalWriter,
         Arc<TableStore>,
         Arc<DbStatusManager>,
         Arc<DefaultMetricsRecorder>,
@@ -885,7 +885,7 @@ mod tests {
             status_manager.clone(),
             system_clock.clone(),
         ));
-        let wal_buffer = WalBufferManager::start_new(
+        let wal_buffer = SlateDbWalWriter::start_new(
             status_manager.result_reader(),
             &helper,
             0, // recent_flushed_wal_id
@@ -902,7 +902,7 @@ mod tests {
         observer
             .subscribe(Arc::new(move |status| {
                 (*listener)(status.clone());
-                let wal::WalEvent::WalFlushed(status) = status else {
+                let WalEvent::WalFlushed(status) = status else {
                     return;
                 };
                 oracle.advance_durable_seq(status.last_flushed_seq.unwrap_or(0))
@@ -1050,8 +1050,8 @@ mod tests {
         );
     }
 
-    fn recording_listener() -> (wal::WalStatusListener, Arc<Mutex<Vec<wal::WalEvent>>>) {
-        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+    fn recording_listener() -> (wal::WalStatusListener, Arc<Mutex<Vec<WalEvent>>>) {
+        let events = Arc::new(Mutex::new(Vec::new()));
         let recorder = events.clone();
         let listener = Arc::new(move |event| {
             recorder.lock().unwrap().push(event);
@@ -1077,7 +1077,7 @@ mod tests {
         let mut flushed: Vec<_> = recorded
             .iter()
             .filter_map(|e| {
-                let wal::WalEvent::WalFlushed(status) = e else {
+                let WalEvent::WalFlushed(status) = e else {
                     return None;
                 };
                 Some(status)
