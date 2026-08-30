@@ -311,7 +311,7 @@ mod tests {
 
         Db::builder("/tmp/snapshot_test", object_store)
             .with_settings(config)
-            .with_write_buffer_manager(ByteBufferManager::new(1024 * 1024, 1024 * 1024))
+            .with_write_buffer_manager(ByteBufferManager::new(1024 * 1024))
             .build()
             .await
             .expect("Failed to create test database")
@@ -752,7 +752,7 @@ mod tests {
             Db::builder("/tmp/failpoint_test", object_store)
                 .with_settings(config)
                 .with_fp_registry(fp_registry.clone())
-                .with_write_buffer_manager(ByteBufferManager::new(1024 * 1024, 1024 * 1024))
+                .with_write_buffer_manager(ByteBufferManager::new(1024 * 1024))
                 .build()
                 .await
                 .expect("Failed to create test database"),

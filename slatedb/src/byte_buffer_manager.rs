@@ -17,15 +17,13 @@ use crate::utils::format_bytes_si;
 #[derive(Clone)]
 pub struct ByteBufferManager {
     inner: Arc<ByteBudgetSemaphore>,
-    pub(crate) high_watermark: usize,
 }
 
 impl ByteBufferManager {
     /// Creates a new write-buffer manager with the given byte budget.
-    pub fn new(capacity: usize, high_watermark: usize) -> Self {
+    pub fn new(capacity: usize) -> Self {
         Self {
             inner: Arc::new(ByteBudgetSemaphore::new(capacity)),
-            high_watermark,
         }
     }
 
@@ -34,7 +32,7 @@ impl ByteBufferManager {
     /// Use this for read-only paths (e.g. WAL replay, empty sentinel tables) where
     /// memory accounting is unnecessary but the API requires a `ByteBufferManager`.
     pub fn unbounded() -> Self {
-        Self::new(usize::MAX, usize::MAX)
+        Self::new(usize::MAX)
     }
 
     /// Unconditionally reserves `num_bytes` without waiting.
@@ -53,7 +51,7 @@ impl ByteBufferManager {
     }
 
     /// Reserves `num_bytes`, blocking while allocated bytes are at or above the
-    /// high watermark. Once below, the bytes are reserved atomically (no TOCTOU
+    /// budget capacity. Once below, the bytes are reserved atomically (no TOCTOU
     /// gap), and the returned permit releases them on drop.
     ///
     /// `on_block` is invoked immediately before each park while the reservation
@@ -61,15 +59,14 @@ impl ByteBufferManager {
     /// the bytes are reserved without waiting, so callers can act on backpressure
     /// only when a write actually has to wait.
     pub async fn acquire(&self, num_bytes: usize, on_block: impl Fn(bool)) -> ByteBufferPermit {
-        let high_watermark = self.high_watermark;
         let semaphore = &self.inner;
         let blocked = semaphore
-            .acquire(num_bytes, high_watermark, |first| {
+            .acquire(num_bytes, |first| {
                 if first {
                     warn!(
-                        "write buffer at capacity; blocking write [allocated={}, high_watermark={}, requested={}]",
+                        "write buffer at capacity; blocking write [allocated={}, capacity={}, requested={}]",
                         format_bytes_si(semaphore.allocated() as u64),
-                        format_bytes_si(high_watermark as u64),
+                        format_bytes_si(self.inner.capacity as u64),
                         format_bytes_si(num_bytes as u64),
                     );
                 }
@@ -110,24 +107,24 @@ impl ByteBufferManager {
         self.inner.allocated()
     }
 
-    /// Returns `true` if allocated bytes have reached or exceeded the high
-    /// watermark, indicating that writers should apply backpressure.
+    /// Returns `true` when allocated bytes have reached the budget capacity,
+    /// indicating that writers should apply backpressure.
     pub fn at_capacity(&self) -> bool {
-        self.inner.allocated() >= self.high_watermark
+        self.inner.allocated() >= self.inner.capacity
     }
 
-    /// Waits until `allocated_bytes` drops below the high watermark.
+    /// Waits until `allocated_bytes` drops below the budget capacity.
     ///
     /// This does **not** reserve any bytes — it only waits for the condition
     /// to be met and then returns. Because no reservation is made, the
-    /// caller must be prepared for `allocated_bytes` to climb back above
-    /// the high watermark immediately after this future resolves (TOCTOU).
+    /// caller must be prepared for `allocated_bytes` to climb back up to
+    /// capacity immediately after this future resolves (TOCTOU).
     ///
     /// Use this for backpressure signaling where you want to wait until
     /// memory pressure has eased without holding budget during the wait.
     pub async fn await_capacity(&self) {
         self.inner
-            .wait_for_allocated_below(self.high_watermark)
+            .wait_for_allocated_below(self.inner.capacity)
             .await;
     }
 }
@@ -268,9 +265,8 @@ impl ByteBudgetSemaphore {
     /// Releases `num_bytes` back to the budget and wakes any blocked
     /// acquirers or capacity waiters.
     ///
-    /// Waiters may be parked on the high watermark (not `capacity`), so every
-    /// release with outstanding waiters must notify — gating on `capacity`
-    /// alone can miss wakes when `high_watermark != capacity`.
+    /// Every release with outstanding waiters notifies so that waiters parked on
+    /// the capacity threshold are woken once the budget frees up.
     ///
     /// # Panics
     ///
@@ -299,21 +295,21 @@ impl ByteBudgetSemaphore {
         self.allocated_bytes.load(Ordering::Acquire)
     }
 
-    /// Blocks until allocated bytes are below `watermark`, then atomically
+    /// Blocks until allocated bytes are below `capacity`, then atomically
     /// reserves `num_bytes`. Reserving before returning closes the TOCTOU gap
     /// that `wait_for_allocated_below` leaves open. May push allocated above
-    /// `watermark` (each caller reserves its full request once below).
+    /// `capacity` (each caller reserves its full request once below).
     ///
     /// `on_block` fires immediately before *every* park while the reservation
     /// waits, receiving `true` only on the first park. Firing on each park lets
     /// callers re-assert relief (e.g. re-request a flush) rather than relying on
     /// a single edge-triggered signal. It never fires when the bytes are
     /// reserved without waiting. Returns `true` if it parked at least once.
-    async fn acquire(&self, num_bytes: usize, watermark: usize, on_block: impl Fn(bool)) -> bool {
+    async fn acquire(&self, num_bytes: usize, on_block: impl Fn(bool)) -> bool {
         let mut allocated = self.allocated_bytes.load(Ordering::Acquire);
 
-        // Fast path: reserve without parking when already below the watermark.
-        while allocated < watermark {
+        // Fast path: reserve without parking when already below capacity.
+        while allocated < self.capacity {
             match self.allocated_bytes.compare_exchange_weak(
                 allocated,
                 allocated + num_bytes,
@@ -325,7 +321,7 @@ impl ByteBudgetSemaphore {
             }
         }
 
-        // Slow path: park until a release drops allocated below the watermark,
+        // Slow path: park until a release drops allocated below capacity,
         // re-checking (with enable-before-check ordering) to avoid lost wakeups.
         // `on_block` fires each time we are truly about to wait, so backpressure
         // relief is re-asserted on every park, not just the first.
@@ -336,7 +332,7 @@ impl ByteBudgetSemaphore {
         loop {
             notify_fut.as_mut().enable();
             allocated = self.allocated_bytes.load(Ordering::Acquire);
-            if allocated < watermark {
+            if allocated < self.capacity {
                 match self.allocated_bytes.compare_exchange_weak(
                     allocated,
                     allocated + num_bytes,
@@ -390,20 +386,20 @@ mod tests {
 
     #[tokio::test]
     async fn test_new_manager_has_full_budget() {
-        let mgr = ByteBufferManager::new(1024, 0);
+        let mgr = ByteBufferManager::new(1024);
         assert_eq!(mgr.available(), 1024);
     }
 
     #[tokio::test]
     async fn test_force_acquire_reduces_available() {
-        let mgr = ByteBufferManager::new(1024, 0);
+        let mgr = ByteBufferManager::new(1024);
         let _permit = mgr.force_acquire(100);
         assert_eq!(mgr.available(), 924);
     }
 
     #[tokio::test]
     async fn test_force_acquire_entire_budget() {
-        let mgr = ByteBufferManager::new(256, 0);
+        let mgr = ByteBufferManager::new(256);
         let permit = mgr.force_acquire(256);
         assert_eq!(mgr.available(), 0);
         assert_eq!(permit.size(), 256);
@@ -411,7 +407,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_drop_permit_restores_budget() {
-        let mgr = ByteBufferManager::new(1024, 0);
+        let mgr = ByteBufferManager::new(1024);
         let permit = mgr.force_acquire(300);
         assert_eq!(mgr.available(), 724);
         drop(permit);
@@ -420,7 +416,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_multiple_force_acquires() {
-        let mgr = ByteBufferManager::new(1024, 0);
+        let mgr = ByteBufferManager::new(1024);
         let p1 = mgr.force_acquire(200);
         let p2 = mgr.force_acquire(300);
         assert_eq!(mgr.available(), 524);
@@ -434,14 +430,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_permit_size() {
-        let mgr = ByteBufferManager::new(1024, 0);
+        let mgr = ByteBufferManager::new(1024);
         let permit = mgr.force_acquire(42);
         assert_eq!(permit.size(), 42);
     }
 
     #[tokio::test]
     async fn test_take_splits_bytes() {
-        let mgr = ByteBufferManager::new(1024, 0);
+        let mgr = ByteBufferManager::new(1024);
         let permit = mgr.force_acquire(100);
         let taken = permit.take(40);
         assert_eq!(taken.size(), 40);
@@ -454,7 +450,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_take_saturates_when_request_exceeds_reserved() {
-        let mgr = ByteBufferManager::new(1024, 0);
+        let mgr = ByteBufferManager::new(1024);
         let permit = mgr.force_acquire(50);
         let taken = permit.take(100);
         assert_eq!(taken.size(), 50);
@@ -470,7 +466,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_merge_combines_sizes() {
-        let mgr = ByteBufferManager::new(1024, 0);
+        let mgr = ByteBufferManager::new(1024);
         let p1 = mgr.force_acquire(100);
         let p2 = mgr.force_acquire(200);
 
@@ -481,7 +477,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_merge_drops_release_combined() {
-        let mgr = ByteBufferManager::new(1024, 0);
+        let mgr = ByteBufferManager::new(1024);
         let p1 = mgr.force_acquire(100);
         let p2 = mgr.force_acquire(200);
 
@@ -493,7 +489,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_merge_other_drops_without_releasing() {
-        let mgr = ByteBufferManager::new(1024, 0);
+        let mgr = ByteBufferManager::new(1024);
         let p1 = mgr.force_acquire(100);
         let p2 = mgr.force_acquire(200);
 
@@ -508,8 +504,8 @@ mod tests {
     #[tokio::test]
     #[should_panic(expected = "merging permits from different semaphore instances")]
     async fn test_merge_different_managers_panics() {
-        let mgr1 = ByteBufferManager::new(1024, 0);
-        let mgr2 = ByteBufferManager::new(1024, 0);
+        let mgr1 = ByteBufferManager::new(1024);
+        let mgr2 = ByteBufferManager::new(1024);
         let p1 = mgr1.force_acquire(10);
         let p2 = mgr2.force_acquire(10);
 
@@ -522,7 +518,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_drop_zero_sized_permit_is_safe() {
-        let mgr = ByteBufferManager::new(1024, 0);
+        let mgr = ByteBufferManager::new(1024);
         let p1 = mgr.force_acquire(100);
         let p2 = mgr.force_acquire(100);
 
@@ -540,7 +536,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_drop_after_merge_releases_all() {
-        let mgr = ByteBufferManager::new(1024, 0);
+        let mgr = ByteBufferManager::new(1024);
         let p1 = mgr.force_acquire(100);
         let p2 = mgr.force_acquire(200);
         let p3 = mgr.force_acquire(300);
@@ -560,8 +556,8 @@ mod tests {
     // ---------------------------------------------------------------
 
     #[tokio::test]
-    async fn test_acquire_reserves_when_below_watermark() {
-        let mgr = ByteBufferManager::new(1024, 500);
+    async fn test_acquire_reserves_when_below_capacity() {
+        let mgr = ByteBufferManager::new(1024);
         let permit = mgr.acquire(100, |_| {}).await;
         assert_eq!(permit.size(), 100);
         assert_eq!(mgr.allocated(), 100);
@@ -569,9 +565,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_acquire_reserves_atomically() {
-        // Once below the watermark, acquire reserves before returning, so
+        // Once below capacity, acquire reserves before returning, so
         // allocated reflects the reservation immediately (no TOCTOU gap).
-        let mgr = ByteBufferManager::new(1024, 200);
+        let mgr = ByteBufferManager::new(1024);
         let _p = mgr.force_acquire(100);
         let permit = mgr.acquire(50, |_| {}).await;
         assert_eq!(mgr.allocated(), 150);
@@ -579,19 +575,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_acquire_blocks_when_at_watermark() {
-        let mgr = ByteBufferManager::new(1024, 500);
-        let _permit = mgr.force_acquire(500);
+    async fn test_acquire_blocks_when_at_capacity() {
+        let mgr = ByteBufferManager::new(1024);
+        let _permit = mgr.force_acquire(1024);
 
-        // allocated=500, high_watermark=500 => should block (not strictly below).
+        // allocated=1024, capacity=1024 => should block (not strictly below).
         let result = timeout(Duration::from_millis(50), mgr.acquire(10, |_| {})).await;
         assert!(result.is_err(), "acquire should have blocked");
     }
 
     #[tokio::test]
     async fn test_acquire_unblocks_after_release() {
-        let mgr = ByteBufferManager::new(1024, 500);
-        let permit = mgr.force_acquire(600);
+        let mgr = ByteBufferManager::new(1024);
+        let permit = mgr.force_acquire(1024);
 
         let mgr_clone = mgr.clone();
         let handle = tokio::spawn(async move { mgr_clone.acquire(50, |_| {}).await });
@@ -599,7 +595,7 @@ mod tests {
         // Give the spawned task a moment to park.
         tokio::time::sleep(Duration::from_millis(10)).await;
 
-        // Release enough to drop below the high watermark.
+        // Release enough to drop below capacity.
         drop(permit);
 
         let acquired = timeout(Duration::from_millis(100), handle)
@@ -611,11 +607,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_acquire_does_not_invoke_on_block_when_reserved_immediately() {
-        let mgr = ByteBufferManager::new(1024, 500);
+        let mgr = ByteBufferManager::new(1024);
         let called = Arc::new(AtomicUsize::new(0));
         let called_clone = Arc::clone(&called);
 
-        // allocated=0 < watermark=500 => reserves without parking, so the
+        // allocated=0 < capacity => reserves without parking, so the
         // backpressure callback must not fire.
         let _permit = mgr
             .acquire(100, move |_| {
@@ -629,8 +625,8 @@ mod tests {
     async fn test_acquire_invokes_on_block_once_per_park() {
         // A reservation that parks exactly once invokes on_block exactly once
         // (with first=true) and does not fire again on the wake-up that reserves.
-        let mgr = ByteBufferManager::new(1024, 500);
-        let permit = mgr.force_acquire(600);
+        let mgr = ByteBufferManager::new(1024);
+        let permit = mgr.force_acquire(1024);
         let called = Arc::new(AtomicUsize::new(0));
         let first_flags = Arc::new(std::sync::Mutex::new(Vec::new()));
 
@@ -665,9 +661,9 @@ mod tests {
         // A reservation that must park more than once invokes on_block before
         // every park, with first=true only on the first. This is what lets a
         // blocked writer re-request relief on each park rather than once.
-        let mgr = ByteBufferManager::new(1024, 500);
-        let big = mgr.force_acquire(500);
-        let small = mgr.force_acquire(100); // allocated = 600, at capacity
+        let mgr = ByteBufferManager::new(1024);
+        let big = mgr.force_acquire(1024);
+        let small = mgr.force_acquire(100); // allocated = 1124, above capacity
         let first_flags = Arc::new(std::sync::Mutex::new(Vec::new()));
 
         let mgr_clone = mgr.clone();
@@ -684,9 +680,9 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(10)).await;
         assert_eq!(first_flags.lock().unwrap().as_slice(), &[true]);
 
-        // Drop only the small permit: allocated 600 -> 500, still >= watermark,
-        // but below capacity so waiters are notified. The waiter wakes, still
-        // cannot reserve, and parks again -> on_block fires with first=false.
+        // Drop only the small permit: allocated 1124 -> 1024, still at capacity
+        // so the waiter is notified but still cannot reserve, and parks again
+        // -> on_block fires with first=false.
         drop(small);
         tokio::time::sleep(Duration::from_millis(10)).await;
         assert_eq!(first_flags.lock().unwrap().as_slice(), &[true, false]);
@@ -705,47 +701,47 @@ mod tests {
 
     #[tokio::test]
     async fn test_await_capacity_returns_immediately_when_below() {
-        let mgr = ByteBufferManager::new(1024, 200);
+        let mgr = ByteBufferManager::new(1024);
         let _permit = mgr.force_acquire(100);
 
-        // allocated=100, high_watermark=200 => should return immediately
+        // allocated=100 < capacity => should return immediately
         let result = timeout(Duration::from_millis(50), mgr.await_capacity()).await;
         assert!(result.is_ok(), "should not have timed out");
     }
 
     #[tokio::test]
     async fn test_await_capacity_returns_immediately_when_zero() {
-        let mgr = ByteBufferManager::new(1024, 1);
+        let mgr = ByteBufferManager::new(1024);
 
-        // allocated=0, high_watermark=1 => should return immediately
+        // allocated=0 < capacity => should return immediately
         let result = timeout(Duration::from_millis(50), mgr.await_capacity()).await;
         assert!(result.is_ok(), "should not have timed out");
     }
 
     #[tokio::test]
-    async fn test_await_capacity_blocks_when_at_threshold() {
-        let mgr = ByteBufferManager::new(1024, 500);
-        let _permit = mgr.force_acquire(500);
+    async fn test_await_capacity_blocks_when_at_capacity() {
+        let mgr = ByteBufferManager::new(1024);
+        let _permit = mgr.force_acquire(1024);
 
-        // allocated=500, high_watermark=500 => should block (not strictly below)
+        // allocated=1024, capacity=1024 => should block (not strictly below)
         let result = timeout(Duration::from_millis(50), mgr.await_capacity()).await;
         assert!(result.is_err(), "should have timed out");
     }
 
     #[tokio::test]
     async fn test_await_capacity_blocks_when_above() {
-        let mgr = ByteBufferManager::new(1024, 500);
-        let _permit = mgr.force_acquire(600);
+        let mgr = ByteBufferManager::new(1024);
+        let _permit = mgr.force_acquire(1100);
 
-        // allocated=600, high_watermark=500 => should block
+        // allocated=1100 > capacity=1024 => should block
         let result = timeout(Duration::from_millis(50), mgr.await_capacity()).await;
         assert!(result.is_err(), "should have timed out");
     }
 
     #[tokio::test]
     async fn test_await_capacity_unblocks_after_release() {
-        let mgr = ByteBufferManager::new(1024, 500);
-        let permit = mgr.force_acquire(600);
+        let mgr = ByteBufferManager::new(1024);
+        let permit = mgr.force_acquire(1024);
 
         let mgr_clone = mgr.clone();
         let handle = tokio::spawn(async move {
@@ -755,7 +751,7 @@ mod tests {
         // Give the spawned task a moment to park.
         tokio::time::sleep(Duration::from_millis(10)).await;
 
-        // Release enough to drop below the high watermark.
+        // Release enough to drop below capacity.
         drop(permit);
 
         let result = timeout(Duration::from_millis(100), handle).await;
@@ -769,8 +765,8 @@ mod tests {
         // missed (no waiter was registered yet, so release does not notify)
         // and the waiter hangs forever.
         for _ in 0..200 {
-            let mgr = ByteBufferManager::new(1024, 500);
-            let permit = mgr.force_acquire(600);
+            let mgr = ByteBufferManager::new(1024);
+            let permit = mgr.force_acquire(1024);
             let mgr_clone = mgr.clone();
             let handle = tokio::spawn(async move {
                 mgr_clone.await_capacity().await;
@@ -785,12 +781,30 @@ mod tests {
 
     #[tokio::test]
     async fn test_await_capacity_does_not_reserve_bytes() {
-        let mgr = ByteBufferManager::new(1024, 200);
+        let mgr = ByteBufferManager::new(1024);
         let _permit = mgr.force_acquire(100);
 
         mgr.await_capacity().await;
 
         // After wait returns, available should be unchanged (no reservation made).
         assert_eq!(mgr.available(), 924);
+    }
+
+    #[tokio::test]
+    async fn test_at_capacity_false_below_capacity() {
+        let mgr = ByteBufferManager::new(1000);
+        let _permit = mgr.force_acquire(700);
+        assert!(!mgr.at_capacity());
+    }
+
+    #[tokio::test]
+    async fn test_at_capacity_true_at_and_above_capacity() {
+        let mgr = ByteBufferManager::new(1000);
+        let permit = mgr.force_acquire(1000);
+        assert!(mgr.at_capacity());
+        // Overshooting via force_acquire still reports at capacity.
+        let _extra = mgr.force_acquire(50);
+        assert!(mgr.at_capacity());
+        drop(permit);
     }
 }

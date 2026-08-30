@@ -554,7 +554,7 @@ impl DbInner {
     #[allow(clippy::disallowed_macros)]
     async fn await_backpressure_relief(
         &self,
-        progress: impl std::future::Future<Output = Result<(), SlateDBError>>,
+        progress: impl Future<Output = Result<(), SlateDBError>>,
     ) -> Result<(), SlateDBError> {
         let timeout_fut = self.system_clock.sleep(Duration::from_secs(30));
         let await_closed = async { Err(self.await_closed().await) };
@@ -5481,15 +5481,14 @@ mod tests {
         let fp_registry = Arc::new(FailPointRegistry::new());
         let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let path = Path::from("/tmp/test_kv_store");
-        // The high-watermark guard requires high_watermark >= l0_sst_size_bytes +
-        // per-memtable overhead; a tiny l0 keeps 512 KiB well above the floor.
+        // A tiny l0 keeps the 1 MiB write buffer well above the minimum size.
         let options = test_db_options(0, 4 * 1024, None);
         let metrics_recorder = Arc::new(DefaultMetricsRecorder::new());
         let db = Db::builder(path, object_store.clone())
             .with_settings(options)
             .with_fp_registry(fp_registry.clone())
             .with_metrics_recorder(metrics_recorder.clone())
-            .with_write_buffer_manager(ByteBufferManager::new(1024 * 1024, 512 * 1024))
+            .with_write_buffer_manager(ByteBufferManager::new(1024 * 1024))
             .build()
             .await
             .unwrap();
@@ -5502,10 +5501,11 @@ mod tests {
             .await
             .unwrap();
 
-        // Manually pin the write buffer at its high watermark so the next write
+        // Manually push the write buffer to its full capacity so the next write
         // applies (force_acquire soft-overshoots) then blocks in
-        // maybe_apply_backpressure until capacity frees.
-        let pressure_permit = db.inner.write_buffer_manager.force_acquire(512 * 1024);
+        // maybe_apply_backpressure until allocation drains below capacity.
+        // at_capacity() reports true once allocation reaches capacity.
+        let pressure_permit = db.inner.write_buffer_manager.force_acquire(1024 * 1024);
         assert!(db.inner.write_buffer_manager.at_capacity());
 
         let db_clone = db.clone();
@@ -5543,10 +5543,10 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_write_buffer_backpressure_waiter_exits_when_db_is_fenced() {
-        // Build a DB whose write buffer high_watermark is set so that a single
-        // put does NOT trip the capacity check, but a manual force_acquire
-        // afterwards pushes allocated bytes above the watermark. This ensures
-        // we exercise the write_buffer_manager at_capacity() path exclusively.
+        // Build a DB whose write buffer capacity is set so that a single put
+        // does NOT trip the capacity check, but a manual force_acquire afterwards
+        // pushes allocated bytes up to capacity. This ensures we exercise the
+        // write_buffer_manager at_capacity() path exclusively.
         let fp_registry = Arc::new(FailPointRegistry::new());
         let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let mut options = test_db_options(0, 4 * 1024, None);
@@ -5555,16 +5555,16 @@ mod tests {
         // (and greater than l0_sst_size_bytes, as required by config validation).
         options.max_unflushed_bytes = 1024 * 1024;
 
-        // high_watermark set above the per-table fixed overhead (SEQ_TRACKER ~128KiB
-        // + SKIPMAP_ENTRY overhead per entry). A small put won't trigger at_capacity(),
-        // but a subsequent force_acquire will push past it.
+        // Capacity is well above the per-table fixed overhead (SEQ_TRACKER ~128KiB
+        // + SKIPMAP_ENTRY overhead per entry). A small put won't trigger
+        // at_capacity(), but a subsequent force_acquire will push up to capacity.
         let db = Db::builder(
             "/tmp/test_write_buffer_backpressure_waiter_exits_when_db_is_fenced",
             object_store,
         )
         .with_settings(options)
         .with_fp_registry(fp_registry.clone())
-        .with_write_buffer_manager(ByteBufferManager::new(1024 * 1024, 512 * 1024))
+        .with_write_buffer_manager(ByteBufferManager::new(1024 * 1024))
         .build()
         .await
         .unwrap();
@@ -5591,9 +5591,9 @@ mod tests {
             1
         );
 
-        // Manually push the write buffer above the high_watermark so that
-        // at_capacity() returns true. Hold the permit to keep it allocated.
-        let _pressure_permit = db.inner.write_buffer_manager.force_acquire(512 * 1024);
+        // Manually push the write buffer to its full capacity so that
+        // at_capacity() reports true. Hold the permit to keep it allocated.
+        let _pressure_permit = db.inner.write_buffer_manager.force_acquire(1024 * 1024);
 
         // Set up a deterministic notification for when backpressure is applied.
         let backpressure_notify = Arc::new(tokio::sync::Notify::new());
@@ -10791,25 +10791,24 @@ mod tests {
             .unwrap();
 
         // On recovery, one complete WAL SST replays into a table whose write-
-        // buffer charge (base KVTable overhead + payload) exceeds a tight high
-        // watermark. Replay must integrate and freeze that table *before*
-        // waiting on `await_capacity`; otherwise open deadlocks with the budget
-        // held by an unfrozen active/local table and nothing for the flusher to
-        // drain.
+        // buffer charge (base KVTable overhead + payload) is accounted against
+        // the budget. Replay must integrate and freeze that table before waiting
+        // on `await_capacity`; otherwise open deadlocks with the budget held by
+        // an unfrozen active/local table and nothing for the flusher to drain.
+        //
+        // NOTE: the separate high-watermark threshold has been removed for now,
+        // so backpressure triggers only at the full `capacity`. With the
+        // `MIN_WRITE_BUFFER_SIZE` floor there is no longer a tight sub-capacity
+        // threshold to reproduce the original deadlock; this now primarily
+        // validates that WAL replay recovers and writes resume.
         let l0_sst_size_bytes = 1024;
         let mut replay_settings = test_db_options(0, l0_sst_size_bytes, None);
         replay_settings.flush_interval = None;
-        let high_watermark = l0_sst_size_bytes
-            + crate::mem_table::KVTable::SEQ_TRACKER_OVERHEAD
-            + crate::mem_table::KVTable::KVTABLE_SIZE;
         let recovered = tokio::time::timeout(
             Duration::from_secs(5),
             Db::builder(path, object_store)
                 .with_settings(replay_settings)
-                .with_write_buffer_manager(ByteBufferManager::new(
-                    MIN_WRITE_BUFFER_SIZE,
-                    high_watermark,
-                ))
+                .with_write_buffer_manager(ByteBufferManager::new(MIN_WRITE_BUFFER_SIZE))
                 .build(),
         )
         .await

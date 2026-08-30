@@ -383,12 +383,12 @@ impl ImmutableMemtable {
 impl KVTable {
     /// Fixed size of a `SequencedKey` struct: one `Bytes` handle (for `user_key`)
     /// plus a `u64` sequence number. This is the key type stored in the SkipMap.
-    pub(crate) const SEQUENCED_KEY_SIZE: usize = std::mem::size_of::<SequencedKey>();
+    pub(crate) const SEQUENCED_KEY_SIZE: usize = size_of::<SequencedKey>();
 
     /// Fixed size of the `KVTable` struct itself (all inline fields, Arc
     /// handles, atomics, etc.). Used when accounting for the base cost of
     /// creating a new memtable.
-    pub(crate) const KVTABLE_SIZE: usize = std::mem::size_of::<KVTable>();
+    pub(crate) const KVTABLE_SIZE: usize = size_of::<KVTable>();
 
     /// Estimated per-entry overhead for the crossbeam SkipMap node:
     /// tower pointers (avg height ~1.3 at p=0.5), node header,
@@ -397,7 +397,7 @@ impl KVTable {
 
     /// The SequenceTracker pre-allocates two Vec::with_capacity(8192) vectors
     /// (one for u64 sequence numbers, one for i64 timestamps).
-    pub(crate) const SEQ_TRACKER_OVERHEAD: usize = 8192 * std::mem::size_of::<u64>() * 2;
+    pub(crate) const SEQ_TRACKER_OVERHEAD: usize = 8192 * size_of::<u64>() * 2;
 
     // The theoretical minimum write-buffer capacity required to create a
     // KVTable and write at least one entry without deadlocking on backpressure:
@@ -594,7 +594,7 @@ impl KVTable {
         // Acquire per-entry skiplist overhead from the buffer manager.
         let entry_overhead = Self::SKIPMAP_ENTRY_OVERHEAD
             + Self::SEQUENCED_KEY_SIZE
-            + std::mem::size_of::<RowEntry>();
+            + size_of::<RowEntry>();
         self.write_buffer_manager
             .force_expand(&self.write_buffer_permit, entry_overhead);
 

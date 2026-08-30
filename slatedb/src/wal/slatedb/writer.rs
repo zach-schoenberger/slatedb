@@ -414,7 +414,7 @@ impl WalBuffer {
             last_seq: 0,
             entries_size: 0,
             write_buffer_manager: write_buffer_manager.clone(),
-            write_buffer_permit: write_buffer_manager.force_acquire(std::mem::size_of::<Self>()),
+            write_buffer_permit: write_buffer_manager.force_acquire(size_of::<Self>()),
         }
     }
 
@@ -426,7 +426,7 @@ impl WalBuffer {
         self.entries.push_back(entry);
         let cap_after = self.entries.capacity();
 
-        let growth_bytes = (cap_after - cap_before) * std::mem::size_of::<RowEntry>();
+        let growth_bytes = (cap_after - cap_before) * size_of::<RowEntry>();
         if growth_bytes > 0 {
             self.write_buffer_manager
                 .force_expand(&self.write_buffer_permit, growth_bytes);

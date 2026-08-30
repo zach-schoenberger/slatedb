@@ -404,7 +404,7 @@ mod tests {
         let (write_tx, _) =
             crate::utils::SafeSender::unbounded_channel(status_manager.result_reader());
         let write_buffer_manager =
-            ByteBufferManager::new(settings.max_unflushed_bytes, settings.max_unflushed_bytes);
+            ByteBufferManager::new(settings.max_unflushed_bytes);
         let wal_writer = Box::new(FakeWalWriter::new(0));
         Arc::new(
             DbInner::new(

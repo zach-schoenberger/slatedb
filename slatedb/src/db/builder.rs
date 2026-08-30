@@ -153,7 +153,6 @@ use crate::garbage_collector::{GarbageCollector, GcFilter};
 use crate::instrumented_object_store::{InstrumentedObjectStore, ObjectStoreComponent};
 use crate::manifest::store::{ManifestStore, StoredManifest};
 use crate::manifest::ManifestCore;
-use crate::mem_table::KVTable;
 use crate::memtable_flusher::MemtableFlusher;
 use crate::merge_operator::MergeOperatorType;
 use crate::object_stores::ObjectStoreType;
@@ -643,52 +642,15 @@ impl<P: Into<Path>> DbBuilder<P> {
             system_clock.clone(),
         ));
 
-        let write_buffer_manager = self.write_buffer_manager.unwrap_or_else(|| {
-            ByteBufferManager::new(
-                self.settings.max_unflushed_bytes,
-                self.settings.max_unflushed_bytes,
-            )
-        });
+        let write_buffer_manager = self
+            .write_buffer_manager
+            .unwrap_or_else(|| ByteBufferManager::new(self.settings.max_unflushed_bytes));
         if write_buffer_manager.capacity() < MIN_WRITE_BUFFER_SIZE {
             return Err(crate::Error::invalid(
                 format!(
                     "invalid configuration: write_buffer_manager capacity ({}) must be at least MIN_WRITE_BUFFER_SIZE ({})",
                     write_buffer_manager.capacity(),
                     MIN_WRITE_BUFFER_SIZE,
-                )
-            ));
-        }
-        if write_buffer_manager.high_watermark > write_buffer_manager.capacity() {
-            return Err(crate::Error::invalid(
-                format!(
-                    "invalid configuration: write_buffer_manager high watermark ({}) must not exceed capacity ({})",
-                    write_buffer_manager.high_watermark,
-                    write_buffer_manager.capacity(),
-                )
-            ));
-        }
-        // The write buffer's high watermark must leave room for a single active
-        // memtable to reach `l0_sst_size_bytes` of encoded entries (which is what
-        // triggers a freeze) before the byte budget hits the watermark. The
-        // budget also counts the fixed per-memtable overhead
-        // (`SEQ_TRACKER_OVERHEAD + KVTABLE_SIZE`) that the freeze threshold does
-        // not, so the watermark must clear `l0_sst_size_bytes` by at least that
-        // overhead. Otherwise the buffer could sit at capacity with only an
-        // unfrozen active memtable and never make progress (nothing frees the
-        // budget until the next write arrives, and a backpressured writer sends
-        // none). Note per-entry SkipMap overhead is not covered here, so tiny-value
-        // workloads still benefit from a proactive freeze on backpressure.
-        let min_high_watermark = self
-            .settings
-            .l0_sst_size_bytes
-            .saturating_add(KVTable::SEQ_TRACKER_OVERHEAD)
-            .saturating_add(KVTable::KVTABLE_SIZE);
-        if write_buffer_manager.high_watermark < min_high_watermark {
-            return Err(crate::Error::invalid(
-                format!(
-                    "invalid configuration: write_buffer_manager high watermark ({}) must be at least l0_sst_size_bytes + per-memtable overhead ({})",
-                    write_buffer_manager.high_watermark,
-                    min_high_watermark,
                 )
             ));
         }
@@ -2601,7 +2563,7 @@ mod tests {
             max_unflushed_bytes: 1024 * 1024,
             ..Settings::default()
         })
-        .with_write_buffer_manager(ByteBufferManager::new(capacity, capacity))
+        .with_write_buffer_manager(ByteBufferManager::new(capacity))
         .build()
         .await
         .expect("build with MIN_WRITE_BUFFER_SIZE should succeed");
@@ -2627,7 +2589,7 @@ mod tests {
             "test_write_buffer_below_minimum_is_rejected",
             Arc::new(InMemory::new()),
         )
-        .with_write_buffer_manager(ByteBufferManager::new(capacity, 0))
+        .with_write_buffer_manager(ByteBufferManager::new(capacity))
         .build()
         .await;
 
@@ -2635,107 +2597,6 @@ mod tests {
             result.is_err(),
             "build should reject capacity below MIN_WRITE_BUFFER_SIZE"
         );
-    }
-
-    /// High watermark above capacity is rejected: waiters park on the watermark
-    /// while the budget's hard ceiling is `capacity`, so HW > capacity is a
-    /// nonsensical configuration.
-    #[tokio::test]
-    async fn test_write_buffer_high_watermark_above_capacity_is_rejected() {
-        use crate::byte_buffer_manager::ByteBufferManager;
-
-        let result = crate::Db::builder(
-            "test_write_buffer_high_watermark_above_capacity_is_rejected",
-            Arc::new(InMemory::new()),
-        )
-        .with_settings(Settings {
-            l0_sst_size_bytes: 256 * 1024,
-            max_unflushed_bytes: 8 * 1024 * 1024,
-            ..Settings::default()
-        })
-        .with_write_buffer_manager(ByteBufferManager::new(1024 * 1024, 8 * 1024 * 1024))
-        .build()
-        .await;
-
-        assert!(
-            result.is_err(),
-            "build should reject high watermark above capacity"
-        );
-    }
-
-    /// Validates that a write-buffer high watermark below `l0_sst_size_bytes` is
-    /// rejected. Backpressure only waits for capacity to free up; the batch
-    /// writer won't freeze the active memtable until it reaches
-    /// `l0_sst_size_bytes`, so a lower watermark could sit at capacity with an
-    /// unfrozen active memtable and stall until the next write.
-    #[tokio::test]
-    async fn test_write_buffer_high_watermark_below_l0_sst_size_is_rejected() {
-        use crate::byte_buffer_manager::ByteBufferManager;
-
-        let result = crate::Db::builder(
-            "test_write_buffer_high_watermark_below_l0_sst_size_is_rejected",
-            Arc::new(InMemory::new()),
-        )
-        .with_settings(Settings {
-            l0_sst_size_bytes: 2 * 1024 * 1024,
-            max_unflushed_bytes: 8 * 1024 * 1024,
-            ..Settings::default()
-        })
-        // Capacity satisfies MIN_WRITE_BUFFER_SIZE, but the high watermark
-        // (1 MiB) is below l0_sst_size_bytes (2 MiB).
-        .with_write_buffer_manager(ByteBufferManager::new(8 * 1024 * 1024, 1024 * 1024))
-        .build()
-        .await;
-
-        assert!(
-            result.is_err(),
-            "build should reject high watermark below l0_sst_size_bytes"
-        );
-    }
-
-    /// The high watermark must clear `l0_sst_size_bytes` by the fixed
-    /// per-memtable overhead. A watermark equal to `l0_sst_size_bytes` is
-    /// rejected (the buffer could reach capacity before the active memtable
-    /// grows enough to freeze); adding the overhead makes it valid.
-    #[tokio::test]
-    async fn test_write_buffer_high_watermark_requires_overhead_margin() {
-        use crate::byte_buffer_manager::ByteBufferManager;
-        use crate::mem_table::KVTable;
-
-        let l0 = 256 * 1024;
-        let overhead = KVTable::SEQ_TRACKER_OVERHEAD + KVTable::KVTABLE_SIZE;
-
-        let rejected = crate::Db::builder(
-            "test_write_buffer_high_watermark_requires_overhead_margin_rejected",
-            Arc::new(InMemory::new()),
-        )
-        .with_settings(Settings {
-            l0_sst_size_bytes: l0,
-            max_unflushed_bytes: 8 * 1024 * 1024,
-            ..Settings::default()
-        })
-        .with_write_buffer_manager(ByteBufferManager::new(8 * 1024 * 1024, l0))
-        .build()
-        .await;
-        assert!(
-            rejected.is_err(),
-            "high watermark equal to l0_sst_size_bytes should be rejected"
-        );
-
-        let accepted = crate::Db::builder(
-            "test_write_buffer_high_watermark_requires_overhead_margin_accepted",
-            Arc::new(InMemory::new()),
-        )
-        .with_settings(Settings {
-            l0_sst_size_bytes: l0,
-            max_unflushed_bytes: 8 * 1024 * 1024,
-            ..Settings::default()
-        })
-        .with_write_buffer_manager(ByteBufferManager::new(8 * 1024 * 1024, l0 + overhead))
-        .build()
-        .await;
-        let db = accepted.expect("high watermark of l0 + overhead should be accepted");
-        db.close().await.unwrap();
     }
 
     #[tokio::test]
