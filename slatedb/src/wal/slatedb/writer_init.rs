@@ -1,14 +1,10 @@
 use crate::byte_buffer_manager::ByteBufferManager;
 use crate::dispatcher::MessageHandlerExecutor;
 use crate::error::SlateDBError;
-use crate::iter::IterationOrder;
 use crate::manifest::Manifest;
-use crate::sst_iter::SstIteratorOptions;
-use crate::tablestore::TableStore;
 use crate::utils::WatchableOnceCellReader;
-use crate::wal::slatedb::iterator::{
-    SlateDbWalIterator, SlateDbWalIteratorOptions, WalIteratorEndBound,
-};
+use crate::wal::slatedb::iterator::{SlateDbWalIterator, WalIteratorEndBound};
+use crate::wal::slatedb::reader::SlateDbWalReaderOptions;
 use crate::wal::slatedb::writer::SlateDbWalWriter;
 use crate::wal::{WalError, WriterInitResult, WriterManifest};
 use crate::{wal, Settings};
@@ -17,6 +13,8 @@ use fail_parallel::{fail_point_send, FailPointTx};
 use slatedb_common::metrics::MetricsRecorderHelper;
 use std::sync::Arc;
 use std::time::Duration;
+
+use super::store::WalTableStore;
 
 #[derive(Clone, Copy)]
 pub(crate) struct SlateDbWalWriterInitOptions {
@@ -38,7 +36,7 @@ impl From<&Settings> for SlateDbWalWriterInitOptions {
 pub(crate) struct SlateDbWalWriterInit {
     closed_result_reader: WatchableOnceCellReader<Result<(), SlateDBError>>,
     recorder: MetricsRecorderHelper,
-    table_store: Arc<TableStore>,
+    table_store: Arc<WalTableStore>,
     max_wal_bytes_size: usize,
     max_wal_flushes_before_l0_flush: u64,
     max_flush_interval: Option<Duration>,
@@ -53,7 +51,7 @@ impl SlateDbWalWriterInit {
     pub(crate) async fn load(
         closed_result_reader: WatchableOnceCellReader<Result<(), SlateDBError>>,
         recorder: MetricsRecorderHelper,
-        table_store: Arc<TableStore>,
+        table_store: Arc<WalTableStore>,
         options: SlateDbWalWriterInitOptions,
         manifest: &Manifest,
         task_executor: Arc<MessageHandlerExecutor>,
@@ -125,19 +123,11 @@ impl wal::WriterInit for SlateDbWalWriterInit {
                 let replay_iterator = SlateDbWalIterator::range(
                     replay_after_wal_id + 1,
                     WalIteratorEndBound::Exclusive(empty_wal_id + 1),
-                    SlateDbWalIteratorOptions {
-                        sst_batch_size: 4,
-                        sst_iter_options: SstIteratorOptions {
-                            max_fetch_tasks: 2,
-                            blocks_to_fetch: 256,
-                            cache_blocks: false,
-                            cache_metadata: false,
-                            eager_spawn: true,
-                            order: IterationOrder::Ascending,
-                            prefix: None,
-                            filter_context: None,
-                        },
-                    },
+                    SlateDbWalReaderOptions {
+                        read_ahead_bytes: self.max_wal_bytes_size,
+                        ..SlateDbWalReaderOptions::default()
+                    }
+                    .into(),
                     self.table_store.clone(),
                 )?;
                 let wal_writer = SlateDbWalWriter::start_new(

@@ -164,6 +164,7 @@ use crate::utils::SafeSender;
 use crate::utils::WatchableOnceCell;
 use crate::wal;
 use crate::wal::slatedb::admin::SlateDbWalAdmin;
+use crate::wal::slatedb::store::WalTableStore;
 use crate::wal::wal_disabled::DisabledWalObserver;
 use crate::wal::{WalAdmin, WalGc, WalObserver};
 use slatedb_common::clock::DefaultSystemClock;
@@ -519,7 +520,11 @@ impl<P: Into<Path>> DbBuilder<P> {
         );
         let retrying_wal_object_store: Option<Arc<dyn ObjectStore>> = self
             .wal_object_store
+            .clone()
             .map(|s| wrap_object_store(s, ObjectStoreComponent::Db, ObjectStoreType::Wal));
+        let wal_object_store = retrying_wal_object_store
+            .clone()
+            .unwrap_or_else(|| retrying_main_object_store.clone());
 
         // Log the database opening
         if let Ok(settings_json) = self.settings.to_json_string() {
@@ -611,6 +616,13 @@ impl<P: Into<Path>> DbBuilder<P> {
             TableStoreKind::Main,
             self.block_cache_policy.clone(),
         ));
+        let wal_store = Arc::new(WalTableStore::new_with_fp_registry(
+            wal_object_store,
+            sst_format.clone(),
+            path_resolver.clone(),
+            self.fp_registry.clone(),
+            TableStoreKind::Main,
+        ));
 
         // Initialize the database
         let stored_manifest = match latest_manifest {
@@ -658,7 +670,7 @@ impl<P: Into<Path>> DbBuilder<P> {
         let fencer = WriterFencer::new(
             status_manager.result_reader(),
             recorder.clone(),
-            table_store.clone(),
+            wal_store.clone(),
             &self.settings,
             system_clock.clone(),
             task_executor.clone(),
@@ -1876,7 +1888,7 @@ impl<P: Into<Path>> DbReaderBuilder<P> {
         .await?;
         let maybe_cached_object_store: Arc<dyn ObjectStore> = match &maybe_cached {
             Some(cached) => Arc::clone(cached) as Arc<dyn ObjectStore>,
-            None => self.object_store,
+            None => self.object_store.clone(),
         };
 
         let retrying_object_store = instrumented_retrying_object_store(
@@ -1889,18 +1901,20 @@ impl<P: Into<Path>> DbReaderBuilder<P> {
             self.options.object_store_max_retries,
         );
 
-        let retrying_wal_object_store: Option<Arc<dyn ObjectStore>> =
-            self.wal_object_store.map(|s| {
-                instrumented_retrying_object_store(
-                    s,
-                    &recorder,
-                    ObjectStoreComponent::Reader,
-                    ObjectStoreType::Wal,
-                    self.rand.clone(),
-                    self.system_clock.clone(),
-                    self.options.object_store_max_retries,
-                )
-            });
+        let retrying_wal_object_store = self.wal_object_store.map(|wal_object_store| {
+            instrumented_retrying_object_store(
+                wal_object_store,
+                &recorder,
+                ObjectStoreComponent::Reader,
+                ObjectStoreType::Wal,
+                self.rand.clone(),
+                self.system_clock.clone(),
+                self.options.object_store_max_retries,
+            )
+        });
+        let wal_object_store = retrying_wal_object_store
+            .clone()
+            .unwrap_or_else(|| retrying_object_store.clone());
 
         // Validate WAL object store configuration.
         let manifest_store = Arc::new(ManifestStore::new(&path, retrying_object_store.clone()));
@@ -1946,19 +1960,28 @@ impl<P: Into<Path>> DbReaderBuilder<P> {
             ..SsTableFormat::default()
         };
         let path_resolver = PathResolver::new_with_external_ssts(path.clone(), external_ssts);
+        let fp_registry = Arc::new(FailPointRegistry::new());
         let table_store = Arc::new(TableStore::new_with_fp_registry(
             ObjectStores::new(retrying_object_store, retrying_wal_object_store),
-            sst_format,
-            path_resolver,
-            Arc::new(FailPointRegistry::new()),
+            sst_format.clone(),
+            path_resolver.clone(),
+            Arc::clone(&fp_registry),
             wrapped_cache,
             TableStoreKind::Reader,
             BlockCachePolicy::default(),
+        ));
+        let wal_store = Arc::new(WalTableStore::new_with_fp_registry(
+            wal_object_store,
+            sst_format,
+            path_resolver,
+            fp_registry,
+            TableStoreKind::Reader,
         ));
 
         let reader = DbReader::open_internal(
             manifest_store,
             table_store,
+            wal_store,
             self.mode,
             self.wal_reader,
             self.merge_operator,

@@ -8,15 +8,12 @@ use futures::{future::join_all, StreamExt};
 use log::{debug, warn};
 use object_store::buffered::BufWriter;
 use object_store::path::Path;
-use object_store::{
-    Extensions, GetOptions, GetRange, ObjectStore, ObjectStoreExt, PutMode, PutOptions,
-};
+use object_store::{GetOptions, ObjectStore, ObjectStoreExt, PutMode, PutOptions};
 use slatedb_common::object_metadata::IdentifiedObjectMetadata;
 use slatedb_common::ObjectMetadata;
 use tokio::io::AsyncWriteExt;
 use ulid::Ulid;
 
-use crate::blob::ReadOnlyBlob;
 use crate::block_cache_policy::{should_cache_data_block, BlockCachePolicy};
 use crate::db_cache::CacheTarget;
 use crate::db_cache::{CacheLoader, CachedEntry, CachedKey, DbCache, EncodedCachedFilter};
@@ -26,11 +23,15 @@ use crate::filter_policy::NamedFilter;
 use crate::flatbuffer_types::SsTableIndexOwned;
 use crate::format::block::Block;
 use crate::format::sst::{EncodedSsTable, EncodedSsTableBlock, SsTableFormat};
+use crate::iter::IterationOrder;
 use crate::object_store_tag::ObjectStoreCallTag;
 pub(crate) use crate::object_store_tag::TableStoreKind;
 use crate::object_stores::{ObjectStoreType, ObjectStores};
 use crate::paths::PathResolver;
 use crate::sst_builder::EncodedSsTableBuilder;
+#[cfg(test)]
+use crate::sst_io::MAX_VALIDATION_RETRIES;
+use crate::sst_io::{read_obj as read_sst_obj, read_with_validation_retry, ReadOnlyObject};
 use crate::sst_stats::SstStats;
 use crate::types::RowEntry;
 use crate::wal::slatedb::sst_builder::EncodedWalSsTableBuilder;
@@ -47,78 +48,6 @@ pub(crate) struct TableStore {
     block_cache_policy: BlockCachePolicy,
     /// Which component owns this store. Tagged on compacted-SST calls.
     kind: TableStoreKind,
-}
-
-struct ReadOnlyObject {
-    object_store: Arc<dyn ObjectStore>,
-    path: Path,
-    tag: ObjectStoreCallTag,
-}
-
-impl ReadOnlyObject {
-    fn extensions(&self) -> Extensions {
-        self.tag.into()
-    }
-}
-
-/// Reads from a [`ReadOnlyObject`] for an SST `$id`, with validation-retry.
-///
-/// It expands to the retry-wrapper future, so callers `.await` it.
-/// This is used instead of repeating the same retry logic for every individual
-/// read from an SST object.
-macro_rules! read_obj {
-    ($store:expr, $id:expr, |$obj:ident| $read:expr) => {{
-        let object_store = $store.object_stores.store_for($id);
-        let path = $store.path($id);
-        read_with_validation_retry(
-            ObjectStoreCallTag::new($store.kind, SstType::from($id)),
-            move |tag| {
-                let object_store = object_store.clone();
-                let path = path.clone();
-                async move {
-                    let $obj = ReadOnlyObject {
-                        object_store,
-                        path,
-                        tag,
-                    };
-                    $read.await.map_err(|e| e.with_path(&$obj.path))
-                }
-            },
-        )
-    }};
-}
-
-impl ReadOnlyBlob for ReadOnlyObject {
-    async fn len(&self) -> Result<u64, SlateDBError> {
-        let opts = GetOptions {
-            head: true,
-            extensions: self.extensions(),
-            ..GetOptions::default()
-        };
-        let result = self.object_store.get_opts(&self.path, opts).await?;
-        Ok(result.meta.size)
-    }
-
-    async fn read_range(&self, range: Range<u64>) -> Result<Bytes, SlateDBError> {
-        let opts = GetOptions {
-            range: Some(GetRange::Bounded(range)),
-            extensions: self.extensions(),
-            ..GetOptions::default()
-        };
-        let result = self.object_store.get_opts(&self.path, opts).await?;
-        let bytes = result.bytes().await?;
-        Ok(bytes)
-    }
-
-    async fn read(&self) -> Result<Bytes, SlateDBError> {
-        let opts = GetOptions {
-            extensions: self.extensions(),
-            ..GetOptions::default()
-        };
-        let result = self.object_store.get_opts(&self.path, opts).await?;
-        let bytes = result.bytes().await?;
-        Ok(bytes)
-    }
 }
 
 impl TableStore {
@@ -161,12 +90,6 @@ impl TableStore {
         }
     }
 
-    /// Get the number of blocks for a size specified in bytes.
-    /// The returned value will be rounded down to the nearest block.
-    pub(crate) fn bytes_to_blocks(&self, bytes: usize) -> usize {
-        bytes.div_ceil(self.sst_format.block_size)
-    }
-
     /// Find the highest WAL SST id present in the object store at or above
     /// `start_after + 1`, returning `start_after` if none exist.
     ///
@@ -184,6 +107,7 @@ impl TableStore {
     /// Relies on the fencing protocol's contiguity invariant: "id exists" is
     /// monotone-decreasing in id, so binary search is sound. Total HEAD count
     /// is `O(log N)` for a gap of size N, vs `O(N)` for a windowed scan.
+    #[allow(unused)]
     pub(crate) async fn last_seen_wal_id(&self, start_after: u64) -> Result<u64, SlateDBError> {
         fail_point!(Arc::clone(&self.fp_registry), "probe-wal-ssts", |_| {
             Err(SlateDBError::from(std::io::Error::other("oops")))
@@ -320,6 +244,7 @@ impl TableStore {
         Ok(wal_list)
     }
 
+    #[allow(unused)]
     pub(crate) async fn next_wal_sst_id(
         &self,
         wal_id_last_compacted: u64,
@@ -348,6 +273,7 @@ impl TableStore {
         self.sst_format.table_builder()
     }
 
+    #[allow(unused)]
     pub(crate) fn wal_table_builder(&self) -> EncodedWalSsTableBuilder {
         self.sst_format.wal_table_builder()
     }
@@ -480,6 +406,7 @@ impl TableStore {
     ///
     /// Uses create-if-absent semantics so any existing WAL object at this ID
     /// fences the writer by returning [`SlateDBError::Fenced`].
+    #[allow(unused)]
     pub(crate) async fn write_wal_fence(&self, wal_id: u64) -> Result<(), SlateDBError> {
         let id = SsTableId::Wal(wal_id);
         fail_point!(self.fp_registry.clone(), "write-wal-sst-io-error", |_| {
@@ -613,15 +540,25 @@ impl TableStore {
     }
 
     pub(crate) async fn open_sst(&self, id: &SsTableId) -> Result<SsTableHandle, SlateDBError> {
-        let (info, version) =
-            read_obj!(self, id, |obj| self.sst_format.read_info_and_version(&obj)).await?;
+        let (info, version) = read_sst_obj!(
+            self.object_stores.store_for(id),
+            self.path(id),
+            ObjectStoreCallTag::new(self.kind, SstType::from(id)),
+            |obj| self.sst_format.read_info_and_version(&obj)
+        )
+        .await?;
         Ok(SsTableHandle::new(*id, version, info))
     }
 
     #[cfg(test)]
     pub(crate) async fn read_sst_version(&self, id: &SsTableId) -> Result<u16, SlateDBError> {
-        let (_, version) =
-            read_obj!(self, id, |obj| self.sst_format.read_info_and_version(&obj)).await?;
+        let (_, version) = read_sst_obj!(
+            self.object_stores.store_for(id),
+            self.path(id),
+            ObjectStoreCallTag::new(self.kind, SstType::from(id)),
+            |obj| self.sst_format.read_info_and_version(&obj)
+        )
+        .await?;
         Ok(version)
     }
 
@@ -675,9 +612,12 @@ impl TableStore {
                 }
             }
         }
-        read_obj!(self, &handle.id, |obj| self
-            .sst_format
-            .read_filters(&handle.info, &obj))
+        read_sst_obj!(
+            self.object_stores.store_for(&handle.id),
+            self.path(&handle.id),
+            ObjectStoreCallTag::new(self.kind, SstType::from(&handle.id)),
+            |obj| self.sst_format.read_filters(&handle.info, &obj)
+        )
         .await
     }
 
@@ -708,9 +648,12 @@ impl TableStore {
                 return Ok(Some(stats.as_ref().clone()));
             }
         }
-        read_obj!(self, &handle.id, |obj| self
-            .sst_format
-            .read_stats(&handle.info, &obj))
+        read_sst_obj!(
+            self.object_stores.store_for(&handle.id),
+            self.path(&handle.id),
+            ObjectStoreCallTag::new(self.kind, SstType::from(&handle.id)),
+            |obj| self.sst_format.read_stats(&handle.info, &obj)
+        )
         .await
     }
 
@@ -739,9 +682,12 @@ impl TableStore {
                 return Ok(index);
             }
         }
-        let index = read_obj!(self, &handle.id, |obj| self
-            .sst_format
-            .read_index(&handle.info, &obj))
+        let index = read_sst_obj!(
+            self.object_stores.store_for(&handle.id),
+            self.path(&handle.id),
+            ObjectStoreCallTag::new(self.kind, SstType::from(&handle.id)),
+            |obj| self.sst_format.read_index(&handle.info, &obj)
+        )
         .await?;
         Ok(Arc::new(index))
     }
@@ -868,6 +814,57 @@ impl TableStore {
             },
         )
         .await
+    }
+
+    /// Returns the smallest contiguous block range, starting at `first_block` in
+    /// `order`, whose encoded size is at least `target_bytes`. If the SST boundary
+    /// is reached first, all remaining blocks in that direction are returned.
+    pub(crate) fn block_range_for_target_bytes(
+        &self,
+        handle: &SsTableHandle,
+        index: &SsTableIndexOwned,
+        first_block: usize,
+        target_bytes: usize,
+        order: IterationOrder,
+    ) -> Range<usize> {
+        assert!(target_bytes > 0);
+
+        let index = index.borrow();
+        let block_meta = index.block_meta();
+        let num_blocks = block_meta.len();
+        assert!(first_block < num_blocks);
+
+        let target_bytes = u64::try_from(target_bytes).unwrap_or(u64::MAX);
+        match order {
+            IterationOrder::Ascending => {
+                let mut blocks = first_block..first_block + 1;
+                loop {
+                    let byte_range =
+                        self.sst_format
+                            .block_range(blocks.clone(), &handle.info, &index);
+                    if byte_range.end.saturating_sub(byte_range.start) >= target_bytes
+                        || blocks.end == num_blocks
+                    {
+                        return blocks;
+                    }
+                    blocks.end += 1;
+                }
+            }
+            IterationOrder::Descending => {
+                let mut blocks = first_block..first_block + 1;
+                loop {
+                    let byte_range =
+                        self.sst_format
+                            .block_range(blocks.clone(), &handle.info, &index);
+                    if byte_range.end.saturating_sub(byte_range.start) >= target_bytes
+                        || blocks.start == 0
+                    {
+                        return blocks;
+                    }
+                    blocks.start -= 1;
+                }
+            }
+        }
     }
 
     /// Reads specified blocks from an SSTable using the provided index.
@@ -1013,12 +1010,17 @@ impl TableStore {
         handle: &SsTableHandle,
         block: usize,
     ) -> Result<Block, SlateDBError> {
-        read_obj!(self, &handle.id, |obj| async {
-            let index = self.sst_format.read_index(&handle.info, &obj).await?;
-            self.sst_format
-                .read_block(&handle.info, &index, block, &obj)
-                .await
-        })
+        read_sst_obj!(
+            self.object_stores.store_for(&handle.id),
+            self.path(&handle.id),
+            ObjectStoreCallTag::new(self.kind, SstType::from(&handle.id)),
+            |obj| async {
+                let index = self.sst_format.read_index(&handle.info, &obj).await?;
+                self.sst_format
+                    .read_block(&handle.info, &index, block, &obj)
+                    .await
+            }
+        )
         .await
     }
 
@@ -1035,6 +1037,7 @@ impl TableStore {
             .estimate_encoded_size_compacted(num_entries, size_entries)
     }
 
+    #[allow(unused)]
     pub(crate) fn estimate_encoded_size_wal(
         &self,
         num_entries: usize,
@@ -1109,6 +1112,7 @@ impl TableStore {
     }
 }
 
+#[allow(unused)]
 async fn wal_object_exists(
     object_store: &Arc<dyn ObjectStore>,
     path: &Path,
@@ -1118,45 +1122,6 @@ async fn wal_object_exists(
         Err(object_store::Error::NotFound { .. }) => Ok(false),
         Err(e) => Err(SlateDBError::from(e)),
     }
-}
-
-/// Number of additional attempts after an SST read fails validation. The
-/// reissue carries a [`RetryReason`](crate::error::RetryReason) so a caching
-/// wrapper drops its local copy.
-const MAX_VALIDATION_RETRIES: usize = 1;
-
-/// Runs `read` with the source/type `tag`, reissuing it with a
-/// [`RetryReason`](crate::error::RetryReason) set on the tag when the result is
-/// a recoverable validation failure.
-///
-/// This is done to enable object store wrappers like a cache to know when
-/// to drop a cached entry that failed validation and retry the read from the
-/// source of truth (object store) instead of repeatedly returning the same
-/// invalid cached entry.
-async fn read_with_validation_retry<T, Fut>(
-    mut tag: ObjectStoreCallTag,
-    mut read: impl FnMut(ObjectStoreCallTag) -> Fut,
-) -> Result<T, SlateDBError>
-where
-    Fut: std::future::Future<Output = Result<T, SlateDBError>>,
-{
-    for _ in 0..MAX_VALIDATION_RETRIES {
-        let result = read(tag).await;
-        match result {
-            Err(ref err) => match err.maybe_validation_retry_reason() {
-                Some(reason) => {
-                    warn!(
-                        "retrying SST read after validation failure [reason={:?}, error={}]",
-                        reason, err
-                    );
-                    tag.retry = Some(reason);
-                }
-                None => return result,
-            },
-            Ok(_) => return result,
-        }
-    }
-    read(tag).await
 }
 
 /// Builds a [`BufWriter`] whose upload carries `tag` in its extensions.
@@ -1311,10 +1276,9 @@ mod tests {
     use futures::future;
     use futures::StreamExt;
     use object_store::{memory::InMemory, path::Path, ObjectStore, ObjectStoreExt};
-    use proptest::prelude::any;
-    use proptest::proptest;
     use rstest::rstest;
     use std::collections::VecDeque;
+    use std::ops::Range;
     use std::sync::Arc;
 
     use crate::block_cache_policy::BlockCachePolicy;
@@ -1322,9 +1286,14 @@ mod tests {
     use crate::db_cache::CacheTarget;
     use crate::db_cache::SplitCache;
     use crate::db_cache::{CachedKey, DbCache, DbCacheWrapper};
+    use crate::db_state::{SsTableHandle, SsTableInfo};
     use crate::error;
+    use crate::flatbuffer_types::{
+        BlockMeta, BlockMetaArgs, SsTableIndex, SsTableIndexArgs, SsTableIndexOwned,
+    };
     use crate::format::block::Block;
-    use crate::format::sst::SsTableFormat;
+    use crate::format::sst::{SsTableFormat, SST_FORMAT_VERSION_LATEST};
+    use crate::iter::IterationOrder;
     use crate::manifest::SsTableView;
     use crate::object_stores::ObjectStores;
     use crate::retrying_object_store::RetryingObjectStore;
@@ -1429,6 +1398,33 @@ mod tests {
 
     fn make_store() -> Arc<dyn ObjectStore> {
         Arc::new(InMemory::new())
+    }
+
+    fn build_index(offsets: &[u64]) -> SsTableIndexOwned {
+        let mut builder = flatbuffers::FlatBufferBuilder::new();
+        let block_meta = offsets
+            .iter()
+            .enumerate()
+            .map(|(block, offset)| {
+                let first_key = builder.create_vector(block.to_string().as_bytes());
+                BlockMeta::create(
+                    &mut builder,
+                    &BlockMetaArgs {
+                        offset: *offset,
+                        first_key: Some(first_key),
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        let block_meta = builder.create_vector(&block_meta);
+        let index = SsTableIndex::create(
+            &mut builder,
+            &SsTableIndexArgs {
+                block_meta: Some(block_meta),
+            },
+        );
+        builder.finish(index, None);
+        SsTableIndexOwned::new(Bytes::copy_from_slice(builder.finished_data())).unwrap()
     }
 
     async fn count_ssts_in(store: &Arc<dyn ObjectStore>) -> usize {
@@ -2926,20 +2922,91 @@ mod tests {
         assert_eq!(metadata.location, path);
     }
 
-    proptest! {
-        #[test]
-        fn convert_bytes_to_blocks_precise_when_aligned_with_block_size(
-            block_size in any::<usize>(),
-            num_blocks in any::<usize>(),
-        ) {
-            let os = Arc::new(InMemory::new());
-            let format = SsTableFormat { block_size, ..SsTableFormat::default() };
-            let ts = Arc::new(TableStore::new(ObjectStores::new(os, None),
-                format, Path::from(ROOT), None, TableStoreKind::Main, BlockCachePolicy::default()));
-            if let Some(bytes) = block_size.checked_mul(num_blocks) {
-                assert_eq!(num_blocks, ts.bytes_to_blocks(bytes));
-            }
-        }
+    #[rstest]
+    #[case::ascending_one_block(IterationOrder::Ascending, 0, 100, 0..1)]
+    #[case::ascending_crosses_boundary(IterationOrder::Ascending, 0, 101, 0..2)]
+    #[case::ascending_exact_boundary(IterationOrder::Ascending, 0, 250, 0..2)]
+    #[case::ascending_exhausts_sst(IterationOrder::Ascending, 1, 1_000, 1..4)]
+    #[case::descending_one_block(IterationOrder::Descending, 3, 200, 3..4)]
+    #[case::descending_crosses_boundary(IterationOrder::Descending, 3, 201, 2..4)]
+    #[case::descending_exact_boundary(IterationOrder::Descending, 3, 250, 2..4)]
+    #[case::descending_exhausts_sst(IterationOrder::Descending, 2, 1_000, 0..3)]
+    fn block_range_for_target_bytes_is_minimal(
+        #[case] order: IterationOrder,
+        #[case] first_block: usize,
+        #[case] target_bytes: usize,
+        #[case] expected: Range<usize>,
+    ) {
+        let table_store = TableStore::new(
+            ObjectStores::new(make_store(), None),
+            SsTableFormat::default(),
+            Path::from(ROOT),
+            None,
+            TableStoreKind::Main,
+            BlockCachePolicy::default(),
+        );
+        let handle = SsTableHandle::new(
+            SsTableId::Compacted(ulid::Ulid::new()),
+            SST_FORMAT_VERSION_LATEST,
+            SsTableInfo {
+                index_offset: 500,
+                filter_offset: 500,
+                ..SsTableInfo::default()
+            },
+        );
+        // Encoded block sizes are 100, 150, 50, and 200 bytes.
+        let index = build_index(&[0, 100, 250, 300]);
+
+        let actual = table_store.block_range_for_target_bytes(
+            &handle,
+            &index,
+            first_block,
+            target_bytes,
+            order,
+        );
+
+        assert_eq!(actual, expected);
+    }
+
+    #[rstest]
+    #[case::filter_precedes_index(1, 500, 700)]
+    #[case::index_follows_data_without_filter(0, 700, 500)]
+    fn block_range_for_target_bytes_uses_format_for_last_block_end(
+        #[case] filter_len: u64,
+        #[case] filter_offset: u64,
+        #[case] index_offset: u64,
+    ) {
+        let table_store = TableStore::new(
+            ObjectStores::new(make_store(), None),
+            SsTableFormat::default(),
+            Path::from(ROOT),
+            None,
+            TableStoreKind::Main,
+            BlockCachePolicy::default(),
+        );
+        let handle = SsTableHandle::new(
+            SsTableId::Compacted(ulid::Ulid::new()),
+            SST_FORMAT_VERSION_LATEST,
+            SsTableInfo {
+                index_offset,
+                filter_offset,
+                filter_len,
+                ..SsTableInfo::default()
+            },
+        );
+        let index = build_index(&[0, 100, 250, 300]);
+
+        let actual = table_store.block_range_for_target_bytes(
+            &handle,
+            &index,
+            3,
+            201,
+            IterationOrder::Descending,
+        );
+
+        // The last block ends at byte 500 and is 200 bytes, so one preceding
+        // block is required to meet a 201-byte target.
+        assert_eq!(actual, 2..4);
     }
 
     /// End-to-end test: concurrent index reads through `TableStore` issue a single
