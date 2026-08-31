@@ -340,13 +340,15 @@ impl DbInner {
 
         let estimated_size = batch_req.batch.estimated_size();
 
-        // Non-blocking reserve before enqueue. Blocking in `acquire` here is
-        // unsafe with a shared `ByteBufferManager`: a freeze requested while
-        // parked can run before this batch is applied (or on the wrong DB
-        // instance), after which nothing re-arms relief and the waiter hangs.
-        // Soft-overshoot with `force_acquire`, apply the write into a freezeable
-        // memtable, then wait in `maybe_apply_backpressure`.
-        let permit = self.write_buffer_manager.force_acquire(estimated_size);
+        let permit = self
+            .write_buffer_manager
+            .acquire(
+                estimated_size,
+                |_parked_cnt: usize, write_buffer_allocated: usize| {
+                    self.apply_memory_backpressure(write_buffer_allocated)
+                },
+            )
+            .await?;
         self.db_stats
             .total_mem_size_bytes
             .set(self.write_buffer_manager.allocated() as i64);
@@ -356,7 +358,7 @@ impl DbInner {
         self.write_notifier.send(batch_msg)?;
 
         let result = rx.await?;
-        self.maybe_apply_backpressure().await?;
+        self.maybe_apply_l0_backpressure().await?;
 
         result
     }
@@ -394,72 +396,13 @@ impl DbInner {
 
     #[inline]
     #[allow(clippy::disallowed_macros)]
-    pub(crate) async fn maybe_apply_backpressure(&self) -> Result<(), SlateDBError> {
-        // Only wait when over a backpressure watermark. Without this check
-        // `maybe_apply_backpressure` would `check_closed()` after every write and
-        // can turn a successful apply into an error if a background task fails
-        // in the race window (e.g. WAL flush panic after freeze). Gate on either
-        // the byte budget (memory) or the L0 SST count (compaction lag): a small-
-        // value / fast-flush workload can keep the byte budget well under its
-        // watermark while L0 grows unbounded because compaction can't keep up.
-        if !(self.write_buffer_manager.at_capacity()
-            || self.l0_at_capacity()
-            || self.l0_overlap_at_capacity())
-        {
+    pub(crate) async fn maybe_apply_l0_backpressure(&self) -> Result<(), SlateDBError> {
+        if !(self.l0_at_capacity() || self.l0_overlap_at_capacity()) {
             return Ok(());
         }
 
         loop {
             self.check_closed()?;
-
-            let write_buffer_remaining = self.write_buffer_manager.available();
-            let write_buffer_allocated = self.write_buffer_manager.allocated();
-
-            // The write buffer's allocated bytes are the accurate accounting of
-            // in-memory unflushed data (memtable overhead + key/value bytes).
-            self.db_stats
-                .total_mem_size_bytes
-                .set(write_buffer_allocated as i64);
-
-            if self.write_buffer_manager.at_capacity() {
-                self.db_stats.backpressure_count.increment(1);
-                fail_point!(Arc::clone(&self.fp_registry), "db-backpressure-applied");
-                warn!(
-                    "write buffer capacity reached. applying backpressure. [max_unflushed_bytes={}, write_buffer_allocated={}, write_buffer_remaining={}]",
-                    format_bytes_si(self.settings.max_unflushed_bytes as u64),
-                    format_bytes_si(write_buffer_allocated as u64),
-                    format_bytes_si(write_buffer_remaining as u64)
-                );
-
-                // Seed a drainable imm so the budget can be released. This is the
-                // single place that freezes for byte-budget backpressure: the
-                // write and replay paths just apply into the active memtable and
-                // call here. Only freeze when the flush queue is empty. Existing
-                // imms will drain and release budget on their own, and freezing an
-                // under-full active memtable just manufactures an extra small L0
-                // SST. If draining the existing imm(s) is not enough, the loop
-                // re-enters with an empty queue and freezes then.
-                {
-                    let replay_after_wal_id = self.wal_observer.status()?.last_flushed_wal_id;
-                    let mut guard = self.state.write();
-                    if guard.state().imm_memtable.is_empty() {
-                        self.freeze_current_memtable_with_state_guard(
-                            &mut guard,
-                            replay_after_wal_id,
-                        );
-                    }
-                }
-
-                // Wait for the write buffer to drain below its high watermark
-                // (or for the DB to close), then re-evaluate.
-                self.await_backpressure_relief(async {
-                    self.write_buffer_manager.await_capacity().await;
-                    Ok(())
-                })
-                .await?;
-
-                continue;
-            }
 
             // L0-count backpressure. `l0_max_ssts` is enforced per tree by the
             // flush-dispatch gate (`FlushTracker::can_dispatch`), which stops
@@ -530,6 +473,50 @@ impl DbInner {
 
             return Ok(());
         }
+    }
+
+    #[inline]
+    #[allow(clippy::disallowed_macros)]
+    pub(crate) async fn apply_memory_backpressure(
+        &self,
+        write_buffer_allocated: usize,
+    ) -> Result<(), SlateDBError> {
+        self.check_closed()?;
+
+        self.db_stats.backpressure_count.increment(1);
+        self.db_stats
+            .total_mem_size_bytes
+            .set(write_buffer_allocated as i64);
+        fail_point!(Arc::clone(&self.fp_registry), "db-backpressure-applied");
+        warn!(
+            "write buffer capacity reached. applying backpressure. [max_unflushed_bytes={}, write_buffer_allocated={}]",
+            format_bytes_si(self.settings.max_unflushed_bytes as u64),
+            format_bytes_si(write_buffer_allocated as u64),
+        );
+
+        // Seed a drainable imm so the budget can be released. This is the
+        // single place that freezes for byte-budget backpressure: the
+        // write and replay paths just apply into the active memtable and
+        // call here. Only freeze when the flush queue is empty. Existing
+        // imms will drain and release budget on their own, and freezing an
+        // under-full active memtable just manufactures an extra small L0
+        // SST. If draining the existing imm(s) is not enough, the loop
+        // re-enters with an empty queue and freezes then.
+        {
+            let replay_after_wal_id = self.wal_observer.status()?.last_flushed_wal_id;
+            let mut guard = self.state.write();
+            if guard.state().imm_memtable.is_empty() {
+                self.freeze_current_memtable_with_state_guard(&mut guard, replay_after_wal_id);
+            }
+        }
+
+        // Wait for the write buffer to drain below its high watermark
+        // (or for the DB to close).
+        self.await_backpressure_relief(async {
+            self.write_buffer_manager.await_capacity().await;
+            Ok(())
+        })
+        .await
     }
 
     /// Waits until the DB is closed or fenced, returning the terminal error.
@@ -713,7 +700,11 @@ impl DbInner {
             // (and the freeze that seeds a drainable imm) is handled centrally by
             // `maybe_apply_backpressure`.
             self.maybe_freeze_memtable(current_memtable_wal_id);
-            self.maybe_apply_backpressure().await?;
+            let mut allocated = self.write_buffer_manager.allocated();
+            while allocated >= self.write_buffer_manager.capacity() {
+                self.apply_memory_backpressure(allocated).await?;
+                allocated = self.write_buffer_manager.allocated();
+            }
         }
 
         let guard = self.state.read();
@@ -5613,7 +5604,7 @@ mod tests {
         // the write_buffer_manager await_capacity() wait path.
         let inner = db.inner.clone();
         let mut backpressure_task =
-            tokio::spawn(async move { inner.maybe_apply_backpressure().await });
+            tokio::spawn(async move { inner.apply_memory_backpressure(1024 * 1024).await });
 
         // Deterministically wait for backpressure to be applied (no polling).
         notified.await;

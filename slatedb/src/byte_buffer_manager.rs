@@ -57,32 +57,44 @@ impl ByteBufferManager {
     /// `on_block` is invoked immediately before each park while the reservation
     /// waits, receiving `true` only on the first park. It is *not* called when
     /// the bytes are reserved without waiting, so callers can act on backpressure
-    /// only when a write actually has to wait.
-    pub async fn acquire(&self, num_bytes: usize, on_block: impl Fn(bool)) -> ByteBufferPermit {
+    /// only when a write actually has to wait. It is an async function, awaited
+    /// on each park, so callers can perform async relief work (e.g. requesting a
+    /// flush) before the reservation waits.
+    pub async fn acquire<F, Fut, Err>(
+        &self,
+        num_bytes: usize,
+        on_block: F,
+    ) -> Result<ByteBufferPermit, Err>
+    where
+        F: Fn(usize, usize) -> Fut,
+        Fut: std::future::Future<Output = Result<(), Err>>,
+    {
         let semaphore = &self.inner;
-        let blocked = semaphore
-            .acquire(num_bytes, |first| {
-                if first {
+        let capacity = self.inner.capacity;
+        let on_block = &on_block;
+        let blocked_cnt = semaphore
+            .acquire(num_bytes, move |parked_cnt, allocated| async move {
+                if parked_cnt == 1 {
                     warn!(
                         "write buffer at capacity; blocking write [allocated={}, capacity={}, requested={}]",
-                        format_bytes_si(semaphore.allocated() as u64),
-                        format_bytes_si(self.inner.capacity as u64),
+                        format_bytes_si(allocated as u64),
+                        format_bytes_si(capacity as u64),
                         format_bytes_si(num_bytes as u64),
                     );
                 }
-                on_block(first);
+                on_block(parked_cnt, allocated).await
             })
-            .await;
-        if blocked {
+            .await?;
+        if blocked_cnt > 0 {
             info!(
                 "write buffer drained; write unblocked [allocated={}]",
                 format_bytes_si(semaphore.allocated() as u64),
             );
         }
-        ByteBufferPermit {
+        Ok(ByteBufferPermit {
             reserved_bytes: AtomicUsize::new(num_bytes),
             semaphore: Arc::clone(&self.inner),
-        }
+        })
     }
 
     pub fn force_expand(&self, permit: &ByteBufferPermit, num_bytes: usize) {
@@ -305,8 +317,16 @@ impl ByteBudgetSemaphore {
     /// callers re-assert relief (e.g. re-request a flush) rather than relying on
     /// a single edge-triggered signal. It never fires when the bytes are
     /// reserved without waiting. Returns `true` if it parked at least once.
-    async fn acquire(&self, num_bytes: usize, on_block: impl Fn(bool)) -> bool {
+    ///
+    /// `on_block` is an async function, awaited before each park, so callers can
+    /// perform async relief work before the reservation waits.
+    async fn acquire<F, Fut, Err>(&self, num_bytes: usize, on_block: F) -> Result<usize, Err>
+    where
+        F: Fn(usize, usize) -> Fut,
+        Fut: std::future::Future<Output = Result<(), Err>>,
+    {
         let mut allocated = self.allocated_bytes.load(Ordering::Acquire);
+        let mut park_cnt = 0;
 
         // Fast path: reserve without parking when already below capacity.
         while allocated < self.capacity {
@@ -316,7 +336,7 @@ impl ByteBudgetSemaphore {
                 Ordering::AcqRel,
                 Ordering::Acquire,
             ) {
-                Ok(_) => return false,
+                Ok(_) => return Ok(park_cnt),
                 Err(cur) => allocated = cur,
             }
         }
@@ -328,23 +348,33 @@ impl ByteBudgetSemaphore {
         let _guard = WaiterGuard::new(self);
         let notify_fut = self.notify.notified();
         tokio::pin!(notify_fut);
-        let mut parked = false;
         loop {
             notify_fut.as_mut().enable();
             allocated = self.allocated_bytes.load(Ordering::Acquire);
-            if allocated < self.capacity {
-                match self.allocated_bytes.compare_exchange_weak(
-                    allocated,
-                    allocated + num_bytes,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                ) {
-                    Ok(_) => return parked,
-                    Err(_) => continue,
+
+            for _ in 0..4 {
+                if allocated < self.capacity {
+                    match self.allocated_bytes.compare_exchange_weak(
+                        allocated,
+                        allocated + num_bytes,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    ) {
+                        Ok(_) => return Ok(park_cnt),
+                        Err(_) => continue,
+                    }
                 }
             }
-            on_block(!parked);
-            parked = true;
+
+            park_cnt += 1;
+            // Perform the caller's relief work first, then park until a release
+            // wakes us. Awaiting `on_block` before the park matches the documented
+            // contract and, crucially, avoids busy-looping when `on_block` returns
+            // without capacity having been freed: the retry only happens after a
+            // `notify` (release) rather than immediately. A release that lands
+            // while `on_block` runs is not lost because `notify_fut` was enabled
+            // at the top of the loop, so the subsequent await returns at once.
+            on_block(park_cnt, allocated).await?;
             notify_fut.as_mut().await;
             notify_fut.set(self.notify.notified());
         }
@@ -558,7 +588,10 @@ mod tests {
     #[tokio::test]
     async fn test_acquire_reserves_when_below_capacity() {
         let mgr = ByteBufferManager::new(1024);
-        let permit = mgr.acquire(100, |_| {}).await;
+        let permit = mgr
+            .acquire(100, |_, _| async { Ok::<(), ()>(()) })
+            .await
+            .unwrap();
         assert_eq!(permit.size(), 100);
         assert_eq!(mgr.allocated(), 100);
     }
@@ -569,7 +602,10 @@ mod tests {
         // allocated reflects the reservation immediately (no TOCTOU gap).
         let mgr = ByteBufferManager::new(1024);
         let _p = mgr.force_acquire(100);
-        let permit = mgr.acquire(50, |_| {}).await;
+        let permit = mgr
+            .acquire(50, |_, _| async { Ok::<(), ()>(()) })
+            .await
+            .unwrap();
         assert_eq!(mgr.allocated(), 150);
         assert_eq!(permit.size(), 50);
     }
@@ -580,7 +616,11 @@ mod tests {
         let _permit = mgr.force_acquire(1024);
 
         // allocated=1024, capacity=1024 => should block (not strictly below).
-        let result = timeout(Duration::from_millis(50), mgr.acquire(10, |_| {})).await;
+        let result = timeout(
+            Duration::from_millis(50),
+            mgr.acquire(10, |_, _| async { Ok::<(), ()>(()) }),
+        )
+        .await;
         assert!(result.is_err(), "acquire should have blocked");
     }
 
@@ -590,7 +630,11 @@ mod tests {
         let permit = mgr.force_acquire(1024);
 
         let mgr_clone = mgr.clone();
-        let handle = tokio::spawn(async move { mgr_clone.acquire(50, |_| {}).await });
+        let handle = tokio::spawn(async move {
+            mgr_clone
+                .acquire(50, |_, _| async { Ok::<(), ()>(()) })
+                .await
+        });
 
         // Give the spawned task a moment to park.
         tokio::time::sleep(Duration::from_millis(10)).await;
@@ -601,7 +645,8 @@ mod tests {
         let acquired = timeout(Duration::from_millis(100), handle)
             .await
             .expect("acquire should have completed")
-            .expect("task should not panic");
+            .expect("task should not panic")
+            .unwrap();
         assert_eq!(acquired.size(), 50);
     }
 
@@ -614,8 +659,12 @@ mod tests {
         // allocated=0 < capacity => reserves without parking, so the
         // backpressure callback must not fire.
         let _permit = mgr
-            .acquire(100, move |_| {
-                called_clone.fetch_add(1, Ordering::Relaxed);
+            .acquire(100, move |_, _| {
+                let called_clone = Arc::clone(&called_clone);
+                async move {
+                    called_clone.fetch_add(1, Ordering::Relaxed);
+                    Ok::<(), ()>(())
+                }
             })
             .await;
         assert_eq!(called.load(Ordering::Relaxed), 0);
@@ -635,9 +684,14 @@ mod tests {
         let first_flags_clone = Arc::clone(&first_flags);
         let handle = tokio::spawn(async move {
             mgr_clone
-                .acquire(50, move |first| {
-                    called_clone.fetch_add(1, Ordering::Relaxed);
-                    first_flags_clone.lock().unwrap().push(first);
+                .acquire(50, move |park_cnt, _| {
+                    let called_clone = Arc::clone(&called_clone);
+                    let first_flags_clone = Arc::clone(&first_flags_clone);
+                    async move {
+                        called_clone.fetch_add(1, Ordering::Relaxed);
+                        first_flags_clone.lock().unwrap().push(park_cnt == 1);
+                        Ok::<(), ()>(())
+                    }
                 })
                 .await
         });
@@ -652,7 +706,8 @@ mod tests {
         timeout(Duration::from_millis(100), handle)
             .await
             .expect("acquire should have completed")
-            .expect("task should not panic");
+            .expect("task should not panic")
+            .unwrap();
         assert_eq!(called.load(Ordering::Relaxed), 1);
     }
 
@@ -670,8 +725,12 @@ mod tests {
         let first_flags_clone = Arc::clone(&first_flags);
         let handle = tokio::spawn(async move {
             mgr_clone
-                .acquire(10, move |first| {
-                    first_flags_clone.lock().unwrap().push(first);
+                .acquire(10, move |park_cnt, _| {
+                    let first_flags_clone = Arc::clone(&first_flags_clone);
+                    async move {
+                        first_flags_clone.lock().unwrap().push(park_cnt == 1);
+                        Ok::<(), ()>(())
+                    }
                 })
                 .await
         });
@@ -692,7 +751,8 @@ mod tests {
         timeout(Duration::from_millis(100), handle)
             .await
             .expect("acquire should have completed")
-            .expect("task should not panic");
+            .expect("task should not panic")
+            .unwrap();
     }
 
     // ---------------------------------------------------------------
