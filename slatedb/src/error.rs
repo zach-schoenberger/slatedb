@@ -6,6 +6,7 @@ use std::{path::PathBuf, sync::Arc};
 use thiserror::Error as ThisError;
 use uuid::Uuid;
 
+use crate::batch::WriteBatch;
 use crate::bytes_range::BytesRange;
 use crate::error::SlateDBError::{
     LatestTransactionalObjectVersionMissing, TransactionalObjectVersionExists,
@@ -39,6 +40,18 @@ pub(crate) enum SlateDBError {
 
     #[error("empty write batch not allowed")]
     EmptyBatch,
+
+    #[error(
+        "write batch too large: estimated size {estimated_size} bytes exceeds maximum {max_size} bytes"
+    )]
+    BatchTooLarge {
+        /// The estimated size of the rejected batch, in bytes.
+        estimated_size: usize,
+        /// The maximum allowed batch size, in bytes.
+        max_size: usize,
+        /// The rejected batch, returned to the caller so it can be split or retried.
+        batch: WriteBatch,
+    },
 
     #[error("empty manifest")]
     EmptyManifest,
@@ -696,6 +709,7 @@ impl From<SlateDBError> for Error {
             SlateDBError::InvalidEnvironmentVariable { .. } => Error::invalid(msg),
             SlateDBError::InvalidSequenceNumber { .. } => Error::invalid(msg),
             SlateDBError::EmptyBatch => Error::invalid(msg),
+            SlateDBError::BatchTooLarge { .. } => Error::invalid(msg),
 
             // Data errors
             SlateDBError::InvalidFlatbuffer(err) => Error::data(msg).with_source(Box::new(err)),

@@ -96,7 +96,7 @@ struct SlateDbWalWriterInner {
 /// failure.
 /// Since the `WalBuffer` does not maintain the order by key it saves some CPU cycles compared to
 /// a [`KVTable`].
-struct WalBuffer {
+pub(crate) struct WalBuffer {
     /// queue for the entries
     entries: VecDeque<RowEntry>,
     /// the sequence number of the most recent addition to this WAL buffer
@@ -405,6 +405,12 @@ impl SlateDbWalWriterInner {
 }
 
 impl WalBuffer {
+    /// Fixed baseline the current WAL buffer reserves against the write-buffer
+    /// budget at construction. When the WAL is enabled there is always at least
+    /// one active WAL buffer, so this is part of the write buffer's irreducible
+    /// outstanding allocation.
+    pub(crate) const BASE_OVERHEAD: usize = size_of::<Self>();
+
     /// Creates a new empty `WalBuffer`, acquiring a zero-byte permit from the
     /// given write buffer manager. The permit grows as entries are appended and
     /// is released back to the budget when this buffer is dropped.
@@ -414,7 +420,7 @@ impl WalBuffer {
             last_seq: 0,
             entries_size: 0,
             write_buffer_manager: write_buffer_manager.clone(),
-            write_buffer_permit: write_buffer_manager.force_acquire(size_of::<Self>()),
+            write_buffer_permit: write_buffer_manager.force_acquire(Self::BASE_OVERHEAD),
         }
     }
 

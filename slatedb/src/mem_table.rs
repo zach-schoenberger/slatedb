@@ -399,6 +399,12 @@ impl KVTable {
     /// (one for u64 sequence numbers, one for i64 timestamps).
     pub(crate) const SEQ_TRACKER_OVERHEAD: usize = 8192 * size_of::<u64>() * 2;
 
+    /// Fixed baseline every active memtable reserves against the write-buffer
+    /// budget at construction (the `SequenceTracker` pre-allocation plus the
+    /// base struct cost). There is always at least one active memtable, so this
+    /// is part of the write buffer's irreducible outstanding allocation.
+    pub(crate) const BASE_OVERHEAD: usize = Self::SEQ_TRACKER_OVERHEAD + Self::KVTABLE_SIZE;
+
     // The theoretical minimum write-buffer capacity required to create a
     // KVTable and write at least one entry without deadlocking on backpressure:
     //
@@ -417,9 +423,7 @@ impl KVTable {
     // for real-world key/value sizes and multiple concurrent writes.
 
     pub(crate) fn new(write_buffer_manager: ByteBufferManager) -> Self {
-        let write_buffer_permit = Arc::new(
-            write_buffer_manager.force_acquire(Self::SEQ_TRACKER_OVERHEAD + Self::KVTABLE_SIZE),
-        );
+        let write_buffer_permit = Arc::new(write_buffer_manager.force_acquire(Self::BASE_OVERHEAD));
         Self {
             map: Arc::new(SkipMap::new()),
             entries_size_in_bytes: AtomicUsize::new(0),
@@ -592,9 +596,8 @@ impl KVTable {
     /// excess pre-allocated overhead is released back to the semaphore.
     pub(crate) fn put(&self, row: RowEntry) {
         // Acquire per-entry skiplist overhead from the buffer manager.
-        let entry_overhead = Self::SKIPMAP_ENTRY_OVERHEAD
-            + Self::SEQUENCED_KEY_SIZE
-            + size_of::<RowEntry>();
+        let entry_overhead =
+            Self::SKIPMAP_ENTRY_OVERHEAD + Self::SEQUENCED_KEY_SIZE + size_of::<RowEntry>();
         self.write_buffer_manager
             .force_expand(&self.write_buffer_permit, entry_overhead);
 

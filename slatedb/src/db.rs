@@ -108,6 +108,11 @@ pub(crate) struct DbInner {
     pub(crate) flush_merge_operator: Option<MergeOperatorType>,
     pub(crate) reader: Reader,
     pub(crate) write_buffer_manager: ByteBufferManager,
+    /// Largest write batch (by estimated key/value bytes) that can ever be
+    /// granted a write-buffer permit without the resulting allocation exceeding
+    /// the buffer's capacity. Computed once at construction from the buffer
+    /// capacity minus the irreducible baseline (see [`DbInner::max_write_batch_size`]).
+    pub(crate) max_write_batch_size: usize,
     /// Largest single-tree L0 SST count observed on the last manifest
     /// mutation (local upload or remote compaction pickup). Maintained
     /// lock-free by the memtable flusher's manifest writer so the write
@@ -195,6 +200,8 @@ impl DbInner {
 
         let db_stats = DbStats::new(&recorder);
         let wal_enabled = DbInner::wal_enabled_in_options(&settings);
+        let max_write_batch_size =
+            DbInner::compute_max_write_batch_size(&write_buffer_manager, wal_enabled);
         let flush_merge_operator = merge_operator.clone().map(|merge_operator| {
             instrument_merge_operator(
                 merge_operator,
@@ -241,6 +248,7 @@ impl DbInner {
             status_manager,
             segment_extractor,
             write_buffer_manager,
+            max_write_batch_size,
             max_l0_sst_count,
             max_l0_overlap,
         };
@@ -316,6 +324,30 @@ impl DbInner {
         return true;
     }
 
+    /// The largest write batch (by estimated key/value bytes) that can ever be
+    /// granted a write-buffer permit without the resulting allocation exceeding
+    /// the buffer's capacity.
+    ///
+    /// The write buffer always has an irreducible baseline outstanding: the
+    /// current active memtable's fixed overhead, plus the current WAL buffer's
+    /// overhead when the WAL is enabled. Both structures always exist, so no
+    /// batch permit larger than `capacity - baseline` can be admitted while
+    /// keeping allocation within capacity. A batch above this limit is rejected
+    /// up front rather than overshooting the budget.
+    ///
+    /// This is constant for the lifetime of the database, so it is computed once
+    /// at construction and cached in [`DbInner::max_write_batch_size`].
+    fn compute_max_write_batch_size(
+        write_buffer_manager: &ByteBufferManager,
+        wal_enabled: bool,
+    ) -> usize {
+        let mut baseline = crate::mem_table::KVTable::BASE_OVERHEAD;
+        if wal_enabled {
+            baseline += crate::wal::slatedb::writer::WalBuffer::BASE_OVERHEAD;
+        }
+        write_buffer_manager.capacity().saturating_sub(baseline)
+    }
+
     #[allow(clippy::disallowed_macros)]
     pub(crate) async fn write_with_options(
         &self,
@@ -330,6 +362,16 @@ impl DbInner {
             return Err(SlateDBError::EmptyBatch);
         }
 
+        let estimated_size = batch.estimated_size();
+        let max_size = self.max_write_batch_size;
+        if estimated_size > max_size {
+            return Err(SlateDBError::BatchTooLarge {
+                estimated_size,
+                max_size,
+                batch,
+            });
+        }
+
         let (tx, rx) = tokio::sync::oneshot::channel();
         let mut batch_req = WriteBatchRequest {
             batch,
@@ -337,8 +379,6 @@ impl DbInner {
             done: tx,
             txn,
         };
-
-        let estimated_size = batch_req.batch.estimated_size();
 
         let permit = self
             .write_buffer_manager
