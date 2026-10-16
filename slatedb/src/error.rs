@@ -191,6 +191,9 @@ pub(crate) enum SlateDBError {
     #[error("checkpoint missing. checkpoint_id=`{0}`")]
     CheckpointMissing(Uuid),
 
+    #[error("checkpoint outcome is unknown. checkpoint_id=`{0}`")]
+    CheckpointOutcomeUnknown(Uuid),
+
     #[error(
         "unsupported {format_name} format version. supported_versions=`{supported_versions:?}`, actual_version=`{actual_version}`"
     )]
@@ -209,6 +212,9 @@ pub(crate) enum SlateDBError {
 
     #[error("cannot seek to a key less than the last returned key")]
     SeekKeyLessThanLastReturnedKey,
+
+    #[error("seek is not supported for descending scans")]
+    SeekNotSupportedForDescendingScan,
 
     #[error(
         "parent path must be different from the clone's path. parent_path=`{0}`, clone_path=`{0}`"
@@ -241,9 +247,6 @@ pub(crate) enum SlateDBError {
         lifetime: Duration,
         interval: Duration,
     },
-
-    #[error("invalid sst batch size. size=`{0}`")]
-    InvalidSSTBatchSize(usize),
 
     #[error("invalid configuration: {0}")]
     InvalidConfiguration(String),
@@ -666,13 +669,13 @@ impl From<SlateDBError> for Error {
             }
             SlateDBError::InvalidObjectStorePath(_) => Error::invalid(msg),
             SlateDBError::UnknownConfigurationFormat(_) => Error::invalid(msg),
-            SlateDBError::InvalidSSTBatchSize(_) => Error::invalid(msg),
             SlateDBError::InvalidConfiguration(_) => Error::invalid(msg),
             SlateDBError::InvalidCheckpointLifetime(_) => Error::invalid(msg),
             SlateDBError::InvalidManifestPollInterval(_) => Error::invalid(msg),
             SlateDBError::CheckpointLifetimeTooShort { .. } => Error::invalid(msg),
             SlateDBError::SeekKeyOutOfRange { .. } => Error::invalid(msg),
             SlateDBError::SeekKeyLessThanLastReturnedKey => Error::invalid(msg),
+            SlateDBError::SeekNotSupportedForDescendingScan => Error::invalid(msg),
             SlateDBError::IdenticalClonePaths { .. } => Error::invalid(msg),
             SlateDBError::DuplicatedCloneSourcePath(_) => Error::invalid(msg),
             SlateDBError::InvalidCloneSourceWithWal { .. } => Error::invalid(msg),
@@ -714,8 +717,8 @@ impl From<SlateDBError> for Error {
             SlateDBError::CheckpointMissing(_) => Error::data(msg),
             SlateDBError::InvalidVersion { .. } => Error::data(msg),
             SlateDBError::ManifestMissing(_) => Error::data(msg),
-            SlateDBError::LatestTransactionalObjectVersionMissing => Error::data(msg),
-            SlateDBError::TransactionalObjectVersionExists => Error::data(msg),
+            LatestTransactionalObjectVersionMissing => Error::data(msg),
+            TransactionalObjectVersionExists => Error::data(msg),
             SlateDBError::InvalidTransactionalObjectState => Error::data(msg),
             SlateDBError::EmptyManifest => Error::data(msg),
             SlateDBError::EmptyBlock => Error::data(msg),
@@ -738,6 +741,7 @@ impl From<SlateDBError> for Error {
             SlateDBError::ReadChannelError(err) => Error::internal(msg).with_source(Box::new(err)),
             SlateDBError::BackgroundTaskExists(_) => Error::internal(msg),
             SlateDBError::BackgroundTaskCancelled(_) => Error::internal(msg),
+            SlateDBError::CheckpointOutcomeUnknown(_) => Error::internal(msg),
             SlateDBError::BackgroundTaskExecutorStarted => Error::internal(msg),
             SlateDBError::UnexpectedTombstone => Error::internal(msg),
             SlateDBError::TransactionalObjectError(err) => {

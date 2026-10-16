@@ -15,10 +15,16 @@ use object_store::{
     ListResult, MultipartUpload, ObjectMeta, ObjectStore, ObjectStoreExt, PutMultipartOptions,
     PutOptions, PutPayload, PutResult, RenameOptions,
 };
+use rand::RngExt;
 
 use crate::utils::IdGenerator;
 use slatedb_common::clock::SystemClock;
 use slatedb_common::DbRand;
+
+const MIN_RETRY_DELAY: Duration = Duration::from_millis(100);
+/// Also caps the L0 uploader's retry backoff, so a long `manifest_poll_interval`
+/// does not stretch upload retries with it.
+pub(crate) const MAX_RETRY_DELAY: Duration = Duration::from_secs(1);
 
 /// Metadata key used to store the ULID for put operations.
 /// This is used to verify if a failed put actually succeeded.
@@ -80,8 +86,10 @@ impl RetryingObjectStore {
     #[inline]
     fn retry_builder(&self) -> ExponentialBuilder {
         let builder = ExponentialBuilder::default()
-            .with_min_delay(Duration::from_millis(100))
-            .with_max_delay(Duration::from_secs(1));
+            .with_min_delay(MIN_RETRY_DELAY)
+            .with_max_delay(MAX_RETRY_DELAY)
+            .with_jitter()
+            .with_jitter_seed(self.rand.rng().random());
         match self.max_retries {
             Some(max_retries) => builder.with_max_times(max_retries as usize),
             None => builder.without_max_times(),
@@ -104,7 +112,7 @@ impl RetryingObjectStore {
     }
 
     #[inline]
-    fn should_retry(err: &object_store::Error) -> bool {
+    pub(crate) fn should_retry(err: &object_store::Error) -> bool {
         let retry = !matches!(
             err,
             object_store::Error::AlreadyExists { .. }
@@ -191,6 +199,73 @@ impl std::fmt::Display for RetryingObjectStore {
     }
 }
 
+#[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
+#[derive(Debug)]
+struct RetryingObjectStorePolicy {
+    clock: Arc<dyn SystemClock>,
+    rand: Arc<DbRand>,
+    max_retries: Option<u32>,
+}
+
+#[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
+#[async_trait]
+impl object_store::retry::RetryPolicy for RetryingObjectStorePolicy {
+    async fn retry(&self, context: object_store::retry::RetryContext) -> bool {
+        self.retry_failure(context.failure, context.attempt).await
+    }
+}
+
+#[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
+impl RetryingObjectStorePolicy {
+    async fn retry_failure(
+        &self,
+        failure: object_store::retry::RetryFailure,
+        attempt: usize,
+    ) -> bool {
+        use object_store::retry::RetryFailure;
+
+        // These statuses map to the errors excluded by `should_retry`.
+        // TODO: Use `RetryingObjectStore::should_retry` directly when
+        // `object_store::retry::RetryContext` includes the actual `Error`.
+        if matches!(failure, RetryFailure::Status(status)
+            if matches!(status.as_u16(), 304 | 404 | 409 | 412))
+        {
+            debug!("not retrying multipart part upload [failure={:?}]", failure);
+            return false;
+        }
+        if self
+            .max_retries
+            .is_some_and(|max_retries| attempt > max_retries as usize)
+        {
+            return false;
+        }
+
+        let delay = self.retry_delay(attempt);
+        info!(
+            "retrying multipart part upload [failure={:?}, attempt={}, duration={:?}]",
+            failure, attempt, delay
+        );
+        self.clock.sleep(delay).await;
+        true
+    }
+
+    /// The sleep before retry `attempt`: the exponential base (doubling from
+    /// [`MIN_RETRY_DELAY`], capped at [`MAX_RETRY_DELAY`]) plus up to 100%
+    /// jitter, the same shape as `RetryingObjectStore::retry_builder`, so parts
+    /// that fail together don't retry together.
+    fn retry_delay(&self, attempt: usize) -> Duration {
+        // Stop doubling at the cap so a large attempt count does not loop long.
+        let mut base = MIN_RETRY_DELAY;
+        for _ in 1..attempt {
+            if base >= MAX_RETRY_DELAY {
+                break;
+            }
+            base = (base * 2).min(MAX_RETRY_DELAY);
+        }
+        self.rand.rng().random_range(base..=base * 2)
+    }
+}
+
 /// Wrapper around MultipartUpload that adds ULID verification on complete() failure.
 struct RetryingMultipartUpload {
     inner: Box<dyn MultipartUpload>,
@@ -266,7 +341,7 @@ impl ObjectStore for RetryingObjectStore {
 
             if options_range.is_none() {
                 // No range requested — don't buffer the body. The buffer size
-                // can't be validated wihtout buffering.
+                // can't be validated without buffering.
                 return Ok(result);
             }
 
@@ -385,6 +460,13 @@ impl ObjectStore for RetryingObjectStore {
         location: &Path,
         opts: PutMultipartOptions,
     ) -> object_store::Result<Box<dyn MultipartUpload>> {
+        #[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
+        let opts = opts.with_retry_policy(Arc::new(RetryingObjectStorePolicy {
+            clock: Arc::clone(&self.clock),
+            rand: Arc::clone(&self.rand),
+            max_retries: self.max_retries,
+        }));
+
         let put_id = self.rand.rng().gen_ulid(self.clock.as_ref()).to_string();
         let opts_with_id = PutMultipartOptions {
             attributes: Self::with_put_id(opts.attributes.clone(), &put_id),
@@ -571,6 +653,7 @@ impl ObjectStore for RetryingObjectStore {
 mod tests {
     use super::RetryingObjectStore;
     use crate::test_utils::{ExtensionMarker, ExtensionObjectStore, FlakyObjectStore};
+    use backon::BackoffBuilder;
     use bytes::Bytes;
     use futures::TryStreamExt;
     use object_store::memory::InMemory;
@@ -592,7 +675,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_put_opts_retries_transient_until_success() {
-        let inner: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+        let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let flaky = Arc::new(FlakyObjectStore::new(inner, 1));
         let retrying = RetryingObjectStore::new(flaky.clone(), test_rand(), test_clock(), None);
 
@@ -632,6 +715,72 @@ mod tests {
         assert!(result.extensions.get::<ExtensionMarker>().is_some());
     }
 
+    #[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
+    #[tokio::test]
+    async fn test_multipart_retry_delays_use_system_clock() {
+        use super::RetryingObjectStorePolicy;
+        use futures::FutureExt;
+        use object_store::client::HttpErrorKind;
+        use object_store::retry::RetryFailure;
+
+        let clock = Arc::new(MockSystemClock::new());
+        let policy = RetryingObjectStorePolicy {
+            clock: clock.clone(),
+            rand: test_rand(),
+            max_retries: None,
+        };
+
+        // Each retry sleeps its exponential base plus up to 100% jitter, on
+        // the configured clock: never wakes before the base, always by 2x.
+        for (attempt, base_ms) in [
+            (1, 100),
+            (2, 200),
+            (3, 400),
+            (4, 800),
+            (5, 1000),
+            (usize::MAX, 1000),
+        ] {
+            let mut retry = Box::pin(
+                policy.retry_failure(RetryFailure::Transport(HttpErrorKind::Timeout), attempt),
+            );
+            assert!(retry.as_mut().now_or_never().is_none());
+            clock.advance(Duration::from_millis(base_ms - 1)).await;
+            assert!(retry.as_mut().now_or_never().is_none());
+            clock.advance(Duration::from_millis(base_ms + 1)).await;
+            assert_eq!(retry.now_or_never(), Some(true));
+        }
+    }
+
+    #[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
+    #[rstest::rstest]
+    #[case(None, usize::MAX, true)]
+    #[case(Some(0), 1, false)]
+    #[case(Some(2), 1, true)]
+    #[case(Some(2), 2, true)]
+    #[case(Some(2), 3, false)]
+    #[tokio::test(start_paused = true)]
+    async fn test_multipart_retry_limit(
+        #[case] max_retries: Option<u32>,
+        #[case] attempt: usize,
+        #[case] expected_retry: bool,
+    ) {
+        use super::RetryingObjectStorePolicy;
+        use object_store::client::HttpErrorKind;
+        use object_store::retry::RetryFailure;
+
+        let policy = RetryingObjectStorePolicy {
+            clock: test_clock(),
+            rand: test_rand(),
+            max_retries,
+        };
+        assert_eq!(
+            policy
+                .retry_failure(RetryFailure::Transport(HttpErrorKind::Timeout), attempt)
+                .await,
+            expected_retry
+        );
+    }
+
     #[tokio::test]
     async fn test_get_opts_range_preserves_extensions() {
         let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
@@ -663,7 +812,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_put_opts_retry_sleep_uses_system_clock() {
-        let inner: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+        let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let flaky = Arc::new(FlakyObjectStore::new(inner, 1));
         let clock = Arc::new(MockSystemClock::new());
         let retrying = RetryingObjectStore::new(flaky.clone(), test_rand(), clock.clone(), None);
@@ -687,12 +836,13 @@ mod tests {
         assert_eq!(flaky.put_attempts(), 1);
         assert!(!handle.is_finished());
 
+        // The first retry waits MIN_RETRY_DELAY (100 ms) plus up to 100% jitter.
         clock.advance(Duration::from_millis(99)).await;
         tokio::task::yield_now().await;
         assert_eq!(flaky.put_attempts(), 1);
         assert!(!handle.is_finished());
 
-        clock.advance(Duration::from_millis(1)).await;
+        clock.advance(Duration::from_millis(101)).await;
 
         let result = handle.await.unwrap();
         assert!(
@@ -705,9 +855,70 @@ mod tests {
         assert_eq!(got.bytes().await.unwrap(), Bytes::from_static(b"hello"));
     }
 
+    /// Retry delays are jittered within `[d, 2d]` of the exponential schedule,
+    /// so concurrent retriers spread out; a given `DbRand` seed reproduces the
+    /// same schedule.
+    #[test]
+    fn test_retry_backoff_is_jittered_and_seeded() {
+        let store = |seed| {
+            RetryingObjectStore::new(
+                Arc::new(InMemory::new()),
+                Arc::new(DbRand::new(seed)),
+                test_clock(),
+                None,
+            )
+        };
+        let schedule = |s: &RetryingObjectStore| -> Vec<Duration> {
+            s.retry_builder().build().take(8).collect()
+        };
+
+        let a = schedule(&store(1));
+        let unjittered = [100, 200, 400, 800, 1000, 1000, 1000, 1000].map(Duration::from_millis);
+        for (delay, base) in a.iter().zip(unjittered) {
+            assert!(
+                *delay >= base && *delay <= base * 2,
+                "{delay:?} not in [{base:?}, {:?}]",
+                base * 2
+            );
+        }
+        assert_ne!(a, unjittered.to_vec(), "delays must be jittered");
+        assert_ne!(a, schedule(&store(2)), "different seeds spread retries");
+        assert_eq!(a, schedule(&store(1)), "a seed reproduces its schedule");
+    }
+
+    /// Multipart part retries are jittered the same way: within `[d, 2d]` of
+    /// the exponential schedule, different across seeds, reproducible for one.
+    #[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
+    #[test]
+    fn test_multipart_retry_delay_is_jittered_and_seeded() {
+        use super::RetryingObjectStorePolicy;
+
+        let policy = |seed| RetryingObjectStorePolicy {
+            clock: test_clock(),
+            rand: Arc::new(DbRand::new(seed)),
+            max_retries: None,
+        };
+        let schedule = |p: &RetryingObjectStorePolicy| -> Vec<Duration> {
+            (1..=8).map(|attempt| p.retry_delay(attempt)).collect()
+        };
+
+        let a = schedule(&policy(1));
+        let unjittered = [100, 200, 400, 800, 1000, 1000, 1000, 1000].map(Duration::from_millis);
+        for (delay, base) in a.iter().zip(unjittered) {
+            assert!(
+                *delay >= base && *delay <= base * 2,
+                "{delay:?} not in [{base:?}, {:?}]",
+                base * 2
+            );
+        }
+        assert_ne!(a, unjittered.to_vec(), "delays must be jittered");
+        assert_ne!(a, schedule(&policy(2)), "different seeds spread retries");
+        assert_eq!(a, schedule(&policy(1)), "a seed reproduces its schedule");
+    }
+
     #[tokio::test]
     async fn test_put_opts_does_not_retry_on_already_exists() {
-        let inner: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+        let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let flaky = Arc::new(FlakyObjectStore::new(inner, 0));
         let retrying = RetryingObjectStore::new(flaky.clone(), test_rand(), test_clock(), None);
         let path = Path::from("/data/obj");
@@ -743,7 +954,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_head_retries_transient_until_success() {
-        let inner: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+        let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let path = Path::from("/x");
         inner
             .put(&path, PutPayload::from_bytes(Bytes::from_static(b"data")))
@@ -760,7 +971,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_put_opts_does_not_retry_on_precondition() {
-        let inner: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+        let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let failing = Arc::new(FlakyObjectStore::new(inner, 0).with_put_precondition_always());
         let retrying = RetryingObjectStore::new(failing.clone(), test_rand(), test_clock(), None);
         let path = Path::from("/p");
@@ -783,7 +994,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_opts_does_not_retry_on_not_modified() {
-        let inner: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+        let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let retrying = RetryingObjectStore::new(inner.clone(), test_rand(), test_clock(), None);
         let path = Path::from("/data/obj");
 
@@ -812,7 +1023,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_list_retries_transient_until_success() {
-        let inner: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+        let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let paths = [
             Path::from("/items/a"),
             Path::from("/items/b"),
@@ -847,7 +1058,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_list_with_offset_retries_transient_until_success() {
-        let inner: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+        let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let paths = [
             Path::from("/items/a"),
             Path::from("/items/b"),
@@ -885,7 +1096,7 @@ mod tests {
     async fn test_put_opts_succeeds_on_matching_ulid() {
         // Simulate: put succeeds but returns AlreadyExists error (timeout after write)
         // The ULID in the object's metadata should match, so we return success
-        let inner: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+        let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let flaky = Arc::new(
             FlakyObjectStore::new(inner, 0).with_put_succeeds_but_returns_already_exists(),
         );
@@ -910,7 +1121,7 @@ mod tests {
     #[tokio::test]
     async fn test_put_opts_fails_on_mismatched_ulid() {
         // First write a file with different ULID (simulating another client's write)
-        let inner: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+        let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let path = Path::from("/data/obj");
 
         // Write directly to inner store (no ULID from RetryingObjectStore)
@@ -948,7 +1159,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_range_retries_transient_until_success() {
-        let inner: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+        let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let path = Path::from("/data/obj");
         inner
             .put(
@@ -972,7 +1183,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_ranges_retries_transient_until_success() {
-        let inner: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+        let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let path = Path::from("/data/obj");
         inner
             .put(
@@ -1001,7 +1212,7 @@ mod tests {
         use object_store::{Attribute, Attributes, GetOptions};
         use std::borrow::Cow;
 
-        let inner: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+        let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let retrying = RetryingObjectStore::new(inner.clone(), test_rand(), test_clock(), None);
         let path = Path::from("/data/obj");
 
@@ -1120,7 +1331,7 @@ mod tests {
     #[tokio::test]
     async fn test_bounded_max_retries_gives_up_instead_of_retrying_forever() {
         // Store fails more times (5) than the configured retry bound (2).
-        let inner: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+        let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let flaky = Arc::new(FlakyObjectStore::new(inner, 5));
         let retrying = RetryingObjectStore::new(flaky.clone(), test_rand(), test_clock(), Some(2));
 

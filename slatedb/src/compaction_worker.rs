@@ -445,7 +445,7 @@ impl CompactionWorkerHandler {
             .spec()
             .destination()
             .ok_or(SlateDBError::InvalidCompaction)?;
-        let l0_sst_views = compaction.get_l0_sst_views(db_state);
+        let l0_sst_views = compaction.get_l0_sst_views(db_state)?;
         let sorted_runs = compaction.get_sorted_runs(db_state);
 
         // Reject drain specs (workers only execute tiered compactions; drain
@@ -488,6 +488,7 @@ impl CompactionWorkerHandler {
             // the entry in `.compactions`. (One-job-per-Compaction in phase 2.)
             id: compaction.id(),
             compaction_id: compaction.id(),
+            segment: compaction.spec().segment().clone(),
             destination,
             l0_sst_views,
             sorted_runs,
@@ -789,7 +790,6 @@ mod tests {
     use crate::format::sst::{SsTableFormat, SST_FORMAT_VERSION_LATEST};
     use crate::manifest::store::StoredManifest;
     use crate::manifest::ManifestCore;
-    use crate::object_stores::ObjectStores;
     use crate::tablestore::{TableStore, TableStoreKind};
     use crate::test_utils::{build_sorted_runs, write_ssts, GatedObjectStore};
     use crate::types::RowEntry;
@@ -877,7 +877,7 @@ mod tests {
                 ..SsTableInfo::default()
             };
             let l0_view = SsTableView::identity(SsTableHandle::new(
-                SsTableId::Compacted(sst_ulid),
+                SsTableId::from(sst_ulid),
                 SST_FORMAT_VERSION_LATEST,
                 sst_info,
             ));
@@ -1113,7 +1113,7 @@ mod tests {
 
         // Build a synthetic sorted run the executor would have returned.
         let output_handle = SsTableHandle::new(
-            SsTableId::Compacted(Ulid::from_parts(9000, 0)),
+            SsTableId::from(Ulid::from_parts(9000, 0)),
             SST_FORMAT_VERSION_LATEST,
             SsTableInfo {
                 first_entry: Some(Bytes::from_static(b"a")),
@@ -1233,7 +1233,7 @@ mod tests {
     /// Builds a throwaway output SST handle for tests.
     fn fake_output_handle(ulid: Ulid) -> SsTableHandle {
         SsTableHandle::new(
-            SsTableId::Compacted(ulid),
+            SsTableId::from(ulid),
             SST_FORMAT_VERSION_LATEST,
             SsTableInfo {
                 first_entry: Some(Bytes::from_static(b"a")),
@@ -1317,7 +1317,7 @@ mod tests {
         let gated_store: Arc<dyn ObjectStore> = gated.clone();
         let root_path = Path::from("testdb-worker-planning-heartbeat");
         let table_store = Arc::new(TableStore::new(
-            ObjectStores::new(gated_store, None),
+            gated_store,
             SsTableFormat {
                 block_size: 256,
                 ..SsTableFormat::default()
@@ -1376,13 +1376,13 @@ mod tests {
         let (tx, rx) = async_channel::unbounded::<WorkerMessage>();
         let executor: Arc<dyn CompactionExecutor + Send + Sync> = Arc::new(
             TokioCompactionExecutor::new(TokioCompactionExecutorOptions {
-                handle: tokio::runtime::Handle::current(),
+                handle: Handle::current(),
                 options: options.clone(),
                 worker_tx: tx,
                 table_store: table_store.clone(),
                 rand: Arc::new(DbRand::new(100u64)),
                 stats: {
-                    let recorder = slatedb_common::metrics::MetricsRecorderHelper::noop();
+                    let recorder = MetricsRecorderHelper::noop();
                     Arc::new(CompactionStats::new(&recorder))
                 },
                 worker_stats: WorkerStats::noop(),
@@ -1428,7 +1428,7 @@ mod tests {
                 COMPACTION_WORKER_TASK_NAME.to_string(),
                 Box::new(handler),
                 rx,
-                &tokio::runtime::Handle::current(),
+                &Handle::current(),
             )
             .unwrap();
         let worker = CompactionWorker::new(task_executor);

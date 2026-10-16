@@ -55,7 +55,7 @@
 //! async fn main() -> Result<(), Error> {
 //!     let object_store = Arc::new(InMemory::new());
 //!     let db = Db::builder("test_db", object_store)
-//!         .with_db_cache(Arc::new(FoyerCache::new()))
+//!         .with_db_cache(Arc::new(FoyerCache::new()), 0)
 //!         .build()
 //!         .await?;
 //!     Ok(())
@@ -111,7 +111,7 @@ use log::info;
 use log::warn;
 use object_store::path::Path;
 use object_store::ObjectStore;
-use rand::RngCore;
+use rand::Rng;
 use tokio::runtime::Handle;
 
 use crate::admin::Admin;
@@ -139,7 +139,7 @@ use crate::config::{Settings, SstBlockSize};
 use crate::db::Db;
 use crate::db::DbInner;
 use crate::db_cache::SplitCache;
-use crate::db_cache::{DbCache, DbCacheWrapper, UnownedDbCache};
+use crate::db_cache::{DbCache, DbCacheAndScope, DbCacheWrapper, UnownedDbCache};
 use crate::db_reader::{DbReader, DbReaderMode};
 use crate::db_status::{ClosedResultWriter, DbStatusManager};
 use crate::dispatcher::MessageHandlerExecutor;
@@ -154,15 +154,15 @@ use crate::manifest::store::{ManifestStore, StoredManifest};
 use crate::manifest::ManifestCore;
 use crate::memtable_flusher::MemtableFlusher;
 use crate::merge_operator::MergeOperatorType;
-use crate::object_stores::ObjectStoreType;
-use crate::object_stores::ObjectStores;
 use crate::paths::PathResolver;
 use crate::retrying_object_store::RetryingObjectStore;
 use crate::tablestore::{TableStore, TableStoreKind};
+use crate::utils::ObjectStoreType;
 use crate::utils::SafeSender;
 use crate::utils::WatchableOnceCell;
 use crate::wal;
-use crate::wal::admin::SlateDbWalAdmin;
+use crate::wal::slatedb::admin::SlateDbWalAdmin;
+use crate::wal::slatedb::store::WalTableStore;
 use crate::wal::wal_disabled::DisabledWalObserver;
 use crate::wal::{WalAdmin, WalGc, WalObserver};
 use slatedb_common::clock::DefaultSystemClock;
@@ -182,21 +182,24 @@ pub struct DbBuilder<P: Into<Path>> {
     settings: Settings,
     main_object_store: Arc<dyn ObjectStore>,
     wal_object_store: Option<Arc<dyn ObjectStore>>,
-    db_cache: Option<Arc<dyn DbCache>>,
+    db_cache: Option<DbCacheAndScope>,
     block_cache_policy: BlockCachePolicy,
     system_clock: Option<Arc<dyn SystemClock>>,
     gc_runtime: Option<Handle>,
+    write_runtime: Option<Handle>,
     compactor_builder: Option<CompactorBuilder<Path>>,
     gc_builder: Option<GarbageCollectorBuilder<Path>>,
     fp_registry: Arc<FailPointRegistry>,
     seed: Option<u64>,
     sst_block_size: Option<SstBlockSize>,
+    sst_block_alignment: bool,
     merge_operator: Option<MergeOperatorType>,
     block_transformer: Option<Arc<dyn BlockTransformer>>,
     filter_policies: Vec<Arc<dyn FilterPolicy>>,
     metrics_recorder: Arc<dyn MetricsRecorder>,
     segment_extractor: Option<Arc<dyn crate::prefix_extractor::PrefixExtractor>>,
     wal_writer_init: Option<Box<dyn wal::WriterInit>>,
+    expected_epoch: Option<u64>,
 }
 
 impl<P: Into<Path>> DbBuilder<P> {
@@ -216,18 +219,32 @@ impl<P: Into<Path>> DbBuilder<P> {
             block_cache_policy: BlockCachePolicy::default(),
             system_clock: None,
             gc_runtime: None,
+            write_runtime: None,
             compactor_builder: None,
             gc_builder: None,
             fp_registry: Arc::new(FailPointRegistry::new()),
             seed: None,
             sst_block_size: None,
+            sst_block_alignment: false,
             merge_operator: None,
             block_transformer: None,
             filter_policies: default_filter_policies(),
             metrics_recorder: Arc::new(NoopMetricsRecorder::new()),
             segment_extractor: None,
             wal_writer_init: None,
+            expected_epoch: None,
         }
+    }
+
+    /// Attempts to claim writer epoch `expected_epoch + 1`.
+    ///
+    /// If a different writer epoch is observed, opening fails with
+    /// [`crate::CloseReason::Fenced`]. Compactor epoch changes are tolerated.
+    /// Without this option, opening retries claims against newer writers.
+    /// `expected_epoch` must be less than `u64::MAX`.
+    pub fn with_expected_epoch(mut self, expected_epoch: u64) -> Self {
+        self.expected_epoch = Some(expected_epoch);
+        self
     }
 
     /// Set the segment extractor (RFC-0024). When configured, every
@@ -284,10 +301,17 @@ impl<P: Into<Path>> DbBuilder<P> {
     /// A cache passed in here remains owned by the caller: it is safe to share it across
     /// multiple `Db`/`DbReader` instances, and [`Db::close`](crate::Db::close) will *not*
     /// close it. Call [`DbCache::close`] yourself after closing every database that uses it.
-    pub fn with_db_cache(mut self, db_cache: Arc<dyn DbCache>) -> Self {
+    ///
+    /// `db_cache_id` isolates this database's entries from any other `Db`/`DbReader` sharing
+    /// the same cache. Each database should have its own unique `db_cache_id`. The ID can be
+    /// reused by the database when it's re-opened to recover any persisted cache data.
+    pub fn with_db_cache(mut self, db_cache: Arc<dyn DbCache>, db_cache_id: u64) -> Self {
         // Wrap so Db::close()/DbReader::close() can't close a cache the
         // caller owns and may be sharing with other instances.
-        self.db_cache = Some(Arc::new(UnownedDbCache::new(db_cache)));
+        self.db_cache = Some(DbCacheAndScope::new(
+            Arc::new(UnownedDbCache::new(db_cache)),
+            db_cache_id,
+        ));
         self
     }
 
@@ -314,6 +338,20 @@ impl<P: Into<Path>> DbBuilder<P> {
     /// Sets the garbage collection runtime to use for the database.
     pub fn with_gc_runtime(mut self, gc_runtime: Handle) -> Self {
         self.gc_runtime = Some(gc_runtime);
+        self
+    }
+
+    /// Runs the batch-writer task on `runtime` instead of the one the database is built on; all
+    /// other components stay put. On a current-thread runtime the writing threads drive
+    /// themselves, a write becomes a task switch rather than a cross-thread wake-up.
+    ///
+    /// The caller must drive `runtime` for every write, [`Db::flush`], [`Db::close`] and
+    /// [`Db::create_checkpoint`] — they go through the batch-writer and otherwise hang; reads do
+    /// not. Build it with [`enable_time`] and no IO driver, which would cost a syscall per write.
+    ///
+    /// [`enable_time`]: tokio::runtime::Builder::enable_time
+    pub fn with_write_runtime(mut self, runtime: Handle) -> Self {
+        self.write_runtime = Some(runtime);
         self
     }
 
@@ -381,6 +419,29 @@ impl<P: Into<Path>> DbBuilder<P> {
         self
     }
 
+    /// Pads every data block of a compacted SST with zeros to the block size
+    /// set by [`Self::with_sst_block_size`]. An entry too large for a block
+    /// gets a block of its own, padded to the next multiple of the block
+    /// size.
+    ///
+    /// The padding rounds up to the block size, not to the 4KB disk block. A
+    /// block size above 4KB therefore over-pads a large entry. Keep the block
+    /// size at 4KB to pad a large entry to the tightest disk-aligned size.
+    ///
+    /// A [`BlockTransformer`] that adds bytes to a block must report them
+    /// through [`BlockTransformer::encoded_overhead`], or every full block
+    /// spills into a second block-sized unit.
+    ///
+    /// Readers that predate the `encoded_len` index field cannot read padded
+    /// SSTs, so upgrade every reader before a writer enables this. Once
+    /// padded SSTs exist, the readers cannot be rolled back.
+    ///
+    /// Defaults to `false`.
+    pub fn with_sst_block_alignment(mut self, aligned: bool) -> Self {
+        self.sst_block_alignment = aligned;
+        self
+    }
+
     /// Sets the merge operator to use for the database. The merge operator allows
     /// applications to bypass the traditional read/modify/write cycle by expressing
     /// partial updates using an associative operator.
@@ -438,6 +499,12 @@ impl<P: Into<Path>> DbBuilder<P> {
     /// Builds and opens the database.
     pub async fn build(self) -> Result<Db, crate::Error> {
         self.settings.validate()?;
+        if self.sst_block_alignment && self.settings.compression_codec.is_some() {
+            return Err(SlateDBError::InvalidConfiguration(
+                "sst_block_alignment cannot be combined with compression_codec".into(),
+            )
+            .into());
+        }
 
         let path = self.path.into();
         // TODO: proper URI generation, for now it works just as a flag
@@ -474,8 +541,7 @@ impl<P: Into<Path>> DbBuilder<P> {
         // producing the same layering as a caller-built
         // [`CachedObjectStore`] passed to [`DbBuilder::new`]: the cache sits
         // under the retry and instrumentation layers, so the same cache
-        // instance can be shared with the compactor and GC below while each
-        // component keeps its own layers.
+        // instance can be shared with the WAL store, compactor, and GC.
         let cached_object_store = CachedObjectStore::from_config(
             self.main_object_store.clone(),
             &self.settings.object_store_cache_options,
@@ -496,7 +562,11 @@ impl<P: Into<Path>> DbBuilder<P> {
         );
         let retrying_wal_object_store: Option<Arc<dyn ObjectStore>> = self
             .wal_object_store
+            .clone()
             .map(|s| wrap_object_store(s, ObjectStoreComponent::Db, ObjectStoreType::Wal));
+        let wal_object_store = retrying_wal_object_store
+            .clone()
+            .unwrap_or_else(|| retrying_main_object_store.clone());
 
         // Log the database opening
         if let Ok(settings_json) = self.settings.to_json_string() {
@@ -527,6 +597,7 @@ impl<P: Into<Path>> DbBuilder<P> {
             filter_policies: self.filter_policies.clone(),
             compression_codec: self.settings.compression_codec,
             block_size: self.sst_block_size.unwrap_or_default().as_bytes(),
+            block_alignment: self.sst_block_alignment,
             block_transformer: self.block_transformer.clone(),
             block_format,
             ..SsTableFormat::default()
@@ -569,24 +640,29 @@ impl<P: Into<Path>> DbBuilder<P> {
 
         // Create path resolver and table store
         let path_resolver = PathResolver::new_with_external_ssts(path.clone(), external_ssts);
-        let db_cache = self.db_cache.as_ref().map(|cache| {
+        let db_cache = self.db_cache.as_ref().map(|db_cache| {
             Arc::new(DbCacheWrapper::new(
-                cache.clone(),
+                db_cache.cache.clone(),
                 &recorder,
                 system_clock.clone(),
+                db_cache.db_cache_id,
             )) as Arc<dyn DbCache>
         });
         let table_store = Arc::new(TableStore::new_with_fp_registry(
-            ObjectStores::new(
-                retrying_main_object_store.clone(),
-                retrying_wal_object_store.clone(),
-            ),
+            retrying_main_object_store.clone(),
             sst_format.clone(),
             path_resolver.clone(),
             self.fp_registry.clone(),
             db_cache.clone(),
             TableStoreKind::Main,
             self.block_cache_policy.clone(),
+        ));
+        let wal_store = Arc::new(WalTableStore::new_with_fp_registry(
+            wal_object_store,
+            sst_format.clone(),
+            path_resolver.clone(),
+            self.fp_registry.clone(),
+            TableStoreKind::Main,
         ));
 
         // Initialize the database
@@ -622,7 +698,7 @@ impl<P: Into<Path>> DbBuilder<P> {
         let fencer = WriterFencer::new(
             status_manager.result_reader(),
             recorder.clone(),
-            table_store.clone(),
+            wal_store.clone(),
             &self.settings,
             system_clock.clone(),
             task_executor.clone(),
@@ -632,7 +708,7 @@ impl<P: Into<Path>> DbBuilder<P> {
             manifest,
             replay_iterator,
             mut wal_writer,
-        } = fencer.fence(stored_manifest).await?;
+        } = fencer.fence(stored_manifest, self.expected_epoch).await?;
         let (wal_writer, wal_observer) = if DbInner::wal_enabled_in_options(&self.settings) {
             let wal_observer = wal_writer.observer();
             (Some(wal_writer), wal_observer)
@@ -685,7 +761,7 @@ impl<P: Into<Path>> DbBuilder<P> {
             WRITE_BATCH_TASK_NAME.to_string(),
             Box::new(WriteBatchEventHandler::new(inner.clone(), wal_writer)),
             write_rx,
-            &tokio_handle,
+            self.write_runtime.as_ref().unwrap_or(&tokio_handle),
         )?;
 
         // Selects the store a background component (compactor, GC) reads and
@@ -736,10 +812,7 @@ impl<P: Into<Path>> DbBuilder<P> {
                 ObjectStoreType::Main,
             );
             let compactor_table_store = Arc::new(TableStore::new_with_fp_registry(
-                ObjectStores::new(
-                    compactor_main_object_store,
-                    retrying_wal_object_store.clone(),
-                ),
+                compactor_main_object_store,
                 sst_format.clone(),
                 path_resolver.clone(),
                 self.fp_registry.clone(),
@@ -793,7 +866,7 @@ impl<P: Into<Path>> DbBuilder<P> {
                 ObjectStoreType::Main,
             );
             let gc_table_store = Arc::new(TableStore::new_with_fp_registry(
-                ObjectStores::new(gc_object_store.clone(), retrying_wal_object_store.clone()),
+                gc_object_store.clone(),
                 sst_format.clone(),
                 path_resolver.clone(),
                 self.fp_registry.clone(),
@@ -801,12 +874,22 @@ impl<P: Into<Path>> DbBuilder<P> {
                 TableStoreKind::GC,
                 BlockCachePolicy::default(),
             ));
+            let gc_wal_store = Arc::new(WalTableStore::new_with_fp_registry(
+                retrying_wal_object_store
+                    .clone()
+                    .unwrap_or_else(|| gc_object_store.clone()),
+                sst_format.clone(),
+                path_resolver.clone(),
+                self.fp_registry.clone(),
+                TableStoreKind::GC,
+            ));
             let gc = gc_builder
                 .with_system_clock(system_clock.clone())
                 .with_metrics_recorder(metrics_recorder.clone())
                 .with_seed(rand.rng().next_u64())
                 .build_collector(
                     gc_table_store,
+                    gc_wal_store,
                     manifest_store.clone(),
                     compactions_store.clone(),
                     gc_object_store,
@@ -862,6 +945,7 @@ pub struct AdminBuilder<P: Into<Path>> {
     #[cfg(feature = "compaction_filters")]
     compaction_filter_supplier: Option<Arc<dyn CompactionFilterSupplier>>,
     merge_operator: Option<MergeOperatorType>,
+    block_transformer: Option<Arc<dyn BlockTransformer>>,
 }
 
 impl<P: Into<Path>> AdminBuilder<P> {
@@ -878,6 +962,7 @@ impl<P: Into<Path>> AdminBuilder<P> {
             #[cfg(feature = "compaction_filters")]
             compaction_filter_supplier: None,
             merge_operator: None,
+            block_transformer: None,
         }
     }
 
@@ -929,6 +1014,13 @@ impl<P: Into<Path>> AdminBuilder<P> {
         self
     }
 
+    /// Sets the block transformer the database's SSTs are written with, so the
+    /// compactor and compaction worker this admin runs can read and rewrite them.
+    pub fn with_block_transformer(mut self, block_transformer: Arc<dyn BlockTransformer>) -> Self {
+        self.block_transformer = Some(block_transformer);
+        self
+    }
+
     /// Builds and returns an Admin instance.
     pub fn build(self) -> Admin {
         // Store the raw object stores here. Admin wraps them in a
@@ -936,10 +1028,14 @@ impl<P: Into<Path>> AdminBuilder<P> {
         // rather than at build time, because several admin operations delegate
         // to sub-builders (compactor/GC) that add their own retry layer, and
         // wrapping here would double-wrap them.
-        let object_stores = ObjectStores::new(self.main_object_store, self.wal_object_store);
+        let main_object_store = self.main_object_store;
+        let wal_object_store = self
+            .wal_object_store
+            .clone()
+            .unwrap_or_else(|| main_object_store.clone());
         let wal_admin = self.wal_admin.unwrap_or_else(|| {
             let retrying_object_store = Arc::new(RetryingObjectStore::new(
-                object_stores.store_of(ObjectStoreType::Wal).clone(),
+                wal_object_store.clone(),
                 self.rand.clone(),
                 self.system_clock.clone(),
                 self.object_store_max_retries,
@@ -951,7 +1047,8 @@ impl<P: Into<Path>> AdminBuilder<P> {
         });
         Admin {
             path: self.path.into(),
-            object_stores,
+            main_object_store,
+            wal_object_store: self.wal_object_store,
             wal_admin,
             system_clock: self.system_clock,
             rand: self.rand,
@@ -959,6 +1056,7 @@ impl<P: Into<Path>> AdminBuilder<P> {
             #[cfg(feature = "compaction_filters")]
             compaction_filter_supplier: self.compaction_filter_supplier,
             merge_operator: self.merge_operator,
+            block_transformer: self.block_transformer,
         }
     }
 }
@@ -1056,6 +1154,7 @@ impl<P: Into<Path>> GarbageCollectorBuilder<P> {
     pub(crate) fn build_collector(
         self,
         table_store: Arc<TableStore>,
+        wal_store: Arc<WalTableStore>,
         manifest_store: Arc<ManifestStore>,
         compactions_store: Arc<CompactionsStore>,
         object_store: Arc<dyn ObjectStore>,
@@ -1068,6 +1167,7 @@ impl<P: Into<Path>> GarbageCollectorBuilder<P> {
             manifest_store,
             compactions_store,
             table_store,
+            wal_store,
             object_store,
             self.options,
             &recorder,
@@ -1113,20 +1213,24 @@ impl<P: Into<Path>> GarbageCollectorBuilder<P> {
             retrying_main_object_store.clone(),
         ));
         let table_store = Arc::new(TableStore::new(
-            ObjectStores::new(
-                retrying_main_object_store.clone(),
-                retrying_wal_object_store.clone(),
-            ),
+            retrying_main_object_store.clone(),
             SsTableFormat::default(), // read only SSTs can use default
-            path,
+            path.clone(),
             None, // no need for cache in GC
             TableStoreKind::GC,
             BlockCachePolicy::default(),
+        ));
+        let wal_store = Arc::new(WalTableStore::new(
+            retrying_wal_object_store.unwrap_or_else(|| retrying_main_object_store.clone()),
+            SsTableFormat::default(),
+            path.clone(),
+            TableStoreKind::GC,
         ));
         GarbageCollector::new(
             manifest_store,
             compactions_store,
             table_store,
+            wal_store,
             retrying_main_object_store,
             self.options,
             &recorder,
@@ -1148,7 +1252,7 @@ pub(crate) struct CompactorHandlers {
     /// The embedded worker handler and its receiver, present when
     /// [`CompactorOptions::worker`] is `Some`.
     pub(crate) worker: Option<(
-        crate::compaction_worker::CompactionWorkerHandler,
+        CompactionWorkerHandler,
         async_channel::Receiver<WorkerMessage>,
     )>,
 }
@@ -1162,6 +1266,7 @@ pub struct CompactorBuilder<P: Into<Path>> {
     compaction_runtime: Handle,
     options: CompactorOptions,
     scheduler_supplier: Option<Arc<dyn CompactionSchedulerSupplier>>,
+    expected_epoch: Option<u64>,
     rand: Arc<DbRand>,
     metrics_recorder: Arc<dyn MetricsRecorder>,
     system_clock: Arc<dyn SystemClock>,
@@ -1170,6 +1275,8 @@ pub struct CompactorBuilder<P: Into<Path>> {
     fp_registry: Arc<FailPointRegistry>,
     block_transformer: Option<Arc<dyn BlockTransformer>>,
     filter_policies: Vec<Arc<dyn FilterPolicy>>,
+    sst_block_size: Option<SstBlockSize>,
+    sst_block_alignment: bool,
     #[cfg(feature = "compaction_filters")]
     compaction_filter_supplier: Option<Arc<dyn CompactionFilterSupplier>>,
 }
@@ -1183,6 +1290,7 @@ impl<P: Into<Path>> CompactorBuilder<P> {
             compaction_runtime: Handle::current(),
             options: CompactorOptions::default(),
             scheduler_supplier: None,
+            expected_epoch: None,
             rand: Arc::new(DbRand::default()),
             metrics_recorder: Arc::new(NoopMetricsRecorder::new()),
             system_clock: Arc::new(DefaultSystemClock::default()),
@@ -1191,6 +1299,8 @@ impl<P: Into<Path>> CompactorBuilder<P> {
             fp_registry: Arc::new(FailPointRegistry::new()),
             block_transformer: None,
             filter_policies: default_filter_policies(),
+            sst_block_size: None,
+            sst_block_alignment: false,
             #[cfg(feature = "compaction_filters")]
             compaction_filter_supplier: None,
         }
@@ -1203,6 +1313,7 @@ impl<P: Into<Path>> CompactorBuilder<P> {
             compaction_runtime: self.compaction_runtime,
             options: self.options,
             scheduler_supplier: self.scheduler_supplier,
+            expected_epoch: self.expected_epoch,
             rand: self.rand,
             metrics_recorder: self.metrics_recorder,
             system_clock: self.system_clock,
@@ -1211,6 +1322,8 @@ impl<P: Into<Path>> CompactorBuilder<P> {
             fp_registry: self.fp_registry,
             block_transformer: self.block_transformer,
             filter_policies: self.filter_policies,
+            sst_block_size: self.sst_block_size,
+            sst_block_alignment: self.sst_block_alignment,
             #[cfg(feature = "compaction_filters")]
             compaction_filter_supplier: self.compaction_filter_supplier,
         }
@@ -1226,6 +1339,17 @@ impl<P: Into<Path>> CompactorBuilder<P> {
     /// Sets the options to use for the compactor.
     pub fn with_options(mut self, options: CompactorOptions) -> Self {
         self.options = options;
+        self
+    }
+
+    /// Attempts to claim compactor epoch `expected_epoch + 1`.
+    ///
+    /// If a different compactor epoch is observed, startup fails with
+    /// [`crate::CloseReason::Fenced`]. Writer epoch changes are tolerated.
+    /// Without this option, startup retries claims against newer compactors.
+    /// `expected_epoch` must be less than `u64::MAX`.
+    pub fn with_expected_epoch(mut self, expected_epoch: u64) -> Self {
+        self.expected_epoch = Some(expected_epoch);
         self
     }
 
@@ -1312,6 +1436,25 @@ impl<P: Into<Path>> CompactorBuilder<P> {
         self
     }
 
+    /// Sets the SST block size the worker uses when it rewrites SSTs.
+    ///
+    /// Must match the writer's `DbBuilder::with_sst_block_size` configuration
+    /// so that SSTs rewritten by the worker are encoded consistently with
+    /// those produced by the DB. Defaults to [`SstBlockSize::default`].
+    pub fn with_sst_block_size(mut self, block_size: SstBlockSize) -> Self {
+        self.sst_block_size = Some(block_size);
+        self
+    }
+
+    /// Pads every data block of a compacted SST with zeros to the block size
+    /// set by [`Self::with_sst_block_size`].
+    ///
+    /// Defaults to `false`.
+    pub fn with_sst_block_alignment(mut self, aligned: bool) -> Self {
+        self.sst_block_alignment = aligned;
+        self
+    }
+
     /// Builds and returns a Compactor instance.
     pub fn build(self) -> Compactor {
         let path: Path = self.path.into();
@@ -1339,10 +1482,12 @@ impl<P: Into<Path>> CompactorBuilder<P> {
         let sst_format = SsTableFormat {
             filter_policies: self.filter_policies.clone(),
             block_transformer: self.block_transformer.clone(),
+            block_size: self.sst_block_size.unwrap_or_default().as_bytes(),
+            block_alignment: self.sst_block_alignment,
             ..SsTableFormat::default()
         };
         let table_store = Arc::new(TableStore::new(
-            ObjectStores::new(retrying_main_object_store, None),
+            retrying_main_object_store,
             sst_format,
             path,
             None,
@@ -1360,6 +1505,7 @@ impl<P: Into<Path>> CompactorBuilder<P> {
             table_store,
             self.options,
             scheduler_supplier,
+            self.expected_epoch,
             self.compaction_runtime,
             self.rand,
             &recorder,
@@ -1404,6 +1550,7 @@ impl<P: Into<Path>> CompactorBuilder<P> {
             stats.clone(),
             self.system_clock.clone(),
             recorder.clone(),
+            self.expected_epoch,
         )
         .await?;
         let worker = options.worker.clone().map(|worker_options| {
@@ -1449,6 +1596,7 @@ pub struct CompactionWorkerBuilder<P: Into<Path>> {
     block_transformer: Option<Arc<dyn BlockTransformer>>,
     filter_policies: Vec<Arc<dyn FilterPolicy>>,
     sst_block_size: Option<SstBlockSize>,
+    sst_block_alignment: bool,
     #[cfg(feature = "compaction_filters")]
     compaction_filter_supplier: Option<Arc<dyn CompactionFilterSupplier>>,
 }
@@ -1468,6 +1616,7 @@ impl<P: Into<Path>> CompactionWorkerBuilder<P> {
             block_transformer: None,
             filter_policies: default_filter_policies(),
             sst_block_size: None,
+            sst_block_alignment: false,
             #[cfg(feature = "compaction_filters")]
             compaction_filter_supplier: None,
         }
@@ -1530,11 +1679,20 @@ impl<P: Into<Path>> CompactionWorkerBuilder<P> {
 
     /// Sets the SST block size the worker uses when it rewrites SSTs.
     ///
-    /// Must match the writer's `DbBuilder::with_sst_block_size` configuration so
-    /// that SSTs rewritten by the worker are encoded consistently with those
-    /// produced by the DB. Defaults to [`SstBlockSize::default`].
+    /// Must match the writer's `DbBuilder::with_sst_block_size` configuration
+    /// so that SSTs rewritten by the worker are encoded consistently with
+    /// those produced by the DB. Defaults to [`SstBlockSize::default`].
     pub fn with_sst_block_size(mut self, block_size: SstBlockSize) -> Self {
         self.sst_block_size = Some(block_size);
+        self
+    }
+
+    /// Pads every data block of a compacted SST with zeros to the block size
+    /// set by [`Self::with_sst_block_size`].
+    ///
+    /// Defaults to `false`.
+    pub fn with_sst_block_alignment(mut self, aligned: bool) -> Self {
+        self.sst_block_alignment = aligned;
         self
     }
 
@@ -1548,18 +1706,25 @@ impl<P: Into<Path>> CompactionWorkerBuilder<P> {
     }
 
     pub async fn build(self) -> Result<CompactionWorker, crate::Error> {
+        if self.sst_block_alignment && self.options.compression_codec.is_some() {
+            return Err(SlateDBError::InvalidConfiguration(
+                "sst_block_alignment cannot be combined with compression_codec".into(),
+            )
+            .into());
+        }
         let path: Path = self.path.into();
         let manifest_store = Arc::new(ManifestStore::new(&path, self.main_object_store.clone()));
         let compactions_store =
             Arc::new(CompactionsStore::new(&path, self.main_object_store.clone()));
         let table_store = Arc::new(TableStore::new(
-            ObjectStores::new(self.main_object_store, None),
+            self.main_object_store,
             SsTableFormat {
                 filter_policies: self.filter_policies.clone(),
                 block_transformer: self.block_transformer.clone(),
                 block_size: self.sst_block_size.unwrap_or_default().as_bytes(),
                 min_filter_keys: self.options.min_filter_keys,
                 compression_codec: self.options.compression_codec,
+                block_alignment: self.sst_block_alignment,
                 ..SsTableFormat::default()
             },
             path,
@@ -1663,7 +1828,7 @@ pub struct DbReaderBuilder<P: Into<Path>> {
     object_store: Arc<dyn ObjectStore>,
     wal_object_store: Option<Arc<dyn ObjectStore>>,
     wal_reader: Option<Arc<dyn wal::WalReader>>,
-    db_cache: Option<Arc<dyn DbCache>>,
+    db_cache: Option<DbCacheAndScope>,
     mode: DbReaderMode,
     merge_operator: Option<MergeOperatorType>,
     block_transformer: Option<Arc<dyn BlockTransformer>>,
@@ -1749,10 +1914,17 @@ impl<P: Into<Path>> DbReaderBuilder<P> {
     /// multiple `Db`/`DbReader` instances, and [`DbReader::close`](crate::DbReader::close)
     /// will *not* close it. Call [`DbCache::close`] yourself after closing every database
     /// that uses it.
-    pub fn with_db_cache(mut self, db_cache: Arc<dyn DbCache>) -> Self {
+    ///
+    /// `db_cache_id` isolates this reader's entries from any other `Db`/`DbReader` sharing
+    /// the same cache. Pass the same id as the `Db` it's reading, or the same ID as a prior open
+    /// of this same reader, to share/recover persisted entries.
+    pub fn with_db_cache(mut self, db_cache: Arc<dyn DbCache>, db_cache_id: u64) -> Self {
         // Wrap so Db::close()/DbReader::close() can't close a cache the
         // caller owns and may be sharing with other instances.
-        self.db_cache = Some(Arc::new(UnownedDbCache::new(db_cache)));
+        self.db_cache = Some(DbCacheAndScope::new(
+            Arc::new(UnownedDbCache::new(db_cache)),
+            db_cache_id,
+        ));
         self
     }
 
@@ -1838,7 +2010,7 @@ impl<P: Into<Path>> DbReaderBuilder<P> {
         .await?;
         let maybe_cached_object_store: Arc<dyn ObjectStore> = match &maybe_cached {
             Some(cached) => Arc::clone(cached) as Arc<dyn ObjectStore>,
-            None => self.object_store,
+            None => self.object_store.clone(),
         };
 
         let retrying_object_store = instrumented_retrying_object_store(
@@ -1851,18 +2023,20 @@ impl<P: Into<Path>> DbReaderBuilder<P> {
             self.options.object_store_max_retries,
         );
 
-        let retrying_wal_object_store: Option<Arc<dyn ObjectStore>> =
-            self.wal_object_store.map(|s| {
-                instrumented_retrying_object_store(
-                    s,
-                    &recorder,
-                    ObjectStoreComponent::Reader,
-                    ObjectStoreType::Wal,
-                    self.rand.clone(),
-                    self.system_clock.clone(),
-                    self.options.object_store_max_retries,
-                )
-            });
+        let retrying_wal_object_store = self.wal_object_store.map(|wal_object_store| {
+            instrumented_retrying_object_store(
+                wal_object_store,
+                &recorder,
+                ObjectStoreComponent::Reader,
+                ObjectStoreType::Wal,
+                self.rand.clone(),
+                self.system_clock.clone(),
+                self.options.object_store_max_retries,
+            )
+        });
+        let wal_object_store = retrying_wal_object_store
+            .clone()
+            .unwrap_or_else(|| retrying_object_store.clone());
 
         // Validate WAL object store configuration.
         let manifest_store = Arc::new(ManifestStore::new(&path, retrying_object_store.clone()));
@@ -1894,11 +2068,12 @@ impl<P: Into<Path>> DbReaderBuilder<P> {
             (None, _) => HashMap::new(),
         };
 
-        let wrapped_cache = self.db_cache.as_ref().map(|c| {
+        let wrapped_cache = self.db_cache.as_ref().map(|db_cache| {
             Arc::new(DbCacheWrapper::new(
-                c.clone(),
+                db_cache.cache.clone(),
                 &recorder,
                 self.system_clock.clone(),
+                db_cache.db_cache_id,
             )) as Arc<dyn DbCache>
         });
 
@@ -1908,19 +2083,28 @@ impl<P: Into<Path>> DbReaderBuilder<P> {
             ..SsTableFormat::default()
         };
         let path_resolver = PathResolver::new_with_external_ssts(path.clone(), external_ssts);
+        let fp_registry = Arc::new(FailPointRegistry::new());
         let table_store = Arc::new(TableStore::new_with_fp_registry(
-            ObjectStores::new(retrying_object_store, retrying_wal_object_store),
-            sst_format,
-            path_resolver,
-            Arc::new(FailPointRegistry::new()),
+            retrying_object_store,
+            sst_format.clone(),
+            path_resolver.clone(),
+            Arc::clone(&fp_registry),
             wrapped_cache,
             TableStoreKind::Reader,
             BlockCachePolicy::default(),
+        ));
+        let wal_store = Arc::new(WalTableStore::new_with_fp_registry(
+            wal_object_store,
+            sst_format,
+            path_resolver,
+            fp_registry,
+            TableStoreKind::Reader,
         ));
 
         let reader = DbReader::open_internal(
             manifest_store,
             table_store,
+            wal_store,
             self.mode,
             self.wal_reader,
             self.merge_operator,
@@ -1945,15 +2129,16 @@ fn default_filter_policies() -> Vec<Arc<dyn FilterPolicy>> {
     vec![Arc::new(BloomFilterPolicy::new(10))]
 }
 
-fn default_db_cache() -> Option<Arc<dyn DbCache>> {
+fn default_db_cache() -> Option<DbCacheAndScope> {
     let block_cache = default_block_cache();
     let meta_cache = default_meta_cache();
-    Some(Arc::new(
+    let cache = Arc::new(
         SplitCache::new()
             .with_block_cache(block_cache)
             .with_meta_cache(meta_cache)
             .build(),
-    ) as Arc<dyn DbCache>)
+    ) as Arc<dyn DbCache>;
+    Some(DbCacheAndScope::new(cache, 0))
 }
 
 /// Specifies the source database and checkpoint for a clone operation.
@@ -2097,7 +2282,7 @@ impl<R: RangeBounds<Bytes> + Clone> CloneBuilder<R> {
                 r.start_bound().cloned(),
                 r.end_bound().cloned(),
             )
-            .ok_or_else(|| crate::error::SlateDBError::InvalidProjection {
+            .ok_or_else(|| SlateDBError::InvalidProjection {
                 prefix: Bytes::copy_from_slice(prefix),
                 reason: "empty range".into(),
             })
@@ -2240,6 +2425,8 @@ mod tests {
         atomic::{AtomicBool, Ordering},
         Arc,
     };
+    // Aliased because `tempfile::Builder` is also used below.
+    use tokio::runtime::{Builder as RuntimeBuilder, Runtime};
 
     struct EmptyWalIterator;
 
@@ -2290,6 +2477,19 @@ mod tests {
         let counter = helper.counter(name).level(MetricLevel::Debug).register();
         counter.increment(1);
         assert_eq!(lookup_metric(recorder, name), Some(1));
+    }
+
+    #[tokio::test]
+    async fn test_expected_writer_epoch_returns_closed_fenced() {
+        let result = crate::Db::builder("epoch-mismatch", Arc::new(InMemory::new()))
+            .with_expected_epoch(1)
+            .build()
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(error) if error.kind() == ErrorKind::Closed(crate::CloseReason::Fenced)
+        ));
     }
 
     #[tokio::test]
@@ -2609,5 +2809,81 @@ mod tests {
             Some(b"v1".as_ref())
         );
         db.close().await.expect("failed to close db");
+    }
+
+    // Not a `#[tokio::test]`: the caller has to own both runtimes.
+    #[test]
+    fn test_write_runtime_serves_writes_and_close() {
+        let background = Runtime::new().expect("failed to build background runtime");
+        let writer = RuntimeBuilder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("failed to build writer runtime");
+
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let db = background
+            .block_on(
+                crate::Db::builder(
+                    Path::from("test_write_runtime_serves_writes_and_close"),
+                    object_store,
+                )
+                .with_write_runtime(writer.handle().clone())
+                .build(),
+            )
+            .expect("failed to build db");
+
+        writer
+            .block_on(db.put(b"k1", b"v1"))
+            .expect("failed to put");
+
+        // Reads do not go through the batch-writer.
+        let value = background
+            .block_on(db.get(b"k1"))
+            .expect("failed to get")
+            .expect("expected the written value");
+        assert_eq!(value.as_ref(), b"v1");
+
+        // Close flushes through the batch-writer and joins it.
+        writer.block_on(db.close()).expect("failed to close db");
+    }
+
+    #[tokio::test]
+    async fn test_write_runtime_defaults_to_the_build_runtime() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let db = crate::Db::builder(
+            Path::from("test_write_runtime_defaults_to_the_build_runtime"),
+            object_store,
+        )
+        .build()
+        .await
+        .expect("failed to build db");
+
+        db.put(b"k1", b"v1").await.expect("failed to put");
+        assert_eq!(
+            db.get(b"k1").await.expect("failed to get").as_deref(),
+            Some(b"v1".as_ref())
+        );
+        db.close().await.expect("failed to close db");
+    }
+
+    #[tokio::test]
+    async fn admin_hands_its_hooks_to_the_compactor_and_worker_it_runs() {
+        use super::AdminBuilder;
+        use crate::config::CompactionWorkerOptions;
+        use crate::test_utils::{IdentityBlockTransformer, StringConcatMergeOperator};
+
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let admin = AdminBuilder::new("/tmp/admin_hooks", object_store)
+            .with_merge_operator(Arc::new(StringConcatMergeOperator))
+            .with_block_transformer(Arc::new(IdentityBlockTransformer))
+            .build();
+
+        let compactor = admin.compactor_builder(CompactorOptions::default());
+        assert!(compactor.merge_operator.is_some());
+        assert!(compactor.block_transformer.is_some());
+
+        let worker = admin.compaction_worker_builder(CompactionWorkerOptions::default());
+        assert!(worker.merge_operator.is_some());
+        assert!(worker.block_transformer.is_some());
     }
 }

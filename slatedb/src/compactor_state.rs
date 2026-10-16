@@ -501,21 +501,60 @@ impl Compaction {
     /// Returns all L0 SSTable sources for this compaction. Sources are looked
     /// up from the spec's target segment tree (root tree for an empty
     /// segment).
+    /// Returns an error if a source is missing, ambiguous, or repeated.
     ///
     /// ## Arguments
     /// - `db_state`: The current core DB state from the manifest.
-    pub(crate) fn get_l0_sst_views(&self, db_state: &ManifestCore) -> Vec<SsTableView> {
+    pub(crate) fn get_l0_sst_views(
+        &self,
+        db_state: &ManifestCore,
+    ) -> Result<Vec<SsTableView>, SlateDBError> {
         let Some(tree) = db_state.tree_for_segment(self.spec.segment()) else {
-            return Vec::new();
+            debug!(
+                "compaction target segment missing [compaction_id={}, segment={:?}]",
+                self.id,
+                self.spec.segment()
+            );
+            return Err(SlateDBError::InvalidCompaction);
         };
-        let sst_views_by_id: HashMap<Ulid, &SsTableView> =
-            tree.l0.iter().map(|view| (view.id, view)).collect();
+        let mut sst_views_by_id = HashMap::new();
+        for view in &tree.l0 {
+            // None marks an ID shared by multiple views.
+            sst_views_by_id
+                .entry(view.id)
+                .and_modify(|entry| *entry = None)
+                .or_insert(Some(view));
+        }
 
+        let mut sources_seen = HashSet::new();
         self.spec
             .sources()
             .iter()
             .filter_map(|s| s.maybe_unwrap_sst_view())
-            .filter_map(|ulid| sst_views_by_id.get(&ulid).map(|t| (*t).clone()))
+            .map(|id| {
+                if !sources_seen.insert(id) {
+                    debug!(
+                        "compaction L0 source repeated [compaction_id={}, view_id={}]",
+                        self.id, id
+                    );
+                    return Err(SlateDBError::InvalidCompaction);
+                }
+                match sst_views_by_id.get(&id) {
+                    Some(Some(view)) => Ok((*view).clone()),
+                    invalid => {
+                        let reason = if invalid.is_some() {
+                            "ambiguous"
+                        } else {
+                            "missing"
+                        };
+                        debug!(
+                            "compaction L0 source {} [compaction_id={}, view_id={}]",
+                            reason, self.id, id
+                        );
+                        Err(SlateDBError::InvalidCompaction)
+                    }
+                }
+            })
             .collect()
     }
 
@@ -523,7 +562,7 @@ impl Compaction {
     /// key ranges. Reusing the views avoids reading or rewriting SST data.
     pub(crate) fn trivial_move_output(&self, db_state: &ManifestCore) -> Option<SortedRun> {
         let destination = self.spec.destination()?;
-        let mut sst_views = self.get_l0_sst_views(db_state);
+        let mut sst_views = self.get_l0_sst_views(db_state).ok()?;
         sst_views.extend(
             self.get_sorted_runs(db_state)
                 .iter()
@@ -571,6 +610,16 @@ impl Compaction {
     /// Returns the current status of this compaction.
     pub fn status(&self) -> CompactionStatus {
         self.status
+    }
+
+    /// Returns whether a worker can claim this compaction but has not yet.
+    pub(crate) fn scheduled(&self) -> bool {
+        matches!(self.status, CompactionStatus::Scheduled)
+    }
+
+    /// Returns whether a worker has claimed this compaction and is executing it.
+    pub(crate) fn running(&self) -> bool {
+        matches!(self.status, CompactionStatus::Running)
     }
 
     /// Returns all output SSTs produced by this compaction.
@@ -1150,7 +1199,7 @@ impl CompactorState {
                     .l0
                     .iter()
                     .find(|v| v.id == view_id)
-                    .map(|v| v.sst.id.unwrap_compacted_id());
+                    .map(|v| v.sst.id.value());
             }
             tree.l0 = new_l0;
             tree.compacted = new_compacted;
@@ -1233,7 +1282,7 @@ impl CompactorState {
             .cloned()
         {
             tree.last_compacted_l0_sst_view_id = Some(view.id);
-            tree.last_compacted_l0_sst_id = Some(view.sst.id.unwrap_compacted_id());
+            tree.last_compacted_l0_sst_id = Some(view.sst.id.value());
         }
 
         tree.l0.retain(|view| !drained_l0_ids.contains(&view.id));
@@ -1288,7 +1337,7 @@ mod tests {
 
     fn test_subcompaction_sst(first_key: &[u8]) -> SsTableHandle {
         SsTableHandle::new(
-            SsTableId::Compacted(Ulid::new()),
+            SsTableId::from(Ulid::new()),
             SST_FORMAT_VERSION_LATEST,
             SsTableInfo {
                 first_entry: Some(Bytes::copy_from_slice(first_key)),
@@ -1699,7 +1748,7 @@ mod tests {
         // compacted sorted run and remain live) and a stale ID that was never in the
         // manifest (simulating a parent SST already compacted away on a prior cycle).
         let live_id = before_compaction.tree.l0.front().unwrap().sst.id;
-        let stale_id = SsTableId::Compacted(Ulid::new());
+        let stale_id = SsTableId::from(Ulid::new());
         state.manifest.value.external_dbs = vec![
             ExternalDb {
                 path: "/parent/db".to_string(),
@@ -1785,14 +1834,14 @@ mod tests {
             .tree
             .l0
             .iter()
-            .map(|t| t.sst.id.unwrap_compacted_id())
+            .map(|t| t.sst.id.value())
             .collect();
         let merged_l0s: Vec<Ulid> = state
             .db_state()
             .tree
             .l0
             .iter()
-            .map(|h| h.sst.id.unwrap_compacted_id())
+            .map(|h| h.sst.id.value())
             .collect();
         assert_eq!(expected_merged_l0s, merged_l0s);
     }
@@ -1802,7 +1851,7 @@ mod tests {
         let manifest = new_dirty_manifest();
         let compactions = new_dirty_compactions(manifest.value.compactor_epoch);
         let mut state = CompactorState::new(manifest, compactions);
-        let stale_id = SsTableId::Compacted(Ulid::new());
+        let stale_id = SsTableId::from(Ulid::new());
         let mut remote = new_dirty_manifest();
         remote.value.external_dbs = vec![crate::manifest::ExternalDb {
             path: "/parent/db".to_string(),
@@ -1851,28 +1900,12 @@ mod tests {
 
         // then:
         let db_state = state.db_state();
-        let mut expected_merged_l0s: VecDeque<Ulid> = original_l0s
-            .iter()
-            .map(|h| h.sst.id.unwrap_compacted_id())
-            .collect();
+        let mut expected_merged_l0s: VecDeque<Ulid> =
+            original_l0s.iter().map(|h| h.sst.id.value()).collect();
         expected_merged_l0s.pop_back();
-        let new_l0 = sm
-            .manifest()
-            .core
-            .tree
-            .l0
-            .front()
-            .unwrap()
-            .sst
-            .id
-            .unwrap_compacted_id();
+        let new_l0 = sm.manifest().core.tree.l0.front().unwrap().sst.id.value();
         expected_merged_l0s.push_front(new_l0);
-        let merged_l0: VecDeque<Ulid> = db_state
-            .tree
-            .l0
-            .iter()
-            .map(|h| h.sst.id.unwrap_compacted_id())
-            .collect();
+        let merged_l0: VecDeque<Ulid> = db_state.tree.l0.iter().map(|h| h.sst.id.value()).collect();
         assert_eq!(merged_l0, expected_merged_l0s);
         assert_eq!(
             compacted_to_description(&db_state.tree.compacted),
@@ -1916,23 +1949,9 @@ mod tests {
         // then:
         let db_state = state.db_state();
         let mut expected_merged_l0s = VecDeque::new();
-        let new_l0 = sm
-            .manifest()
-            .core
-            .tree
-            .l0
-            .front()
-            .unwrap()
-            .sst
-            .id
-            .unwrap_compacted_id();
+        let new_l0 = sm.manifest().core.tree.l0.front().unwrap().sst.id.value();
         expected_merged_l0s.push_front(new_l0);
-        let merged_l0: VecDeque<Ulid> = db_state
-            .tree
-            .l0
-            .iter()
-            .map(|h| h.sst.id.unwrap_compacted_id())
-            .collect();
+        let merged_l0: VecDeque<Ulid> = db_state.tree.l0.iter().map(|h| h.sst.id.value()).collect();
         assert_eq!(merged_l0, expected_merged_l0s);
     }
 
@@ -1965,7 +1984,7 @@ mod tests {
         fn view(seq: u64) -> SsTableView {
             let ulid = Ulid::from_parts(seq, 0);
             SsTableView::identity(SsTableHandle::new(
-                SsTableId::Compacted(ulid),
+                SsTableId::from(ulid),
                 SST_FORMAT_VERSION_LATEST,
                 SsTableInfo::default(),
             ))
@@ -2034,7 +2053,7 @@ mod tests {
         fn view(seq: u64) -> SsTableView {
             let ulid = Ulid::from_parts(seq, 0);
             SsTableView::identity(SsTableHandle::new(
-                SsTableId::Compacted(ulid),
+                SsTableId::from(ulid),
                 SST_FORMAT_VERSION_LATEST,
                 SsTableInfo::default(),
             ))
@@ -2120,7 +2139,7 @@ mod tests {
         let original_l0s = &state.db_state().clone().tree.l0;
         let original_srs = &state.db_state().clone().tree.compacted;
         // L0: from 4th onward (index > 2)
-        let l0_sources = original_l0s.iter().skip(3).map(|h| SourceId::SstView(h.id));
+        let l0_sources = original_l0s.iter().skip(3).map(|h| SstView(h.id));
 
         // SRs: first 3 (index < 3)
         let sr_sources = original_srs
@@ -2212,7 +2231,7 @@ mod tests {
     }
 
     fn build_l0_compaction(ssts: &VecDeque<SsTableView>, dst: u32) -> CompactionSpec {
-        let sources = ssts.iter().map(|h| SourceId::SstView(h.id)).collect();
+        let sources = ssts.iter().map(|h| SstView(h.id)).collect();
         CompactionSpec::new(sources, dst)
     }
 
@@ -2398,13 +2417,13 @@ mod tests {
         }];
 
         let first_id = rand.rng().gen_ulid(system_clock.as_ref());
-        let first = CompactionSpec::drain_segment(prefix.clone(), vec![SourceId::SstView(l0_a.id)]);
+        let first = CompactionSpec::drain_segment(prefix.clone(), vec![SstView(l0_a.id)]);
         state
             .add_compaction(Compaction::new(first_id, first))
             .expect("first drain must register");
 
         let second_id = rand.rng().gen_ulid(system_clock.as_ref());
-        let second = CompactionSpec::drain_segment(prefix, vec![SourceId::SstView(l0_b.id)]);
+        let second = CompactionSpec::drain_segment(prefix, vec![SstView(l0_b.id)]);
         let err = state
             .add_compaction(Compaction::new(second_id, second))
             .expect_err("second drain on same segment must be rejected");
@@ -2444,13 +2463,13 @@ mod tests {
         ];
 
         let first_id = rand.rng().gen_ulid(system_clock.as_ref());
-        let first = CompactionSpec::drain_segment(prefix_a, vec![SourceId::SstView(l0_a.id)]);
+        let first = CompactionSpec::drain_segment(prefix_a, vec![SstView(l0_a.id)]);
         state
             .add_compaction(Compaction::new(first_id, first))
             .expect("first drain must register");
 
         let second_id = rand.rng().gen_ulid(system_clock.as_ref());
-        let second = CompactionSpec::drain_segment(prefix_b, vec![SourceId::SstView(l0_b.id)]);
+        let second = CompactionSpec::drain_segment(prefix_b, vec![SstView(l0_b.id)]);
         state
             .add_compaction(Compaction::new(second_id, second))
             .expect("drain on a different segment must register");
@@ -2476,7 +2495,7 @@ mod tests {
         }];
 
         let compaction_id = rand.rng().gen_ulid(system_clock.as_ref());
-        let spec = CompactionSpec::drain_segment(prefix, vec![SourceId::SstView(l0.id)]);
+        let spec = CompactionSpec::drain_segment(prefix, vec![SstView(l0.id)]);
         state
             .add_compaction(Compaction::new(compaction_id, spec))
             .expect("drain submission must register");
@@ -2498,7 +2517,7 @@ mod tests {
     fn drain_test_view(seed: u64) -> SsTableView {
         let ulid = Ulid::from_parts(seed, 0);
         SsTableView::identity(SsTableHandle::new(
-            SsTableId::Compacted(ulid),
+            SsTableId::from(ulid),
             SST_FORMAT_VERSION_LATEST,
             SsTableInfo::default(),
         ))
@@ -2531,8 +2550,8 @@ mod tests {
         let spec = CompactionSpec::drain_segment(
             prefix.clone(),
             vec![
-                SourceId::SstView(l0_newer.id),
-                SourceId::SstView(l0_older.id),
+                SstView(l0_newer.id),
+                SstView(l0_older.id),
                 SourceId::SortedRun(sr.id),
             ],
         );
@@ -2579,8 +2598,7 @@ mod tests {
         }];
 
         let compaction_id = rand.rng().gen_ulid(system_clock.as_ref());
-        let spec =
-            CompactionSpec::drain_segment(prefix.clone(), vec![SourceId::SstView(l0_observed.id)]);
+        let spec = CompactionSpec::drain_segment(prefix.clone(), vec![SstView(l0_observed.id)]);
         state
             .add_compaction(Compaction::new(compaction_id, spec))
             .expect("drain compaction must register");
@@ -2600,7 +2618,10 @@ mod tests {
 
     fn build_db(os: Arc<dyn ObjectStore>, tokio_handle: &Handle) -> Db {
         let opts = Settings {
-            l0_sst_size_bytes: 256,
+            // The two seeded puts must land in one L0 SST, so this sits
+            // between the estimated size of a one entry and a two entry
+            // memtable.
+            l0_sst_size_bytes: 300,
             // make sure to run with the compactor disabled. The tests will explicitly
             // manage compaction execution and assert the associated state mutations.
             compactor_options: None,

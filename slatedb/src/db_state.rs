@@ -5,7 +5,9 @@ use crate::manifest::{Manifest, ManifestCore};
 use crate::mem_table::{ImmutableMemtable, KVTable, WritableKVTable};
 use crate::reader::DbStateReader;
 use bytes::Bytes;
+use rand::RngExt;
 use serde::Serialize;
+use slatedb_common::DbRand;
 use slatedb_txn_obj::DirtyObject;
 use std::collections::VecDeque;
 use std::fmt::{Debug, Formatter};
@@ -13,12 +15,11 @@ use std::ops::Bound::{Excluded, Included, Unbounded};
 use std::ops::{Bound, Range, RangeBounds};
 use std::sync::Arc;
 use ulid::Ulid;
-use SsTableId::{Compacted, Wal};
 
 /// A handle to an SSTable — the physical SST on storage.
 #[derive(Clone, PartialEq, Serialize)]
 pub struct SsTableHandle {
-    /// The unique identifier for this SSTable. The table can be either a WAL SST or a compacted SST.
+    /// The unique identifier for this compacted SSTable.
     pub id: SsTableId,
 
     /// The format version that this SSTable was serialized with.
@@ -88,14 +89,10 @@ impl Debug for SsTableView {
 
 impl SsTableView {
     /// Create a view using a deterministic id derived from the SST's own identity.
-    /// Use this only for ephemeral views (e.g. WAL iteration) or legacy migration
-    /// where no `DbRand` is available and the id is not stored in the manifest.
+    /// Use this only where no `DbRand` is available and the id is not stored in
+    /// the manifest.
     pub(crate) fn identity(sst: SsTableHandle) -> Self {
-        let id = match &sst.id {
-            SsTableId::Compacted(ulid) => *ulid,
-            SsTableId::Wal(wal_id) => Ulid::from_parts(*wal_id, 0),
-        };
-        Self::new(id, sst)
+        Self::new(sst.id.value(), sst)
     }
 
     /// Create a new view with no visible_range projection.
@@ -166,10 +163,24 @@ impl SsTableView {
     /// SST owns the range logically but holds no physical keys in it: it
     /// contributes nothing to the projection and is dropped rather than
     /// constructing a view whose physical/visible intersection is empty.
-    pub(crate) fn try_with_visible_range(&self, visible_range: BytesRange) -> Option<Self> {
+    pub(crate) fn try_with_visible_range(
+        &self,
+        visible_range: BytesRange,
+        rand: &DbRand,
+    ) -> Option<Self> {
         self.physical_range().intersect(&visible_range)?;
+        if self.visible_range.as_ref() == Some(&visible_range) {
+            return Some(self.clone());
+        }
+        // A changed range is a new view. Preserve the timestamp for GC watermarks.
+        let id = loop {
+            let id = Ulid::from_parts(self.id.timestamp_ms(), rand.rng().random::<u128>());
+            if id != self.id {
+                break id;
+            }
+        };
         Some(Self::new_projected(
-            self.id,
+            id,
             self.sst.clone(),
             Some(visible_range),
         ))
@@ -188,7 +199,6 @@ impl SsTableView {
     // memtable flushes, which should never produce empty SSTs. This method returns
     // the start bound after applying projections.
     pub(crate) fn compacted_effective_start_bound(&self) -> Bound<Bytes> {
-        assert!(matches!(self.sst.id, Compacted(_)));
         self.effective_range.start_bound().cloned()
     }
 
@@ -196,7 +206,6 @@ impl SsTableView {
     // memtable flushes, which should never produce empty SSTs. This method returns
     // the start key after applying projections.
     pub(crate) fn compacted_effective_start_key(&self) -> &Bytes {
-        assert!(matches!(self.sst.id, Compacted(_)));
         match self.effective_range.start_bound() {
             Included(k) => k,
             _ => unreachable!("Invalid start bound"),
@@ -212,7 +221,6 @@ impl SsTableView {
         next_view: Option<&SsTableView>,
         range: &BytesRange,
     ) -> Option<BytesRange> {
-        assert!(matches!(self.sst.id, Compacted(_)));
         if let Some(next_view) = next_view {
             BytesRange::new(
                 self.compacted_effective_start_bound(),
@@ -253,6 +261,94 @@ impl SsTableView {
     /// Returns an estimate of the underlying SST's on-disk size in bytes.
     pub fn estimate_size(&self) -> u64 {
         self.sst.estimate_size()
+    }
+
+    pub(crate) fn estimate_visible_size(&self) -> u64 {
+        const MIN_ESTIMATED_SIZE_BYTES: f64 = 1.0;
+
+        let raw_size = self.sst.estimate_size();
+        if self.visible_range.is_none() {
+            return raw_size;
+        }
+        let fraction = self.visible_fraction();
+        ((raw_size as f64) * fraction)
+            .round()
+            .max(MIN_ESTIMATED_SIZE_BYTES) as u64
+    }
+
+    /// This function finds the size of the visible part of a file:
+    /// - Compares the start and end keys of the file and the view.
+    /// - Skips the bytes that are equal and reads the bytes after them.
+    /// - Uses these bytes to find the fraction of the full file size.
+    fn visible_fraction(&self) -> f64 {
+        const FULL_VISIBLE_FRACTION: f64 = 1.0;
+        const MIN_VISIBLE_FRACTION: f64 = 1e-6;
+
+        if self.sst.info.last_entry.is_none() {
+            return FULL_VISIBLE_FRACTION;
+        }
+
+        let physical_range = self.physical_range();
+        if self.effective_range == physical_range {
+            return FULL_VISIBLE_FRACTION;
+        }
+
+        let skip = common_prefix_len(physical_range.start_bound(), physical_range.end_bound());
+
+        let (phys_start, phys_end) = Self::range_span(&physical_range, skip);
+        let (vis_start, vis_end) = Self::range_span(&self.effective_range, skip);
+
+        let phys_len = (phys_end - phys_start).max(f64::EPSILON);
+        let vis_len = vis_end - vis_start;
+        if vis_len == 0.0 {
+            return FULL_VISIBLE_FRACTION;
+        }
+
+        (vis_len / phys_len).clamp(MIN_VISIBLE_FRACTION, FULL_VISIBLE_FRACTION)
+    }
+
+    /// This function finds a position number for the start and end of a range:
+    /// - Skips the bytes given by `skip`, then reads the bytes after them.
+    /// - Turns these bytes into a number between 0 and 1.
+    /// - Uses 0 for an open start and 1 for an open end.
+    fn range_span(range: &BytesRange, skip: usize) -> (f64, f64) {
+        const KEYSPACE_START: f64 = 0.0;
+        const KEYSPACE_END: f64 = 1.0;
+
+        fn key_fraction(key: &[u8], skip: usize) -> f64 {
+            const BYTE_VALUE_RANGE: f64 = 256.0;
+            const FRACTION_WINDOW_BYTES: usize = 8;
+
+            let key = key.get(skip..).unwrap_or(&[]);
+            let mut frac = 0.0_f64;
+            let mut scale = 1.0_f64 / BYTE_VALUE_RANGE;
+            // The code reads up to 8 bytes after the skip point, which gives a fine result for almost all keys.
+            // Checking more bytes adds little value, but costs a little more time.
+            for &byte in key.iter().take(FRACTION_WINDOW_BYTES) {
+                frac += byte as f64 * scale;
+                scale /= BYTE_VALUE_RANGE;
+            }
+            frac
+        }
+
+        let start = match range.start_bound() {
+            Unbounded => KEYSPACE_START,
+            Included(k) | Excluded(k) => key_fraction(k, skip),
+        };
+        let end = match range.end_bound() {
+            Unbounded => KEYSPACE_END,
+            Included(k) | Excluded(k) => key_fraction(k, skip),
+        };
+        (start, end)
+    }
+}
+
+fn common_prefix_len(a: Bound<&Bytes>, b: Bound<&Bytes>) -> usize {
+    match (a, b) {
+        (Included(a) | Excluded(a), Included(b) | Excluded(b)) => {
+            a.iter().zip(b.iter()).take_while(|(x, y)| x == y).count()
+        }
+        _ => 0,
     }
 }
 
@@ -356,40 +452,29 @@ pub(crate) fn max_l0_overlap(l0: &VecDeque<SsTableView>) -> usize {
     peak as usize
 }
 
-/// An identifier for an SSTable, which can be either a WAL SST or a compacted SST.
+/// An identifier for a compacted SSTable.
 #[derive(Clone, PartialEq, PartialOrd, Ord, Hash, Eq, Copy, Serialize)]
-pub enum SsTableId {
-    /// A WAL SST identified by its unique WAL ID.
-    Wal(u64),
-
-    /// A compacted SST identified by its ULID.
-    Compacted(Ulid),
-}
+pub struct SsTableId(Ulid);
 
 impl SsTableId {
-    #[allow(clippy::panic)]
-    pub fn unwrap_wal_id(&self) -> u64 {
-        match self {
-            Wal(wal_id) => *wal_id,
-            Compacted(_) => panic!("found compacted id when unwrapping WAL ID"),
-        }
+    pub const fn new(value: Ulid) -> Self {
+        Self(value)
     }
 
-    #[allow(clippy::panic)]
-    pub fn unwrap_compacted_id(&self) -> Ulid {
-        match self {
-            Wal(_) => panic!("found WAL id when unwrapping compacted ID"),
-            Compacted(ulid) => *ulid,
-        }
+    pub fn value(&self) -> Ulid {
+        self.0
+    }
+}
+
+impl From<Ulid> for SsTableId {
+    fn from(value: Ulid) -> Self {
+        Self::new(value)
     }
 }
 
 impl Debug for SsTableId {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> Result<(), std::fmt::Error> {
-        match self {
-            Wal(id) => write!(f, "SsTableId::Wal({})", id),
-            Compacted(id) => write!(f, "SsTableId::Compacted({})", id.to_string()),
-        }
+    fn fmt(&self, f: &mut Formatter) -> Result<(), std::fmt::Error> {
+        write!(f, "SsTableId({})", self.0)
     }
 }
 
@@ -404,11 +489,8 @@ pub enum SstType {
 }
 
 impl From<&SsTableId> for SstType {
-    fn from(id: &SsTableId) -> Self {
-        match id {
-            SsTableId::Wal(_) => SstType::Wal,
-            SsTableId::Compacted(_) => SstType::Compacted,
-        }
+    fn from(_id: &SsTableId) -> Self {
+        SstType::Compacted
     }
 }
 
@@ -516,6 +598,13 @@ impl SortedRun {
     /// Estimate the total size of all SSTables in this sorted run.
     pub fn estimate_size(&self) -> u64 {
         self.sst_views.iter().map(|sst| sst.estimate_size()).sum()
+    }
+
+    pub(crate) fn estimate_visible_size(&self) -> u64 {
+        self.sst_views
+            .iter()
+            .map(|sst| sst.estimate_visible_size())
+            .sum()
     }
 
     /// Cheap O(1) check: does the run's overall key span overlap `range`?
@@ -864,9 +953,10 @@ mod tests {
     use proptest::collection::vec;
     use proptest::proptest;
     use slatedb_common::clock::{DefaultSystemClock, SystemClock};
+    use slatedb_common::DbRand;
     use std::collections::BTreeSet;
-    use std::collections::Bound::Included;
     use std::collections::VecDeque;
+    use std::ops::Bound::{Excluded, Included, Unbounded};
     use std::ops::RangeBounds;
     use std::sync::Arc;
 
@@ -900,7 +990,7 @@ mod tests {
     #[test]
     fn test_merge_remote_manifest_reestablishes_external_sst_invariant() {
         let mut db_state = DbState::new(new_dirty_manifest());
-        let stale_id = SsTableId::Compacted(ulid::Ulid::new());
+        let stale_id = SsTableId::from(ulid::Ulid::new());
         let mut remote = new_dirty_manifest();
         remote.value.external_dbs = vec![crate::manifest::ExternalDb {
             path: "/parent/db".to_string(),
@@ -986,7 +1076,7 @@ mod tests {
         fn view(seq: u64) -> SsTableView {
             let ulid = ulid::Ulid::from_parts(seq, 0);
             SsTableView::identity(SsTableHandle::new(
-                SsTableId::Compacted(ulid),
+                SsTableId::from(ulid),
                 SST_FORMAT_VERSION_LATEST,
                 SsTableInfo::default(),
             ))
@@ -1039,7 +1129,7 @@ mod tests {
         fn view(seq: u64) -> SsTableView {
             let ulid = ulid::Ulid::from_parts(seq, 0);
             SsTableView::identity(SsTableHandle::new(
-                SsTableId::Compacted(ulid),
+                SsTableId::from(ulid),
                 SST_FORMAT_VERSION_LATEST,
                 SsTableInfo::default(),
             ))
@@ -1133,7 +1223,7 @@ mod tests {
             db_state.freeze_memtable(i as u64);
             let imm = db_state.state.imm_memtable.back().unwrap().clone();
             let handle = SsTableHandle::new(
-                SsTableId::Compacted(ulid::Ulid::from_parts(i as u64, 0)),
+                SsTableId::from(ulid::Ulid::from_parts(i as u64, 0)),
                 SST_FORMAT_VERSION_LATEST,
                 dummy_info.clone(),
             );
@@ -1247,7 +1337,7 @@ mod tests {
 
     fn create_compacted_sst_view(first_entry: Option<Bytes>) -> SsTableView {
         let sst_info = create_sst_info(first_entry);
-        let sst_id = SsTableId::Compacted(ulid::Ulid::from_parts(0, 0));
+        let sst_id = SsTableId::from(ulid::Ulid::from_parts(0, 0));
         let handle = SsTableHandle::new(sst_id, SST_FORMAT_VERSION_LATEST, sst_info);
         SsTableView::identity(handle)
     }
@@ -1261,7 +1351,7 @@ mod tests {
             last_entry: last_entry.map(Bytes::copy_from_slice),
             ..Default::default()
         };
-        let sst_id = SsTableId::Compacted(ulid::Ulid::new());
+        let sst_id = SsTableId::from(ulid::Ulid::new());
         let handle = SsTableHandle::new(sst_id, SST_FORMAT_VERSION_LATEST, sst_info);
         SsTableView::identity(handle)
     }
@@ -1273,9 +1363,184 @@ mod tests {
         }
     }
 
+    fn create_compacted_sst_view_with_size(
+        first_entry: &[u8],
+        last_entry: &[u8],
+        raw_size: u64,
+    ) -> SsTableView {
+        let sst_info = SsTableInfo {
+            first_entry: Some(Bytes::copy_from_slice(first_entry)),
+            last_entry: Some(Bytes::copy_from_slice(last_entry)),
+            index_offset: raw_size,
+            ..Default::default()
+        };
+        let sst_id = SsTableId::new(ulid::Ulid::new());
+        let handle = SsTableHandle::new(sst_id, SST_FORMAT_VERSION_LATEST, sst_info);
+        SsTableView::identity(handle)
+    }
+
+    #[test]
+    fn test_projection_assigns_new_view_ids_only_when_range_changes() {
+        let base = create_compacted_sst_view_with_size(b"a", b"z", 100);
+        let rand = DbRand::new(42);
+        let left_range = BytesRange::from_ref("a".."m");
+        let left = base
+            .try_with_visible_range(left_range.clone(), &rand)
+            .unwrap();
+        let right = base
+            .try_with_visible_range(BytesRange::from_ref("m"..="z"), &rand)
+            .unwrap();
+
+        assert_ne!(left.id, base.id);
+        assert_ne!(right.id, base.id);
+        assert_ne!(left.id, right.id);
+        for view in [&left, &right] {
+            assert_eq!(view.id.timestamp_ms(), base.id.timestamp_ms());
+            assert_eq!(view.sst, base.sst);
+        }
+        assert_eq!(left.visible_range, Some(left_range.clone()));
+        assert_eq!(left.try_with_visible_range(left_range, &rand), Some(left));
+        assert!(base
+            .try_with_visible_range(BytesRange::from_ref("zz"..), &rand)
+            .is_none());
+        assert_eq!(base.visible_range, None);
+    }
+
+    #[test]
+    fn estimate_size_unprojected_view_returns_raw_physical_size() {
+        let view = create_compacted_sst_view_with_size(b"a", b"z", 1_000_000);
+        assert_eq!(view.estimate_size(), 1_000_000);
+    }
+
+    #[test]
+    fn estimate_visible_size_scales_projected_views_by_visible_fraction() {
+        let raw_size = 1_000_000u64;
+        let base = create_compacted_sst_view_with_size(b"a", b"z", raw_size);
+
+        let a = Bytes::copy_from_slice(b"a");
+        let m = Bytes::copy_from_slice(b"m");
+        let z = Bytes::copy_from_slice(b"z");
+
+        let first_half = base.with_visible_range(BytesRange::new(Included(a), Excluded(m.clone())));
+        let second_half = base.with_visible_range(BytesRange::new(Included(m), Included(z)));
+
+        let first_size = first_half.estimate_visible_size();
+        let second_size = second_half.estimate_visible_size();
+
+        assert!(
+            first_size < raw_size && second_size < raw_size,
+            "projected views must not report the full physical size: \
+             first={first_size}, second={second_size}, raw={raw_size}"
+        );
+
+        let summed = first_size + second_size;
+        let lower = (raw_size as f64 * 0.8) as u64;
+        let upper = (raw_size as f64 * 1.2) as u64;
+        assert!(
+            (lower..=upper).contains(&summed),
+            "sibling views over disjoint halves of one physical SST should \
+             sum to ~raw_size, got {summed} (raw={raw_size})"
+        );
+    }
+
+    #[test]
+    fn estimate_visible_size_single_key_visible_range_falls_back_to_raw_size() {
+        let raw_size = 1_000_000u64;
+        let prefix = b"tenant00";
+        let low = [prefix.as_slice(), &[0]].concat();
+        let high = [prefix.as_slice(), &[200]].concat();
+        let base = create_compacted_sst_view_with_size(&low, &high, raw_size);
+
+        let point = base.with_visible_range(BytesRange::new(
+            Included(Bytes::copy_from_slice(&low)),
+            Included(Bytes::copy_from_slice(&low)),
+        ));
+        assert_eq!(point.estimate_visible_size(), raw_size);
+    }
+
+    #[test]
+    fn estimate_visible_size_single_key_sst_fully_visible_returns_raw_size() {
+        let raw_size = 1_000_000u64;
+        let key = b"tenant0000000";
+        let base = create_compacted_sst_view_with_size(key, key, raw_size);
+
+        let projected = base.with_visible_range(BytesRange::new(
+            Included(Bytes::copy_from_slice(key)),
+            Included(Bytes::copy_from_slice(key)),
+        ));
+        assert_eq!(projected.estimate_visible_size(), raw_size);
+    }
+
+    #[test]
+    fn estimate_visible_size_shared_prefix_does_not_collapse() {
+        let raw_size = 1_000_000u64;
+        let prefix = b"tenant00";
+        let phys_low = [prefix.as_slice(), &[0]].concat();
+        let phys_high = [prefix.as_slice(), &[200]].concat();
+        let base = create_compacted_sst_view_with_size(&phys_low, &phys_high, raw_size);
+
+        let vis_low = [prefix.as_slice(), &[0]].concat();
+        let vis_high = [prefix.as_slice(), &[2]].concat();
+        let slice = base.with_visible_range(BytesRange::new(
+            Included(Bytes::copy_from_slice(&vis_low)),
+            Excluded(Bytes::copy_from_slice(&vis_high)),
+        ));
+
+        let size = slice.estimate_visible_size();
+        assert_ne!(
+            size, 1,
+            "shared long prefix must not collapse the estimate to the 1-byte floor"
+        );
+        assert!(
+            (1_000..100_000).contains(&size),
+            "expected roughly a 1% slice of raw_size, got {size} (raw={raw_size})"
+        );
+    }
+
+    #[test]
+    fn estimate_visible_size_ambiguous_deep_divergence_falls_back_to_raw_size() {
+        let raw_size = 1_000_000u64;
+        let phys_low = vec![0x10u8];
+        let phys_high = vec![0xF0u8];
+        let base = create_compacted_sst_view_with_size(&phys_low, &phys_high, raw_size);
+
+        let vis_low = vec![0x50u8, 0, 0, 0, 0, 0, 0, 0, 0x00];
+        let vis_high = vec![0x50u8, 0, 0, 0, 0, 0, 0, 0, 0xFF];
+        let view = base.with_visible_range(BytesRange::new(
+            Included(Bytes::copy_from_slice(&vis_low)),
+            Included(Bytes::copy_from_slice(&vis_high)),
+        ));
+
+        assert_eq!(view.estimate_visible_size(), raw_size);
+    }
+
+    #[test]
+    fn estimate_visible_size_missing_last_entry_falls_back_to_raw_size() {
+        let raw_size = 1_000_000u64;
+        let sst_info = SsTableInfo {
+            first_entry: Some(Bytes::copy_from_slice(&[0x00])),
+            last_entry: None,
+            index_offset: raw_size,
+            ..Default::default()
+        };
+        let handle = SsTableHandle::new(
+            SsTableId::new(ulid::Ulid::new()),
+            SST_FORMAT_VERSION_LATEST,
+            sst_info,
+        );
+        let base = SsTableView::identity(handle);
+
+        let view = base.with_visible_range(BytesRange::new(
+            Included(Bytes::copy_from_slice(&[0x00])),
+            Included(Bytes::copy_from_slice(&[0x01])),
+        ));
+
+        assert_eq!(view.estimate_visible_size(), raw_size);
+    }
+
     #[test]
     fn max_l0_overlap_empty_is_zero() {
-        let l0: std::collections::VecDeque<SsTableView> = std::collections::VecDeque::new();
+        let l0: VecDeque<SsTableView> = VecDeque::new();
         assert_eq!(super::max_l0_overlap(&l0), 0);
     }
 
@@ -1283,7 +1548,7 @@ mod tests {
     fn max_l0_overlap_disjoint_ranges_is_one() {
         // Simulates a post-union manifest where each source's L0s cover
         // disjoint key ranges — the peak per-point count stays at 1.
-        let mut l0 = std::collections::VecDeque::new();
+        let mut l0 = VecDeque::new();
         l0.push_back(create_compacted_sst_view_with_bounds(b"a", Some(b"b")));
         l0.push_back(create_compacted_sst_view_with_bounds(b"c", Some(b"d")));
         l0.push_back(create_compacted_sst_view_with_bounds(b"e", Some(b"f")));
@@ -1293,7 +1558,7 @@ mod tests {
 
     #[test]
     fn max_l0_overlap_full_overlap_counts_all() {
-        let mut l0 = std::collections::VecDeque::new();
+        let mut l0 = VecDeque::new();
         for _ in 0..4 {
             l0.push_back(create_compacted_sst_view_with_bounds(b"a", Some(b"z")));
         }
@@ -1303,7 +1568,7 @@ mod tests {
     #[test]
     fn max_l0_overlap_partial_overlap() {
         // A: [a, c], B: [b, d]. At B.start=b, both A and B contain b.
-        let mut l0 = std::collections::VecDeque::new();
+        let mut l0 = VecDeque::new();
         l0.push_back(create_compacted_sst_view_with_bounds(b"a", Some(b"c")));
         l0.push_back(create_compacted_sst_view_with_bounds(b"b", Some(b"d")));
         assert_eq!(super::max_l0_overlap(&l0), 2);
@@ -1312,7 +1577,7 @@ mod tests {
     #[test]
     fn max_l0_overlap_mixed_disjoint_groups() {
         // Two disjoint groups of 3 overlapping SSTs each. Peak is 3, not 6.
-        let mut l0 = std::collections::VecDeque::new();
+        let mut l0 = VecDeque::new();
         for _ in 0..3 {
             l0.push_back(create_compacted_sst_view_with_bounds(b"a", Some(b"c")));
         }
@@ -1325,7 +1590,7 @@ mod tests {
     #[test]
     fn max_l0_overlap_single_point_range_is_one() {
         // A view whose first_entry == last_entry covers exactly one key.
-        let mut l0 = std::collections::VecDeque::new();
+        let mut l0 = VecDeque::new();
         l0.push_back(create_compacted_sst_view_with_bounds(b"k", Some(b"k")));
         assert_eq!(super::max_l0_overlap(&l0), 1);
     }
@@ -1333,7 +1598,7 @@ mod tests {
     #[test]
     fn max_l0_overlap_many_point_ranges_same_key() {
         // N coincident point ranges [k, k] all cover key k → peak N.
-        let mut l0 = std::collections::VecDeque::new();
+        let mut l0 = VecDeque::new();
         for _ in 0..5 {
             l0.push_back(create_compacted_sst_view_with_bounds(b"k", Some(b"k")));
         }
@@ -1344,7 +1609,7 @@ mod tests {
     fn max_l0_overlap_mixed_point_and_longer_ranges_at_same_key() {
         // Two point ranges [k, k] and two longer ranges [k, z] all cover k.
         // Peak at k is 4; past k, only the two longer ranges remain.
-        let mut l0 = std::collections::VecDeque::new();
+        let mut l0 = VecDeque::new();
         l0.push_back(create_compacted_sst_view_with_bounds(b"k", Some(b"k")));
         l0.push_back(create_compacted_sst_view_with_bounds(b"k", Some(b"k")));
         l0.push_back(create_compacted_sst_view_with_bounds(b"k", Some(b"z")));
@@ -1355,7 +1620,7 @@ mod tests {
     #[test]
     fn max_l0_overlap_edge_touching_inclusive_counts_both() {
         // [a, b] and [b, c]: both contain b → peak 2.
-        let mut l0 = std::collections::VecDeque::new();
+        let mut l0 = VecDeque::new();
         l0.push_back(create_compacted_sst_view_with_bounds(b"a", Some(b"b")));
         l0.push_back(create_compacted_sst_view_with_bounds(b"b", Some(b"c")));
         assert_eq!(super::max_l0_overlap(&l0), 2);
@@ -1367,14 +1632,10 @@ mod tests {
         // First view has an Excluded end at b via a visible_range projection.
         let a = Bytes::copy_from_slice(b"a");
         let b = Bytes::copy_from_slice(b"b");
-        let v1 = create_compacted_sst_view_with_bounds(b"a", Some(b"b")).with_visible_range(
-            BytesRange::new(
-                std::ops::Bound::Included(a),
-                std::ops::Bound::Excluded(b.clone()),
-            ),
-        );
+        let v1 = create_compacted_sst_view_with_bounds(b"a", Some(b"b"))
+            .with_visible_range(BytesRange::new(Included(a), Excluded(b.clone())));
         let v2 = create_compacted_sst_view_with_bounds(b"b", Some(b"c"));
-        let mut l0 = std::collections::VecDeque::new();
+        let mut l0 = VecDeque::new();
         l0.push_back(v1);
         l0.push_back(v2);
         assert_eq!(super::max_l0_overlap(&l0), 1);
@@ -1384,7 +1645,7 @@ mod tests {
     fn max_l0_overlap_unbounded_end_single_view() {
         // A view with first_entry but no last_entry has effective_range
         // [first, Unbounded) — still one view, peak 1.
-        let mut l0 = std::collections::VecDeque::new();
+        let mut l0 = VecDeque::new();
         l0.push_back(create_compacted_sst_view_with_bounds(b"a", None));
         assert_eq!(super::max_l0_overlap(&l0), 1);
     }
@@ -1393,7 +1654,7 @@ mod tests {
     fn max_l0_overlap_unbounded_ends_share_tail() {
         // [a, ∞) and [b, ∞) both extend to +∞, so they overlap at every
         // point ≥ b. Peak is 2.
-        let mut l0 = std::collections::VecDeque::new();
+        let mut l0 = VecDeque::new();
         l0.push_back(create_compacted_sst_view_with_bounds(b"a", None));
         l0.push_back(create_compacted_sst_view_with_bounds(b"b", None));
         assert_eq!(super::max_l0_overlap(&l0), 2);
@@ -1403,7 +1664,7 @@ mod tests {
     fn max_l0_overlap_mixed_bounded_and_unbounded_end() {
         // [a, m] ends at m; [b, ∞) starts before m and extends past it.
         // They coexist on [b, m]. Peak is 2.
-        let mut l0 = std::collections::VecDeque::new();
+        let mut l0 = VecDeque::new();
         l0.push_back(create_compacted_sst_view_with_bounds(b"a", Some(b"m")));
         l0.push_back(create_compacted_sst_view_with_bounds(b"b", None));
         assert_eq!(super::max_l0_overlap(&l0), 2);
@@ -1415,11 +1676,10 @@ mod tests {
         // Effective range becomes [m, z] (physical end clamps the Unbounded).
         // Pair with [n, ∞): overlap on [n, z]. Peak is 2.
         let m = Bytes::copy_from_slice(b"m");
-        let projected = create_compacted_sst_view_with_bounds(b"a", Some(b"z")).with_visible_range(
-            BytesRange::new(std::ops::Bound::Included(m), std::ops::Bound::Unbounded),
-        );
+        let projected = create_compacted_sst_view_with_bounds(b"a", Some(b"z"))
+            .with_visible_range(BytesRange::new(Included(m), Unbounded));
         let open = create_compacted_sst_view_with_bounds(b"n", None);
-        let mut l0 = std::collections::VecDeque::new();
+        let mut l0 = VecDeque::new();
         l0.push_back(projected);
         l0.push_back(open);
         assert_eq!(super::max_l0_overlap(&l0), 2);
@@ -1432,19 +1692,11 @@ mod tests {
         let lo = Bytes::copy_from_slice(b"a");
         let mid = Bytes::copy_from_slice(b"m");
         let hi = Bytes::copy_from_slice(b"z");
-        let v1 = create_compacted_sst_view_with_bounds(b"a", Some(b"z")).with_visible_range(
-            BytesRange::new(
-                std::ops::Bound::Included(lo.clone()),
-                std::ops::Bound::Excluded(mid.clone()),
-            ),
-        );
-        let v2 = create_compacted_sst_view_with_bounds(b"a", Some(b"z")).with_visible_range(
-            BytesRange::new(
-                std::ops::Bound::Included(mid),
-                std::ops::Bound::Included(hi),
-            ),
-        );
-        let mut l0 = std::collections::VecDeque::new();
+        let v1 = create_compacted_sst_view_with_bounds(b"a", Some(b"z"))
+            .with_visible_range(BytesRange::new(Included(lo.clone()), Excluded(mid.clone())));
+        let v2 = create_compacted_sst_view_with_bounds(b"a", Some(b"z"))
+            .with_visible_range(BytesRange::new(Included(mid), Included(hi)));
+        let mut l0 = VecDeque::new();
         l0.push_back(v1);
         l0.push_back(v2);
         assert_eq!(super::max_l0_overlap(&l0), 1);
@@ -1484,7 +1736,7 @@ mod tests {
             });
 
         proptest!(ProptestConfig::with_cases(256), |(specs in vec(spec, 0..=8))| {
-            let mut l0 = std::collections::VecDeque::new();
+            let mut l0 = VecDeque::new();
             for s in &specs {
                 let view = match &s.end {
                     EndKind::Inclusive(end) => {
@@ -1497,8 +1749,8 @@ mod tests {
                         &s.start, None,
                     )
                     .with_visible_range(BytesRange::new(
-                        std::ops::Bound::Included(s.start.clone()),
-                        std::ops::Bound::Excluded(end.clone()),
+                        Included(s.start.clone()),
+                        Excluded(end.clone()),
                     )),
                 };
                 l0.push_back(view);

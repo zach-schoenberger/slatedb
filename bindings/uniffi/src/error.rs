@@ -1,3 +1,4 @@
+use std::error::Error as StdError;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -5,7 +6,7 @@ pub(crate) enum SlateDbError {
     #[error("key cannot be empty")]
     EmptyKey,
 
-    #[error("key size must be <= u16::MAX")]
+    #[error("key size must be <= u32::MAX")]
     KeyTooLarge,
 
     #[error("value size must be <= u32::MAX")]
@@ -35,6 +36,15 @@ pub(crate) enum SlateDbError {
     #[error("invalid timestamp seconds: {timestamp_secs}")]
     InvalidTimestampSeconds { timestamp_secs: i64 },
 
+    #[error("invalid timestamp millis: {ts_millis}")]
+    InvalidTimestampMillis { ts_millis: i64 },
+
+    #[error("mock clock cannot move backwards from {now_millis} to {ts_millis}")]
+    ClockMovedBackwards { ts_millis: i64, now_millis: i64 },
+
+    #[error("only a mock clock can be advanced or set")]
+    ClockNotMock,
+
     #[error("range start must not be greater than range end")]
     RangeStartGreaterThanEnd,
 
@@ -58,6 +68,30 @@ pub(crate) enum SlateDbError {
 
     #[error("settings update produced invalid settings: {source}")]
     InvalidSettingsUpdate { source: serde_json::Error },
+
+    #[error("object store creation failed: {source}")]
+    ObjectStoreCreationError {
+        #[from]
+        source: Box<dyn StdError>,
+    },
+
+    #[error("invalid {provider} object store config key: {key}")]
+    InvalidObjectStoreConfigKey { provider: &'static str, key: String },
+
+    #[error("missing required {provider} object store config key: {key}")]
+    MissingObjectStoreConfigKey {
+        provider: &'static str,
+        key: &'static str,
+    },
+
+    #[error("invalid object store url {url:?}: {source}")]
+    InvalidObjectStoreUrl {
+        url: String,
+        source: url::ParseError,
+    },
+
+    #[error("unsupported object store scheme in url {url:?}")]
+    UnsupportedObjectStoreScheme { url: String },
 }
 
 /// Error returned by a foreign [`crate::MergeOperator`] implementation.
@@ -66,6 +100,26 @@ pub enum MergeOperatorCallbackError {
     /// The merge callback failed with an application-defined message.
     #[error("{message}")]
     Failed { message: String },
+}
+
+/// Error returned by a foreign [`crate::BlockTransformer`] implementation.
+/// Any other error or exception the foreign method raises becomes `Failed`.
+#[derive(Debug, Error, uniffi::Error)]
+pub enum BlockTransformerCallbackError {
+    /// The transform failed with an application-defined message.
+    #[error("{message}")]
+    Failed { message: String },
+}
+
+impl From<uniffi::UnexpectedUniFFICallbackError> for BlockTransformerCallbackError {
+    fn from(error: uniffi::UnexpectedUniFFICallbackError) -> Self {
+        let message = if error.reason.is_empty() {
+            "foreign transformer failed without a message".to_owned()
+        } else {
+            error.reason
+        };
+        Self::Failed { message }
+    }
 }
 
 /// Reason a database or reader reports itself as closed.
@@ -147,5 +201,62 @@ impl From<slatedb::Error> for Error {
             slatedb::ErrorKind::Internal => Error::Internal { message },
             _ => Error::Internal { message },
         }
+    }
+}
+
+impl From<slatedb::wal::WalError> for Error {
+    fn from(error: slatedb::wal::WalError) -> Self {
+        let message = error.to_string();
+        match error {
+            slatedb::wal::WalError::Fenced => Error::Closed {
+                reason: CloseReason::Fenced,
+                message,
+            },
+            slatedb::wal::WalError::Closed => Error::Closed {
+                reason: CloseReason::Clean,
+                message,
+            },
+            slatedb::wal::WalError::Unavailable(_) => Error::Unavailable { message },
+            slatedb::wal::WalError::WalTruncated(_) | slatedb::wal::WalError::DataError(_) => {
+                Error::Data { message }
+            }
+            slatedb::wal::WalError::InternalError(_) => Error::Internal { message },
+            _ => Error::Internal { message },
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::*;
+
+    #[test]
+    fn wal_errors_preserve_binding_categories() {
+        assert!(matches!(
+            Error::from(slatedb::wal::WalError::WalTruncated(7)),
+            Error::Data { .. }
+        ));
+        assert!(matches!(
+            Error::from(slatedb::wal::WalError::Unavailable(Arc::new(
+                std::io::Error::other("offline")
+            ))),
+            Error::Unavailable { .. }
+        ));
+        assert!(matches!(
+            Error::from(slatedb::wal::WalError::Fenced),
+            Error::Closed {
+                reason: CloseReason::Fenced,
+                ..
+            }
+        ));
+        assert!(matches!(
+            Error::from(slatedb::wal::WalError::Closed),
+            Error::Closed {
+                reason: CloseReason::Clean,
+                ..
+            }
+        ));
     }
 }

@@ -144,6 +144,7 @@ harness = false
 [[bench]]
 name = "scan_prefix_bench"
 harness = false
+required-features = ["foyer"]
 
 [[bench]]
 name = "scan_prefix_large_sorted_run_bench"
@@ -163,5 +164,13 @@ required-features = ["bench-internal"]
 name = "db_transaction"
 harness = false
 
+[[bench]]
+name = "memtable_seek"
+harness = false
+
 [lints]
 workspace = true
+
+[[test]]
+name = "foyer_cache_flush"
+required-features = ["foyer"]

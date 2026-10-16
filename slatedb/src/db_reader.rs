@@ -1,3 +1,4 @@
+use crate::wal::slatedb::reader::SlateDbWalReaderOptions;
 use {
     crate::{
         bytes_range::{ByteRangeBounds, BytesRange},
@@ -7,7 +8,7 @@ use {
         db_cache::CacheTarget,
         db_cache_manager,
         db_common::extract_segment_prefix,
-        db_state::{collect_touched_segments, SsTableId},
+        db_state::{collect_touched_segments, SsTableHandle, SsTableId},
         db_stats::DbStats,
         db_status::{ClosedResultWriter, DbStatus, DbStatusManager},
         dispatcher::{MessageHandler, MessageHandlerExecutor, MessageTickerDef},
@@ -25,6 +26,7 @@ use {
         tablestore::TableStore,
         types::KeyValue,
         utils::IdGenerator,
+        wal::slatedb::store::WalTableStore,
         wal::WalReader as WalReaderTrait,
         wal_replay::{WalReplayIterator, WalReplayOptions},
         Checkpoint, DbCacheManagerOps, DbIterator, DbMetadataOps, DbReadOps,
@@ -172,6 +174,7 @@ impl DbReaderInner {
     async fn new(
         manifest_store: Arc<ManifestStore>,
         table_store: Arc<TableStore>,
+        wal_store: Arc<WalTableStore>,
         wal_reader: Option<Arc<dyn WalReaderTrait>>,
         options: DbReaderOptions,
         mode: DbReaderMode,
@@ -182,11 +185,6 @@ impl DbReaderInner {
         recorder: slatedb_common::metrics::MetricsRecorderHelper,
         mut manifest: StoredManifest,
     ) -> Result<Self, SlateDBError> {
-        let wal_reader = wal_reader.unwrap_or_else(|| {
-            Arc::new(crate::wal::reader::SlateDbWalReader::new(Arc::clone(
-                &table_store,
-            )))
-        });
         let checkpoint =
             Self::get_or_create_checkpoint(&mut manifest, mode, &options, rand.clone()).await?;
         let (manifest_id, initial_manifest) = if let Some(checkpoint) = checkpoint.as_ref() {
@@ -197,6 +195,22 @@ impl DbReaderInner {
         } else {
             (manifest.id(), manifest.manifest().clone())
         };
+        let status_manager = DbStatusManager::new_with_initial_values(
+            initial_manifest.core.last_l0_seq,
+            VersionedManifest::from_manifest(manifest_id, initial_manifest.clone()),
+            BTreeSet::default(),
+        );
+        let wal_reader = wal_reader.unwrap_or_else(|| {
+            Arc::new(
+                crate::wal::slatedb::reader::SlateDbWalReader::new_with_status_manager(
+                    wal_store,
+                    &status_manager,
+                    Arc::clone(&system_clock),
+                    SlateDbWalReaderOptions::default(),
+                ),
+            )
+        });
+
         let initial_state = Arc::new(
             Self::build_reader_state(
                 checkpoint,
@@ -217,13 +231,15 @@ impl DbReaderInner {
             initial_state.core().last_l0_clock_tick,
         ));
 
-        // initial_state contains the last_committed_seq after WAL replay. in no-wal mode, we can
-        // simply fallback to last_l0_seq.
         let initial_durable_seq = initial_state
             .last_remote_persisted_seq
             .max(initial_state.core().last_l0_seq);
-        let status_manager = DbStatusManager::new_with_initial_values(
-            initial_durable_seq,
+        status_manager.report_durable_seq(
+            initial_state
+                .last_remote_persisted_seq
+                .max(initial_state.core().last_l0_seq),
+        );
+        status_manager.report_manifest_and_memtable_segments(
             VersionedManifest::from(initial_state.as_ref()),
             collect_touched_segments(initial_state.as_ref()),
         );
@@ -871,7 +887,7 @@ impl DbReader {
     pub(crate) async fn preload_cache(
         &self,
         cached_obj_store: &CachedObjectStore,
-        path: object_store::path::Path,
+        path: Path,
     ) -> Result<(), SlateDBError> {
         let state = Arc::clone(&self.inner.state.read());
         let external_ssts = state.manifest.external_ssts();
@@ -948,6 +964,7 @@ impl DbReader {
     pub(crate) async fn open_internal(
         manifest_store: Arc<ManifestStore>,
         table_store: Arc<TableStore>,
+        wal_store: Arc<WalTableStore>,
         mode: DbReaderMode,
         wal_reader: Option<Arc<dyn WalReaderTrait>>,
         merge_operator: Option<MergeOperatorType>,
@@ -973,6 +990,7 @@ impl DbReader {
             DbReaderInner::new(
                 manifest_store,
                 table_store,
+                wal_store,
                 wal_reader,
                 options,
                 mode,
@@ -1447,17 +1465,35 @@ impl DbCacheManagerOps for DbReader {
     ) -> Result<(), crate::Error> {
         self.inner.check_closed()?;
         let manifest = self.manifest();
-        db_cache_manager::warm_sst_impl(&self.inner.table_store, &manifest, sst_id, targets).await
+        db_cache_manager::warm_sst_impl(&self.inner.table_store, manifest.core(), sst_id, targets)
+            .await
     }
 
-    async fn evict_cached_sst(&self, sst_id: SsTableId) -> Result<(), crate::Error> {
+    async fn evict_cached_sst(
+        &self,
+        sst: &SsTableHandle,
+        targets: &[CacheTarget],
+    ) -> Result<(), crate::Error> {
         self.inner.check_closed()?;
-        db_cache_manager::evict_cached_sst_impl(&self.inner.table_store, sst_id).await
+        let manifest = self.manifest();
+        db_cache_manager::evict_cached_sst_impl(
+            &self.inner.table_store,
+            manifest.core(),
+            sst,
+            targets,
+        )
+        .await
+    }
+
+    async fn flush_cache_to_disk(&self) -> Result<(), crate::Error> {
+        self.inner.check_closed()?;
+        db_cache_manager::flush_cache_to_disk_impl(&self.inner.table_store).await
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use crate::wal::slatedb::reader::SlateDbWalReaderOptions;
     use {
         super::{DbReaderMessage, ManifestPoller, ReaderState, WalReplayEnd},
         crate::{
@@ -1468,7 +1504,7 @@ mod tests {
                 MergeOptions, PutOptions, Settings, WriteOptions,
             },
             db_reader::{DbReader, DbReaderInner, DbReaderMode, DbReaderOptions},
-            db_state::{SsTableId, SstType},
+            db_state::SstType,
             db_stats::DbStats,
             db_status::DbStatusManager,
             dispatcher::MessageHandler,
@@ -1481,7 +1517,6 @@ mod tests {
             },
             mem_table::{ImmutableMemtable, WritableKVTable},
             merge_operator::MergeOperatorType,
-            object_stores::ObjectStores,
             oracle::DbReaderOracle,
             paths::PathResolver,
             proptest_util::{rng::new_test_rng, sample},
@@ -1489,7 +1524,10 @@ mod tests {
             tablestore::{TableStore, TableStoreKind},
             test_utils,
             types::RowEntry,
-            wal::{WalError, WalFileRange, WalIterator, WalReader as WalReaderTrait, WalRows},
+            wal::{
+                slatedb::store::WalTableStore, WalError, WalFileRange, WalIterator,
+                WalReader as WalReaderTrait, WalRows,
+            },
             CloseReason, Db,
         },
         bytes::Bytes,
@@ -1501,7 +1539,7 @@ mod tests {
             DbRand, MockSystemClock,
         },
         std::{
-            collections::{BTreeMap, VecDeque},
+            collections::{BTreeMap, BTreeSet, VecDeque},
             sync::{
                 atomic::{AtomicUsize, Ordering},
                 Arc,
@@ -1648,6 +1686,7 @@ mod tests {
         let reader = DbReader::open_internal(
             test_provider.manifest_store(),
             test_provider.table_store(),
+            test_provider.wal_store(),
             DbReaderMode::Checkpoint(checkpoint_result.id),
             None,
             None,
@@ -1855,7 +1894,7 @@ mod tests {
 
         let parent_manifest = Manifest::initial(ManifestCore::new());
         let parent_path = "/tmp/parent_store".to_string();
-        let source_checkpoint_id = uuid::Uuid::new_v4();
+        let source_checkpoint_id = Uuid::new_v4();
 
         let _ = StoredManifest::store_uninitialized_clone(
             Arc::clone(&manifest_store),
@@ -2008,6 +2047,7 @@ mod tests {
         let reader = DbReader::open_internal(
             test_provider.manifest_store(),
             test_provider.table_store(),
+            test_provider.wal_store(),
             DbReaderMode::FollowLatest,
             None,
             None,
@@ -2205,6 +2245,7 @@ mod tests {
         let inner = DbReaderInner::new(
             Arc::clone(&manifest_store),
             table_store,
+            test_provider.wal_store(),
             None,
             DbReaderOptions {
                 manifest_poll_interval: Duration::from_millis(100),
@@ -2301,6 +2342,7 @@ mod tests {
         let inner = DbReaderInner::new(
             Arc::clone(&manifest_store),
             table_store,
+            test_provider.wal_store(),
             None,
             DbReaderOptions {
                 manifest_poll_interval: Duration::from_millis(100),
@@ -2387,16 +2429,17 @@ mod tests {
         let path = Path::from("/tmp/test_db_reader_replay_order");
         let test_provider = TestProvider::new(path, Arc::clone(&object_store));
         let table_store = test_provider.table_store();
+        let wal_store = test_provider.wal_store();
 
         write_wal_sst(
-            Arc::clone(&table_store),
+            Arc::clone(&wal_store),
             3,
             vec![RowEntry::new_value(b"stale_key", b"stale_value", 3)],
         )
         .await
         .unwrap();
         write_wal_sst(
-            Arc::clone(&table_store),
+            Arc::clone(&wal_store),
             4,
             vec![RowEntry::new_value(b"fresh_key", b"fresh_value", 4)],
         )
@@ -2415,10 +2458,11 @@ mod tests {
 
         let mut core = ManifestCore::new();
         core.next_wal_sst_id = 5;
+        let status_manager = status_manager_for_core(&core);
 
         let (last_wal_id, last_committed_seq) = DbReaderInner::replay_wal_into(
             Arc::clone(&table_store),
-            &native_wal_reader(&table_store),
+            &native_wal_reader(&wal_store, &status_manager),
             &DbReaderOptions::default(),
             &core,
             &mut into_tables,
@@ -2449,9 +2493,10 @@ mod tests {
         let path = Path::from("/tmp/test_db_reader_missing_wal");
         let test_provider = TestProvider::new(path, Arc::clone(&object_store));
         let table_store = test_provider.table_store();
+        let wal_store = test_provider.wal_store();
 
         write_wal_sst(
-            Arc::clone(&table_store),
+            Arc::clone(&wal_store),
             1,
             vec![RowEntry::new_value(b"key", b"value", 1)],
         )
@@ -2461,10 +2506,11 @@ mod tests {
         let mut into_tables = VecDeque::new();
         let mut core = ManifestCore::new();
         core.next_wal_sst_id = 3;
+        let status_manager = status_manager_for_core(&core);
 
         let (last_wal_id, last_committed_seq) = DbReaderInner::replay_wal_into(
             Arc::clone(&table_store),
-            &native_wal_reader(&table_store),
+            &native_wal_reader(&wal_store, &status_manager),
             &DbReaderOptions::default(),
             &core,
             &mut into_tables,
@@ -2488,6 +2534,7 @@ mod tests {
         let path = Path::from("/tmp/test_db_reader_missing_wal_after_replay");
         let test_provider = TestProvider::new(path, Arc::clone(&object_store));
         let table_store = test_provider.table_store();
+        let wal_store = test_provider.wal_store();
 
         let wal_1_row = RowEntry::new_value(b"a", &[b'a'; 8], 1);
         let wal_2_row_1 = RowEntry::new_value(b"b", &[b'b'; 40], 2);
@@ -2498,11 +2545,11 @@ mod tests {
             wal_1_row.estimated_size() + wal_2_row_1.estimated_size(),
         ) as u64;
 
-        write_wal_sst(Arc::clone(&table_store), 1, vec![wal_1_row.clone()])
+        write_wal_sst(Arc::clone(&wal_store), 1, vec![wal_1_row.clone()])
             .await
             .unwrap();
         write_wal_sst(
-            Arc::clone(&table_store),
+            Arc::clone(&wal_store),
             2,
             vec![wal_2_row_1.clone(), wal_2_row_2.clone()],
         )
@@ -2517,10 +2564,11 @@ mod tests {
             max_memtable_bytes,
             ..DbReaderOptions::default()
         };
+        let status_manager = status_manager_for_core(&core);
 
         let (last_wal_id, last_committed_seq) = DbReaderInner::replay_wal_into(
             Arc::clone(&table_store),
-            &native_wal_reader(&table_store),
+            &native_wal_reader(&wal_store, &status_manager),
             &reader_options,
             &core,
             &mut into_tables,
@@ -2551,13 +2599,15 @@ mod tests {
         let path = Path::from("/tmp/test_db_reader_fresh_db_no_writes");
         let test_provider = TestProvider::new(path, Arc::clone(&object_store));
         let table_store = test_provider.table_store();
+        let wal_store = test_provider.wal_store();
 
         let mut into_tables = VecDeque::new();
         let core = ManifestCore::new();
+        let status_manager = status_manager_for_core(&core);
 
         let (last_wal_id, last_committed_seq) = DbReaderInner::replay_wal_into(
             Arc::clone(&table_store),
-            &native_wal_reader(&table_store),
+            &native_wal_reader(&wal_store, &status_manager),
             &DbReaderOptions::default(),
             &core,
             &mut into_tables,
@@ -2578,18 +2628,20 @@ mod tests {
         let path = Path::from("/tmp/test_db_reader_fresh_db_one_wal");
         let test_provider = TestProvider::new(path, Arc::clone(&object_store));
         let table_store = test_provider.table_store();
+        let wal_store = test_provider.wal_store();
 
         let wal_row = RowEntry::new_value(b"key", b"value", 1);
-        write_wal_sst(Arc::clone(&table_store), 1, vec![wal_row.clone()])
+        write_wal_sst(Arc::clone(&wal_store), 1, vec![wal_row.clone()])
             .await
             .unwrap();
 
         let mut into_tables = VecDeque::new();
         let core = ManifestCore::new();
+        let status_manager = status_manager_for_core(&core);
 
         let (last_wal_id, last_committed_seq) = DbReaderInner::replay_wal_into(
             Arc::clone(&table_store),
-            &native_wal_reader(&table_store),
+            &native_wal_reader(&wal_store, &status_manager),
             &DbReaderOptions::default(),
             &core,
             &mut into_tables,
@@ -2616,8 +2668,9 @@ mod tests {
         let path = Path::from("/tmp/test_db_reader_empty_fence_wal");
         let test_provider = TestProvider::new(path, Arc::clone(&object_store));
         let table_store = test_provider.table_store();
+        let wal_store = test_provider.wal_store();
 
-        write_wal_sst(Arc::clone(&table_store), 6, vec![])
+        write_wal_sst(Arc::clone(&wal_store), 6, vec![])
             .await
             .unwrap();
 
@@ -2633,10 +2686,11 @@ mod tests {
         let mut core = ManifestCore::new();
         core.last_l0_seq = 8;
         core.next_wal_sst_id = 5;
+        let status_manager = status_manager_for_core(&core);
 
         let (last_wal_id, last_committed_seq) = DbReaderInner::replay_wal_into(
             Arc::clone(&table_store),
-            &native_wal_reader(&table_store),
+            &native_wal_reader(&wal_store, &status_manager),
             &DbReaderOptions::default(),
             &core,
             &mut into_tables,
@@ -3066,6 +3120,7 @@ mod tests {
             DbReader::open_internal(
                 self.manifest_store(),
                 self.table_store(),
+                self.wal_store(),
                 mode,
                 None,
                 merge_operator,
@@ -3079,8 +3134,24 @@ mod tests {
         }
     }
 
-    fn native_wal_reader(table_store: &Arc<TableStore>) -> crate::wal::reader::SlateDbWalReader {
-        crate::wal::reader::SlateDbWalReader::new(Arc::clone(table_store))
+    fn status_manager_for_core(core: &ManifestCore) -> DbStatusManager {
+        DbStatusManager::new_with_initial_values(
+            core.last_l0_seq,
+            VersionedManifest::from_manifest(1, Manifest::initial(core.clone())),
+            BTreeSet::default(),
+        )
+    }
+
+    fn native_wal_reader(
+        wal_store: &Arc<WalTableStore>,
+        status_manager: &DbStatusManager,
+    ) -> crate::wal::slatedb::reader::SlateDbWalReader {
+        crate::wal::slatedb::reader::SlateDbWalReader::new_with_status_manager(
+            Arc::clone(wal_store),
+            status_manager,
+            Arc::new(DefaultSystemClock::new()),
+            SlateDbWalReaderOptions::default(),
+        )
     }
 
     fn immutable_memtable(
@@ -3095,15 +3166,16 @@ mod tests {
     }
 
     async fn write_wal_sst(
-        table_store: Arc<TableStore>,
+        wal_store: Arc<WalTableStore>,
         wal_id: u64,
         entries: Vec<RowEntry>,
     ) -> Result<(), SlateDBError> {
-        let mut writer = table_store.table_writer(SsTableId::Wal(wal_id));
+        let mut builder = wal_store.table_builder();
         for entry in entries {
-            writer.add(entry).await?;
+            builder.add(entry).await?;
         }
-        writer.close().await?;
+        let encoded_sst = builder.build().await?;
+        wal_store.write_sst(wal_id.into(), &encoded_sst).await?;
         Ok(())
     }
 
@@ -3205,6 +3277,7 @@ mod tests {
         let test_provider = TestProvider::new(path, Arc::clone(&object_store));
         let manifest_store = test_provider.manifest_store();
         let table_store = test_provider.table_store();
+        let wal_store = test_provider.wal_store();
         let mut stored_manifest = StoredManifest::create_new_db(
             Arc::clone(&manifest_store),
             ManifestCore::new(),
@@ -3257,7 +3330,8 @@ mod tests {
             oracle.clone(),
             None,
         );
-        let wal_reader = Arc::new(native_wal_reader(&table_store));
+        let status_manager = status_manager_for_core(&stored_manifest.manifest().core);
+        let wal_reader = Arc::new(native_wal_reader(&wal_store, &status_manager));
         let inner = DbReaderInner {
             manifest_store,
             table_store,
@@ -3271,7 +3345,7 @@ mod tests {
             system_clock: test_provider.system_clock.clone(),
             oracle,
             reader,
-            status_manager: DbStatusManager::new(0),
+            status_manager,
             segment_extractor: None,
             rand: test_provider.rand.clone(),
             recorder,
@@ -3320,6 +3394,8 @@ mod tests {
     ) -> DbReaderInner {
         let manifest_store = test_provider.manifest_store();
         let table_store = test_provider.table_store();
+        let wal_store = test_provider.wal_store();
+        let status_manager = status_manager_for_core(current_core);
 
         let prior_state = ReaderState {
             manifest_id: 1,
@@ -3345,7 +3421,7 @@ mod tests {
             oracle.clone(),
             None,
         );
-        let wal_reader = Arc::new(native_wal_reader(&table_store));
+        let wal_reader = Arc::new(native_wal_reader(&wal_store, &status_manager));
         DbReaderInner {
             manifest_store,
             table_store,
@@ -3356,7 +3432,7 @@ mod tests {
             system_clock: test_provider.system_clock.clone(),
             oracle,
             reader,
-            status_manager: DbStatusManager::new(0),
+            status_manager,
             segment_extractor: None,
             rand: test_provider.rand.clone(),
             recorder,
@@ -3399,7 +3475,7 @@ mod tests {
 
         fn view(seq: u64) -> SsTableView {
             SsTableView::identity(SsTableHandle::new(
-                SsTableId::Compacted(ulid::Ulid::from_parts(seq, 0)),
+                SsTableId::from(ulid::Ulid::from_parts(seq, 0)),
                 SST_FORMAT_VERSION_LATEST,
                 SsTableInfo::default(),
             ))
@@ -3580,13 +3656,23 @@ mod tests {
     impl TestProvider {
         fn table_store(&self) -> Arc<TableStore> {
             Arc::new(TableStore::new_with_fp_registry(
-                ObjectStores::new(Arc::clone(&self.object_store), None),
+                Arc::clone(&self.object_store),
                 SsTableFormat::default(),
                 PathResolver::from_root(self.path.clone()),
                 Arc::clone(&self.fp_registry),
                 None,
                 TableStoreKind::Reader,
                 BlockCachePolicy::default(),
+            ))
+        }
+
+        fn wal_store(&self) -> Arc<WalTableStore> {
+            Arc::new(WalTableStore::new_with_fp_registry(
+                Arc::clone(&self.object_store),
+                SsTableFormat::default(),
+                PathResolver::from_root(self.path.clone()),
+                Arc::clone(&self.fp_registry),
+                TableStoreKind::Reader,
             ))
         }
 
@@ -3607,8 +3693,7 @@ mod tests {
         let mut test_provider = TestProvider::new(path.clone(), Arc::clone(&object_store));
         test_provider.system_clock = clock.clone();
 
-        let merge_operator: crate::merge_operator::MergeOperatorType =
-            Arc::new(crate::test_utils::StringConcatMergeOperator);
+        let merge_operator: MergeOperatorType = Arc::new(test_utils::StringConcatMergeOperator);
 
         let db = Db::builder(path.clone(), Arc::clone(&object_store))
             .with_settings(Settings {

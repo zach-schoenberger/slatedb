@@ -36,7 +36,7 @@ pub use batch::WriteBatch;
 pub use block_cache_policy::BlockCachePolicy;
 pub use bytes_range::ByteRangeBounds;
 pub use cached_object_store::stats as cached_object_store_stats;
-pub use checkpoint::{Checkpoint, CheckpointCreateResult};
+pub use checkpoint::{Checkpoint, CheckpointCreateResult, CheckpointHandle};
 #[cfg(feature = "compaction_filters")]
 pub use compaction_filter::{
     CompactionFilter, CompactionFilterDecision, CompactionFilterError, CompactionFilterSupplier,
@@ -58,6 +58,7 @@ pub use error::{CloseReason, Error, ErrorKind};
 pub use filter::BloomFilter;
 pub use filter_policy::{
     BloomFilterPolicy, Filter, FilterBuilder, FilterContext, FilterPolicy, FilterQuery,
+    FilterTarget,
 };
 pub use format::sst::BlockTransformer;
 pub use garbage_collector::stats as garbage_collector_stats;
@@ -77,7 +78,7 @@ pub use sst_stats::{BlockStats, SstStats};
 pub use transaction_manager::IsolationLevel;
 pub use types::KeyValue;
 pub use types::{RowEntry, ValueDeletable};
-pub use wal_buffer::stats as wal_buffer_stats;
+pub use wal::slatedb::writer::stats as wal_buffer_stats;
 pub use wal_reader::{WalFile, WalFileIterator, WalReader};
 
 pub mod admin;
@@ -146,7 +147,6 @@ mod mem_table;
 mod memtable_flusher;
 mod merge_iterator;
 mod merge_operator;
-mod object_stores;
 mod ops;
 mod oracle;
 mod partitioned_keyspace;
@@ -154,6 +154,7 @@ mod paths;
 mod peeking_iterator;
 #[cfg(test)]
 mod proptest_util;
+mod read_trace;
 mod reader;
 mod retention_iterator;
 mod retrying_object_store;
@@ -162,9 +163,11 @@ mod single_flight;
 mod snapshot_manager;
 mod sorted_run_iterator;
 mod sst_builder;
+mod sst_io;
 mod sst_iter;
 mod sst_reader;
 mod sst_stats;
+mod sst_upload;
 mod subcompaction;
 mod tablestore;
 #[cfg(test)]
@@ -174,7 +177,6 @@ mod types;
 mod utils;
 
 mod fence;
-mod wal_buffer;
 mod wal_reader;
 mod wal_replay;
 
@@ -184,5 +186,5 @@ mod wal_replay;
 #[cfg(test)]
 #[ctor::ctor]
 fn init_test_infrastructure() {
-    crate::test_utils::init_test_infrastructure();
+    test_utils::init_test_infrastructure();
 }
