@@ -677,11 +677,9 @@ impl CompactorEventHandler {
                 0.0
             };
 
-            let percentage = if estimated_source_bytes > 0 {
-                (compaction.bytes_processed() * 100 / estimated_source_bytes) as u32
-            } else {
-                0
-            };
+            let percentage = (compaction.bytes_processed() * 100)
+                .checked_div(estimated_source_bytes)
+                .unwrap_or(0) as u32;
             debug!(
                 "compaction progress [id={}, progress={}%, processed_bytes={}, estimated_source_bytes={}, elapsed={:.2}s, throughput={}/s]",
                 compaction.id(),

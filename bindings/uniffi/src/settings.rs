@@ -169,6 +169,8 @@ fn apply_dotted_json_path(root: &mut Value, key: &str, value: Value) -> Result<(
 }
 
 #[cfg(test)]
+// `figment::Jail::expect_with` dictates the closure's `figment::Error` type.
+#[allow(clippy::result_large_err)]
 mod tests {
     use serde_json::json;
     use std::sync::Arc;

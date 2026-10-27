@@ -2101,7 +2101,7 @@ impl Db {
         let env_vars = std::env::vars().map(|(key, value)| (key.to_ascii_lowercase(), value));
         let (object_store, path) = parse_url_opts(&url, env_vars).map_err(SlateDBError::from)?;
         if !path.as_ref().is_empty() {
-            return Err(SlateDBError::InvalidObjectStorePath(path.to_string()))?;
+            Err(SlateDBError::InvalidObjectStorePath(path.to_string()))?;
         }
         Ok(Arc::from(object_store))
     }

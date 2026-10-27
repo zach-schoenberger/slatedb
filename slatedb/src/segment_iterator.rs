@@ -423,7 +423,7 @@ async fn build_sr_range_iters(
     let opts = ctx.sst_iter_options.clone();
     let stats = ctx.db_stats.clone();
     let read_trace = ctx.read_trace.clone();
-    build_concurrent(overlapping.into_iter(), ctx.max_parallel, move |sr| {
+    build_concurrent(overlapping, ctx.max_parallel, move |sr| {
         let table_store = table_store.clone();
         let range = range.clone();
         let opts = opts.clone();

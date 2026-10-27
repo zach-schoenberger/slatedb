@@ -327,6 +327,8 @@ impl ObjectStoreBuilder {
 }
 
 #[cfg(test)]
+// `figment::Jail::expect_with` dictates the closure's `figment::Error` type.
+#[allow(clippy::result_large_err)]
 mod tests {
     use object_store::ObjectStoreExt;
     use std::path::Path;
