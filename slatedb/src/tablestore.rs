@@ -42,8 +42,11 @@ use tracing::Instrument;
 
 pub(crate) struct TableStore {
     object_store: Arc<dyn ObjectStore>,
-    sst_format: SsTableFormat,
-    path_resolver: PathResolver,
+    // `sst_format` and `path_resolver` are behind `Arc`s so that building a
+    // cache-miss loader on every cached read is a few refcount bumps rather than
+    // a deep clone plus path formatting.
+    sst_format: Arc<SsTableFormat>,
+    path_resolver: Arc<PathResolver>,
     #[allow(dead_code)]
     fp_registry: Arc<FailPointRegistry>,
     /// In-memory cache for data blocks and SST metadata.
@@ -97,8 +100,8 @@ impl TableStore {
     ) -> Self {
         Self {
             object_store,
-            sst_format,
-            path_resolver,
+            sst_format: Arc::new(sst_format),
+            path_resolver: Arc::new(path_resolver),
             fp_registry,
             cache,
             block_cache_policy,
@@ -113,7 +116,7 @@ impl TableStore {
         Self {
             object_store: self.object_store.clone(),
             sst_format: self.sst_format.clone(),
-            path_resolver: self.path_resolver.with_external_ssts(external_ssts),
+            path_resolver: Arc::new(self.path_resolver.with_external_ssts(external_ssts)),
             fp_registry: self.fp_registry.clone(),
             cache: self.cache.clone(),
             block_cache_policy: self.block_cache_policy.clone(),
@@ -607,23 +610,25 @@ impl TableStore {
     /// or index). Panics on [`CacheTarget::Data`]: data blocks resolve through
     /// [`Self::block_loader`] because they require a block index lookup.
     ///
-    /// Builds a fresh boxed closure on every call, even when the cache hits and
-    /// the loader is never invoked; revisit if cache-hit allocations show up in
-    /// profiles.
+    /// Called on every cached read, including hits where the loader never runs,
+    /// so it only captures cheap handles; the SST path is resolved inside the
+    /// loader.
     fn read_loader(
         &self,
         handle: &SsTableHandle,
         target: CacheTarget,
         segment: Option<Bytes>,
     ) -> CacheLoader {
+        let id = handle.id;
         let info = handle.info.clone();
         let object_store = self.object_store.clone();
-        let path = self.path(&handle.id);
+        let path_resolver = self.path_resolver.clone();
         let sst_format = self.sst_format.clone();
         let tag =
             ObjectStoreCallTag::new_with_segment(self.kind, SstType::from(&handle.id), segment);
         Box::new(move || {
             Box::pin(async move {
+                let path = path_resolver.sst_path(&id);
                 // Only the stats arm can produce `None` (stats_len > 0 but no
                 // stats decoded); filters and index always yield an entry.
                 let entry = read_with_validation_retry(tag, async |tag| {
@@ -667,9 +672,8 @@ impl TableStore {
         })
     }
 
-    /// Builds a fresh boxed closure on every call, even when the cache hits and
-    /// the loader is never invoked; revisit if cache-hit allocations show up in
-    /// profiles.
+    /// Like [`Self::read_loader`], this runs on every cached block read, so it
+    /// only captures cheap handles and resolves the SST path inside the loader.
     fn block_loader(
         &self,
         handle: &SsTableHandle,
@@ -677,14 +681,16 @@ impl TableStore {
         block_num: usize,
         segment: Option<Bytes>,
     ) -> CacheLoader {
+        let id = handle.id;
         let info = handle.info.clone();
         let object_store = self.object_store.clone();
-        let path = self.path(&handle.id);
+        let path_resolver = self.path_resolver.clone();
         let sst_format = self.sst_format.clone();
         let tag =
             ObjectStoreCallTag::new_with_segment(self.kind, SstType::from(&handle.id), segment);
         Box::new(move || {
             Box::pin(async move {
+                let path = path_resolver.sst_path(&id);
                 let block = read_with_validation_retry(tag, async |tag| {
                     let obj = ReadOnlyObject {
                         object_store: object_store.clone(),
