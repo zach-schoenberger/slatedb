@@ -3752,7 +3752,13 @@ mod tests {
             key: &crate::db_cache::CachedKey,
         ) -> Result<Option<crate::db_cache::CachedEntry>, crate::Error> {
             use std::sync::atomic::Ordering::SeqCst;
-            match self.mode.load(SeqCst) {
+            // Mode 1 holds only the first read: on a miss `TableStore` reads the key
+            // again inside the fetch, and that read must not wait for a second release.
+            match self
+                .mode
+                .compare_exchange(1, 0, SeqCst, SeqCst)
+                .unwrap_or_else(|mode| mode)
+            {
                 1 => {
                     self.started.fetch_add(1, SeqCst);
                     let _drop = PointReadDrop(self.dropped.clone());

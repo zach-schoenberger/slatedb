@@ -773,37 +773,12 @@ impl DbCacheWrapper {
         key.with_scope(self.db_cache_id)
     }
 
+    /// A fetch records only errors. `TableStore` looks a key up with `get_*` first,
+    /// which counts the hit or miss, and fetches only on a miss; counting the fetch
+    /// too would count every miss twice.
     fn record_fetch_outcome(&self, block_type: &str, result: &Result<CacheFetch, crate::Error>) {
-        match result {
-            Ok(CacheFetch {
-                lookup: CacheLookup::Miss,
-                ..
-            }) => self.record_miss(block_type),
-            Ok(CacheFetch {
-                lookup: CacheLookup::Hit,
-                ..
-            }) => self.record_hit(block_type),
-            Err(err) => self.record_get_err(block_type, err),
-        }
-    }
-
-    fn record_hit(&self, block_type: &str) {
-        match block_type {
-            "block" => self.stats.data_block_hit.increment(1),
-            "index" => self.stats.index_hit.increment(1),
-            "filter" => self.stats.filter_hit.increment(1),
-            "stats" => self.stats.stats_hit.increment(1),
-            _ => {}
-        }
-    }
-
-    fn record_miss(&self, block_type: &str) {
-        match block_type {
-            "block" => self.stats.data_block_miss.increment(1),
-            "index" => self.stats.index_miss.increment(1),
-            "filter" => self.stats.filter_miss.increment(1),
-            "stats" => self.stats.stats_miss.increment(1),
-            _ => {}
+        if let Err(err) = result {
+            self.record_get_err(block_type, err);
         }
     }
 
@@ -1322,7 +1297,7 @@ mod tests {
     const SST_ID: SsTableId = SsTableId::new(Ulid::from_parts(0u64, 0u128));
 
     #[tokio::test]
-    async fn test_wrapper_counts_reported_fetch_lookup() {
+    async fn test_wrapper_fetch_counts_no_lookup() {
         struct ReportedLookupCache {
             lookup: CacheLookup,
             entry: CachedEntry,
@@ -1411,18 +1386,16 @@ mod tests {
                 .unwrap();
                 assert_eq!(fetch.lookup, lookup);
                 assert!(Arc::ptr_eq(&fetch.entry.block().unwrap(), &block));
+                // A fetch counts no hit or miss: the caller's `get_*` already did.
                 for entry_kind in ["data_block", "index", "filter", "stats"] {
-                    for (result, expected_lookup) in
-                        [("hit", CacheLookup::Hit), ("miss", CacheLookup::Miss)]
-                    {
-                        let expected = i64::from(entry_kind == method && lookup == expected_lookup);
+                    for result in ["hit", "miss"] {
                         assert_eq!(
                             lookup_metric_with_labels(
                                 &recorder,
                                 super::stats::ACCESS_COUNT,
                                 &[("entry_kind", entry_kind), ("result", result)],
                             ),
-                            Some(expected),
+                            Some(0),
                             "method={method}, lookup={lookup:?}, entry_kind={entry_kind}, result={result}",
                         );
                     }

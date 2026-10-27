@@ -450,26 +450,23 @@ impl TableStore {
     ) -> Result<Arc<[NamedFilter]>, SlateDBError> {
         let cache_key: CachedKey = (handle.id, handle.info.filter_offset).into();
         if let Some(cache) = self.cache_for_reads() {
-            // cache_blocks=true: dedup-aware fetch; concurrent callers collapse onto
-            // one loader. cache_blocks=false: read-only lookup that won't pollute the
-            // cache on miss. Cache errors fall through to a best-effort direct load;
+            // A plain lookup first: a hit needs no loader, and building one allocates
+            // on every call. On a miss, cache_blocks=true does a dedup-aware fetch
+            // (concurrent callers collapse onto one loader); cache_blocks=false
+            // won't pollute the cache. Cache errors fall through to a best-effort direct load;
             // we intentionally don't re-insert there — `fetch_X` errors are almost
             // always the smuggled loader error (so the direct retry will also fail),
             // and on the rare foyer-machinery error an insert would likely fail too.
-            let fetch = if cache_blocks {
-                cache
+            let fetch = match cache.get_filter(&cache_key).await.ok().flatten() {
+                Some(entry) => Some(CacheFetch::hit(entry)),
+                None if cache_blocks => cache
                     .fetch_filter(
                         cache_key.clone(),
                         self.read_loader(handle, CacheTarget::Filters, segment.clone()),
                     )
                     .await
-                    .ok()
-            } else {
-                cache
-                    .get_filter(&cache_key)
-                    .await
-                    .unwrap_or(None)
-                    .map(CacheFetch::hit)
+                    .ok(),
+                None => None,
             };
             if let Some(CacheFetch { entry, lookup }) = fetch {
                 // Already decoded.
@@ -516,17 +513,17 @@ impl TableStore {
         let cache_key = (handle.id, handle.info.stats_offset).into();
         if let Some(cache) = self.cache_for_reads() {
             // See `read_filters` for the rationale on the fall-through path.
-            let entry = if cache_blocks {
-                cache
+            let entry = match cache.get_stats(&cache_key).await.ok().flatten() {
+                Some(entry) => Some(entry),
+                None if cache_blocks => cache
                     .fetch_stats(
                         cache_key,
                         self.read_loader(handle, CacheTarget::Stats, segment.clone()),
                     )
                     .await
                     .ok()
-                    .map(|fetch| fetch.entry)
-            } else {
-                cache.get_stats(&cache_key).await.unwrap_or(None)
+                    .map(|fetch| fetch.entry),
+                None => None,
             };
             if let Some(stats) = entry.and_then(|e| e.sst_stats()) {
                 return Ok(Some(stats.as_ref().clone()));
@@ -573,20 +570,16 @@ impl TableStore {
         let cache_key = (handle.id, handle.info.index_offset).into();
         if let Some(cache) = self.cache_for_reads() {
             // See `read_filters` for the rationale on the fall-through path.
-            let fetch = if cache_blocks {
-                cache
+            let fetch = match cache.get_index(&cache_key).await.ok().flatten() {
+                Some(entry) => Some(CacheFetch::hit(entry)),
+                None if cache_blocks => cache
                     .fetch_index(
                         cache_key,
                         self.read_loader(handle, CacheTarget::Index, segment.clone()),
                     )
                     .await
-                    .ok()
-            } else {
-                cache
-                    .get_index(&cache_key)
-                    .await
-                    .unwrap_or(None)
-                    .map(CacheFetch::hit)
+                    .ok(),
+                None => None,
             };
             if let Some(CacheFetch { entry, lookup }) = fetch {
                 if let Some(index) = entry.sst_index() {
@@ -848,8 +841,16 @@ impl TableStore {
                 let block_num = blocks.start;
                 let offset = index.borrow().block_meta().get(block_num).offset();
                 let cache_key: CachedKey = (handle.id, offset).into();
-                let loader = self.block_loader(handle, index.clone(), block_num, segment.clone());
-                if let Ok(fetch) = cache.fetch_block(cache_key, loader).await {
+                // A plain lookup first: a hit needs no loader (see `read_filters_inner`).
+                let fetch = match cache.get_block(&cache_key).await.ok().flatten() {
+                    Some(entry) => Ok(CacheFetch::hit(entry)),
+                    None => {
+                        let loader =
+                            self.block_loader(handle, index.clone(), block_num, segment.clone());
+                        cache.fetch_block(cache_key, loader).await
+                    }
+                };
+                if let Ok(fetch) = fetch {
                     if let Some(block) = fetch.entry.block() {
                         let (cache_hits, cache_misses) = match fetch.lookup {
                             CacheLookup::Hit => (1, 0),
