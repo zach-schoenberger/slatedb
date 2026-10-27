@@ -930,11 +930,15 @@ impl<'a> FilterIterator<'a> {
 impl RowEntryIterator for FilterIterator<'_> {
     async fn init(&mut self) -> Result<(), SlateDBError> {
         if !self.initialized {
-            let filters = self.read_filters().await?;
-            let sst_id = self.inner.view().table_as_ref().sst.id;
-            let read_trace = self.inner.read_trace();
-            self.filter
-                .evaluate(&filters, sst_id, self.inner.sst_level(), &read_trace);
+            // A point pre-check (`new_owned_point_with_stats`) may have
+            // evaluated already; evaluating again would re-read the filters.
+            if self.filter.state == FilterState::NotChecked {
+                let filters = self.read_filters().await?;
+                let sst_id = self.inner.view().table_as_ref().sst.id;
+                let read_trace = self.inner.read_trace();
+                self.filter
+                    .evaluate(&filters, sst_id, self.inner.sst_level(), &read_trace);
+            }
 
             if self.is_filtered_out() {
                 return Ok(());
@@ -1060,6 +1064,48 @@ impl<'a> SstIterator<'a> {
         let internal =
             InternalSstIterator::new_owned(range, table, table_store, options, tracing_context)?;
         Ok(internal.map(|iter| Self::from_internal(iter, db_stats.clone())))
+    }
+
+    /// A point-get source that evaluates the SST's filters before building
+    /// anything, so an SST the filter rules out costs one cache lookup rather
+    /// than an iterator build, init and drop. It reuses the evaluator the
+    /// iterator would have built, so filter stats are unchanged.
+    pub(crate) async fn new_owned_point_with_stats(
+        key: Bytes,
+        range: BytesRange,
+        table: SsTableView,
+        table_store: Arc<TableStore>,
+        options: SstIteratorOptions,
+        tracing_context: Option<SstTracingContext>,
+        db_stats: Option<DbStats>,
+    ) -> Result<Option<Self>, SlateDBError> {
+        if table.calculate_view_range(range.clone()).is_none() {
+            return Ok(None);
+        }
+        let level = tracing_context.as_ref().map(|c| &c.sst_level);
+        let read_trace = tracing_context
+            .as_ref()
+            .map(|c| c.read_trace.clone())
+            .unwrap_or_else(ReadTrace::none);
+        let filters = table_store
+            .read_filters(
+                &table.sst,
+                options.cache_metadata,
+                options.segment.clone(),
+                &read_trace,
+                level,
+            )
+            .await?;
+        let mut filter = FilterEvaluator::new_point(key, options.filter_context.clone(), db_stats);
+        filter.evaluate(&filters, table.sst.id, level, &read_trace);
+        if filter.is_filtered_out() {
+            return Ok(None);
+        }
+        let internal =
+            InternalSstIterator::new_owned(range, table, table_store, options, tracing_context)?;
+        Ok(internal.map(|internal| Self {
+            delegate: SstIteratorDelegate::Filter(FilterIterator::new(internal, filter)),
+        }))
     }
 
     #[allow(dead_code)]

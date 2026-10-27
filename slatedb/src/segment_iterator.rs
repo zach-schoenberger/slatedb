@@ -322,59 +322,6 @@ pub(crate) fn build_segment_iter(
     }
 }
 
-pub(crate) fn build_l0_point_iters(
-    l0: &VecDeque<SsTableView>,
-    ctx: &SegmentScanContext,
-) -> Result<VecDeque<Box<dyn RowEntryIterator>>, SlateDBError> {
-    let mut iters = VecDeque::new();
-    let options = ctx.sst_iter_options.clone();
-    for sst in l0.iter().cloned() {
-        let iter = SstIterator::new_owned_with_stats(
-            ctx.range.clone(),
-            sst,
-            ctx.table_store.clone(),
-            options.clone(),
-            Some(SstTracingContext::new(
-                SstTraceLevel::L0,
-                ctx.read_trace.clone(),
-            )),
-            ctx.point_lookup_stats.clone(),
-        )?;
-        if let Some(iter) = iter {
-            iters.push_back(Box::new(iter) as Box<dyn RowEntryIterator>);
-        }
-    }
-    Ok(iters)
-}
-
-pub(crate) fn build_sr_point_iters(
-    key: &Bytes,
-    compacted: &[SortedRun],
-    ctx: &SegmentScanContext,
-) -> Result<VecDeque<Box<dyn RowEntryIterator>>, SlateDBError> {
-    let mut iters = VecDeque::new();
-    let options = ctx.sst_iter_options.clone();
-    for sr in compacted.iter() {
-        for handle in sr.tables_covering_point_key(key.as_ref()) {
-            let iter = SstIterator::new_owned_with_stats(
-                ctx.range.clone(),
-                handle.clone(),
-                ctx.table_store.clone(),
-                options.clone(),
-                Some(SstTracingContext::new(
-                    SstTraceLevel::SortedRun(sr.id),
-                    ctx.read_trace.clone(),
-                )),
-                ctx.point_lookup_stats.clone(),
-            )?;
-            if let Some(iter) = iter {
-                iters.push_back(Box::new(iter) as Box<dyn RowEntryIterator>);
-            }
-        }
-    }
-    Ok(iters)
-}
-
 async fn build_l0_range_iters(
     l0: &VecDeque<SsTableView>,
     ctx: &SegmentScanContext,

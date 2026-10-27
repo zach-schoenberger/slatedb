@@ -1,5 +1,6 @@
 use crate::batch::WriteBatchIterator;
 use crate::bytes_range::BytesRange;
+use crate::db_state::SsTableView;
 use crate::error::SlateDBError;
 use crate::filter_iterator::FilterIterator;
 use crate::iter::{EmptyIterator, IterationOrder, RowEntryIterator};
@@ -9,15 +10,18 @@ use crate::merge_operator::{
     MergeOperatorIterator, MergeOperatorRequiredIterator, MergeOperatorType,
 };
 use crate::read_trace::ReadTrace;
-use crate::segment_iterator::{build_l0_point_iters, build_sr_point_iters, SegmentScanContext};
+use crate::read_trace::SstTraceLevel;
+use crate::segment_iterator::SegmentScanContext;
+use crate::sst_iter::{SstIterator, SstTracingContext};
 use crate::types::{KeyValue, RowEntry, ValueDeletable};
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use futures::stream::{self, BoxStream, StreamExt};
+use futures::stream::{self, BoxStream, StreamExt, TryStreamExt};
 use parking_lot::Mutex;
 use std::collections::VecDeque;
 use std::ops::RangeBounds;
+use std::sync::Arc;
 use tracing::Instrument;
 
 /// [`DbIteratorRangeTracker`] records the *requested* scan range of a
@@ -145,10 +149,62 @@ impl GetIterator {
         ctx: &SegmentScanContext,
         max_seq: Option<u64>,
     ) -> Result<Self, SlateDBError> {
-        let l0 = build_l0_point_iters(&tree.l0, ctx)?;
-        let sr = build_sr_point_iters(&key, &tree.compacted, ctx)?;
-        let iters = apply_filters(l0.into_iter().chain(sr), max_seq);
-        Ok(Self::with_lookahead(key, iters, ctx.max_parallel))
+        // Sources are built lazily, newest first, each only after its filter
+        // passes (`new_owned_point_with_stats`): a filtered-out SST costs one
+        // cache lookup, and SSTs past a hit are never built.
+        let ssts: Vec<_> = tree
+            .l0
+            .iter()
+            .map(|sst| (sst.clone(), SstTraceLevel::L0))
+            .chain(tree.compacted.iter().flat_map(|sr| {
+                sr.tables_covering_point_key(key.as_ref())
+                    .iter()
+                    .map(move |sst| (sst.clone(), SstTraceLevel::SortedRun(sr.id)))
+            }))
+            .filter(|(sst, _)| sst.calculate_view_range(ctx.range.clone()).is_some())
+            .collect();
+        let build = {
+            // One context clone per get; each SST takes a refcount, not a copy.
+            let (key, ctx) = (key.clone(), Arc::new(ctx.clone()));
+            move |(sst, level): (SsTableView, SstTraceLevel)| {
+                let (key, ctx) = (key.clone(), Arc::clone(&ctx));
+                async move {
+                    let iter = SstIterator::new_owned_point_with_stats(
+                        key,
+                        ctx.range.clone(),
+                        sst,
+                        ctx.table_store.clone(),
+                        ctx.sst_iter_options.clone(),
+                        Some(SstTracingContext::new(level, ctx.read_trace.clone())),
+                        ctx.point_lookup_stats.clone(),
+                    )
+                    .await?;
+                    let Some(iter) = iter else {
+                        return Ok(None);
+                    };
+                    let mut iter = apply_filters([iter], max_seq).pop().expect("one source");
+                    iter.init().await?;
+                    Ok(Some(iter))
+                }
+            }
+        };
+        let mut ssts = ssts.into_iter();
+        let newest = ssts.next();
+        let sources = stream::iter(newest)
+            .map(build.clone())
+            .buffered(1)
+            .chain(
+                stream::iter(ssts)
+                    .map(build)
+                    .buffered(ctx.max_parallel.max(1)),
+            )
+            .try_filter_map(|iter| async move { Ok(iter) })
+            .boxed();
+        Ok(Self {
+            key,
+            sources: Mutex::new(sources),
+            current: None,
+        })
     }
 }
 
