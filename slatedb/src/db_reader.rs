@@ -2171,19 +2171,45 @@ mod tests {
         .await
         .unwrap();
 
-        let hook = Arc::new(RecordingRefreshHook::default());
-        let reader = DbReader::builder(path, Arc::clone(&object_store))
-            .with_options(DbReaderOptions {
+        // Build DbReaderInner directly instead of DbReader so `poller` is the
+        // only poller, as it is in production. A DbReader also spawns its own,
+        // whose first tick fires immediately regardless of the poll interval;
+        // that poll can land mid-way through a manual poll's checkpoint
+        // replacement, see the old state, and run the hook a second time.
+        let manifest_store = test_provider.manifest_store();
+        let stored_manifest = StoredManifest::load(
+            Arc::clone(&manifest_store),
+            test_provider.system_clock.clone(),
+        )
+        .await
+        .unwrap();
+        let mut inner = DbReaderInner::new(
+            manifest_store,
+            test_provider.table_store(),
+            test_provider.wal_store(),
+            None,
+            DbReaderOptions {
                 manifest_poll_interval: Duration::from_secs(60 * 60),
                 checkpoint_lifetime: Duration::from_secs(3 * 60 * 60),
                 ..DbReaderOptions::default()
-            })
-            .with_manifest_refresh_hook(hook.clone())
-            .build()
-            .await
-            .unwrap();
+            },
+            DbReaderMode::ManagedCheckpoint,
+            None,
+            None,
+            test_provider.system_clock.clone(),
+            test_provider.rand.clone(),
+            slatedb_common::metrics::MetricsRecorderHelper::noop(),
+            ByteBufferManager::unbounded(),
+            stored_manifest,
+        )
+        .await
+        .unwrap();
+        let hook = Arc::new(RecordingRefreshHook::default());
+        inner.refresh_hook = Some(hook.clone());
+        let inner = Arc::new(inner);
+        let manifest = || VersionedManifest::from(inner.state.read().as_ref());
         let mut poller = ManifestPoller {
-            inner: Arc::clone(&reader.inner),
+            inner: Arc::clone(&inner),
         };
 
         poller.handle(DbReaderMessage::PollManifest).await.unwrap();
@@ -2192,8 +2218,8 @@ mod tests {
             "an unchanged manifest must not run the hook"
         );
 
-        let installed = reader.manifest().id();
-        let before: Vec<SsTableId> = reader.manifest().l0().iter().map(|v| v.sst.id).collect();
+        let installed = manifest().id();
+        let before: Vec<SsTableId> = manifest().l0().iter().map(|v| v.sst.id).collect();
         db.put(b"key", b"updated").await.unwrap();
         db.flush_with_options(FlushOptions {
             flush_type: FlushType::MemTable,
@@ -2207,7 +2233,7 @@ mod tests {
         let (current_id, next_id, added) = &calls[0];
         assert_eq!(*current_id, installed, "hook must run before the install");
         assert!(*next_id > installed);
-        let after: Vec<SsTableId> = reader.manifest().l0().iter().map(|v| v.sst.id).collect();
+        let after: Vec<SsTableId> = manifest().l0().iter().map(|v| v.sst.id).collect();
         let expected: Vec<SsTableId> = after
             .iter()
             .copied()
@@ -2216,9 +2242,32 @@ mod tests {
         assert!(!expected.is_empty());
         assert_eq!(added, &expected);
         assert_eq!(
-            reader.get(b"key").await.unwrap(),
+            inner
+                .get_with_options(b"key", &crate::config::ReadOptions::default())
+                .await
+                .unwrap(),
             Some(Bytes::from_static(b"updated"))
         );
+
+        db.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn builder_should_install_manifest_refresh_hook() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let path = Path::from("/tmp/test_builder_refresh_hook");
+        let test_provider = TestProvider::new(path.clone(), Arc::clone(&object_store));
+        let db = test_provider.new_db(Settings::default()).await.unwrap();
+
+        let hook: Arc<dyn ManifestRefreshHook> = Arc::new(RecordingRefreshHook::default());
+        let reader = DbReader::builder(path, Arc::clone(&object_store))
+            .with_manifest_refresh_hook(Arc::clone(&hook))
+            .build()
+            .await
+            .unwrap();
+
+        let installed = reader.inner.refresh_hook.as_ref().unwrap();
+        assert!(Arc::ptr_eq(installed, &hook));
 
         reader.close().await.unwrap();
         db.close().await.unwrap();
