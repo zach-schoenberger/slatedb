@@ -210,8 +210,10 @@ impl MetadataPinner {
     /// A trivial move puts an L0 SST into a sorted run without rewriting it.
     /// Such an SST keeps the pin it had in L0, in every mode that gave it one.
     ///
-    /// The cost is one pass over the SSTs of `prev` and of `next`. Nothing
-    /// outlives the call.
+    /// The cost is one pass over the SSTs of `prev` and of `next`. A sorted
+    /// run is rebuilt only when one of its handles gains a pin, so in `L0`
+    /// mode a run is rebuilt only when it holds a trivially moved SST.
+    /// Nothing outlives the call.
     pub(crate) fn carry_pins(&self, prev: Option<&ManifestCore>, next: &mut ManifestCore) {
         if self.mode == MetadataPinning::None {
             return;
@@ -224,6 +226,9 @@ impl MetadataPinner {
                     .collect()
             })
             .unwrap_or_default();
+        let gains_pin = |handle: &SsTableHandle, level: PinLevel| {
+            handle.pinned().is_none() && (self.selects(level) || prior.contains_key(&handle.id))
+        };
         let attach = |handle: &mut SsTableHandle, level: PinLevel| {
             if handle.pinned().is_some() {
                 return;
@@ -234,15 +239,20 @@ impl MetadataPinner {
             };
             handle.set_pinned(pin);
         };
-        let pin_sorted_runs = self.selects(PinLevel::SortedRun) || !prior.is_empty();
         for tree in next.trees_mut() {
             for view in tree.l0.iter_mut() {
                 attach(&mut view.sst, PinLevel::L0);
             }
-            if !pin_sorted_runs {
-                continue;
-            }
             for run in tree.compacted.iter_mut() {
+                // Rebuilding a run copies every view, so skip a run that
+                // gains no pin.
+                if !run
+                    .sst_views()
+                    .iter()
+                    .any(|view| gains_pin(&view.sst, PinLevel::SortedRun))
+                {
+                    continue;
+                }
                 let views = run.sst_views().iter().cloned().map(|mut view| {
                     attach(&mut view.sst, PinLevel::SortedRun);
                     view
@@ -385,6 +395,23 @@ mod tests {
         pinner.carry_pins(Some(&prev), &mut next);
 
         assert_eq!(run_pins(&next), [true, false]);
+    }
+
+    #[test]
+    fn carry_pins_rebuilds_only_runs_that_gain_a_pin() {
+        let (pinner, _) = pinner(MetadataPinning::L0);
+        let mut prev = core(vec![view(1)], vec![]);
+        pinner.carry_pins(None, &mut prev);
+
+        // Run 0 holds no pinned SST. Run 1 holds SST 1, trivially moved.
+        let mut next = core(vec![], vec![vec![view(2), view(3)], vec![view(1)]]);
+        let untouched = next.tree.compacted[0].sst_views().as_ptr();
+        let rebuilt = next.tree.compacted[1].sst_views().as_ptr();
+        pinner.carry_pins(Some(&prev), &mut next);
+
+        assert_eq!(next.tree.compacted[0].sst_views().as_ptr(), untouched);
+        assert_ne!(next.tree.compacted[1].sst_views().as_ptr(), rebuilt);
+        assert_eq!(run_pins(&next), [false, false, true]);
     }
 
     #[test]

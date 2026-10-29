@@ -1221,6 +1221,7 @@ impl Default for DbReaderOptions {
 ///
 /// This option models RocksDB's `PinningTier`: `None` is `kNone`, `L0` is
 /// `kFlushedAndSimilar`, and `All` is `kAll`.
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
 pub enum MetadataPinning {
     /// Do not pin. Filters and indexes are read through the block cache.
