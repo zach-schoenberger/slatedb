@@ -43,7 +43,8 @@ pub const MEMTABLE_WRITE_BYTES: &str = db_stat_name!("memtable_write_bytes");
 /// Bytes of decoded SST metadata pinned in memory (RFC 0037), labeled by
 /// `level` and `component`.
 pub const PINNED_SST_METADATA_BYTES: &str = db_stat_name!("pinned_sst_metadata_bytes");
-/// Number of SSTs that hold a pin (RFC 0037), labeled by `level`.
+/// Number of SSTs whose pin (RFC 0037) holds their filters, their index, or
+/// both, labeled by `level`. An SST whose pin is still empty is not counted.
 pub const PINNED_SST_COUNT: &str = db_stat_name!("pinned_sst_count");
 pub const PIN_LEVEL_LABEL: &str = "level";
 pub const PIN_LEVEL_L0: &str = "l0";

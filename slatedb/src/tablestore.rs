@@ -4180,6 +4180,8 @@ mod pin_tests {
         handle.set_pinned(reader.pinner().new_pin(PinLevel::SortedRun));
         let trace = ReadTrace::none();
         assert!(reader.pinned_filters(&handle, &trace, None).is_none());
+        let sorted_run = [(PIN_LEVEL_LABEL, PIN_LEVEL_SORTED_RUN)];
+        assert_eq!(up_down(&recorder, PINNED_SST_COUNT, &sorted_run), 0);
 
         let filters = reader
             .read_filters(&handle, true, Some(Bytes::new()), &trace, None)
@@ -4195,7 +4197,6 @@ mod pin_tests {
         assert!(reader.pinned_filters(&handle, &trace, None).is_some());
 
         let filter_bytes: i64 = filters.iter().map(|f| f.filter.size() as i64).sum();
-        let sorted_run = [(PIN_LEVEL_LABEL, PIN_LEVEL_SORTED_RUN)];
         assert_eq!(up_down(&recorder, PINNED_SST_COUNT, &sorted_run), 1);
         assert_eq!(
             up_down(

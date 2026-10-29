@@ -1822,6 +1822,7 @@ mod pin_tests {
     use super::*;
     use crate::config::MetadataPinning;
     use crate::format::sst::SST_FORMAT_VERSION_LATEST;
+    use crate::manifest::store::test_utils::new_dirty_manifest;
     use crate::pinned_metadata::PinLevel;
     use slatedb_common::metrics::MetricsRecorderHelper;
 
@@ -1851,5 +1852,80 @@ mod pin_tests {
             handle.pinned().unwrap(),
             view.sst.pinned().unwrap()
         ));
+    }
+
+    fn handle(id: u64) -> SsTableHandle {
+        SsTableHandle::new(
+            SsTableId::from(Ulid::from_parts(id, 0)),
+            SST_FORMAT_VERSION_LATEST,
+            SsTableInfo::default(),
+        )
+    }
+
+    /// Strips the pin, as decoding the compactor's manifest does.
+    fn decoded(view: &SsTableView) -> SsTableView {
+        let mut view = view.clone();
+        view.sst.set_pinned(None);
+        view
+    }
+
+    /// The writer adopts the compactor's sorted runs. Its own L0 views keep
+    /// their pins, a trivially moved L0 SST keeps its L0 pin in the run, and a
+    /// rewritten SST gets a fresh pin only when the mode pins sorted runs.
+    #[test]
+    fn merge_remote_manifest_carries_the_writers_pins() {
+        for (mode, rewritten_pinned) in [(MetadataPinning::L0, false), (MetadataPinning::All, true)]
+        {
+            let pinner = MetadataPinner::new(mode, &MetricsRecorderHelper::noop());
+            let mut db_state = DbState::new(new_dirty_manifest());
+            // Three flushed L0 SSTs, pinned as the writer pins them, newest
+            // first.
+            let l0: Vec<SsTableView> = [2, 1, 0]
+                .into_iter()
+                .map(|id| {
+                    SsTableView::identity(handle(id).with_pinned(pinner.new_pin(PinLevel::L0)))
+                })
+                .collect();
+            db_state.modify(|modifier| {
+                Arc::make_mut(&mut modifier.state.manifest.value.core.tree).l0 =
+                    l0.iter().cloned().collect();
+            });
+
+            // The compactor absorbed SSTs 0 and 1: SST 0 by a trivial move,
+            // SST 1 by a rewrite into SST 10. Its manifest still lists SST 2.
+            let mut remote = new_dirty_manifest();
+            remote.value.core = db_state.state.core().clone();
+            let tree = Arc::make_mut(&mut remote.value.core.tree);
+            tree.l0 = [decoded(&l0[0])].into_iter().collect();
+            tree.compacted = vec![
+                SortedRun::new(1, [SsTableView::identity(handle(10))]),
+                SortedRun::new(0, [decoded(&l0[2])]),
+            ];
+            tree.last_compacted_l0_sst_view_id = Some(l0[1].id);
+
+            db_state.merge_remote_manifest(remote, &pinner);
+
+            let core = db_state.state.core();
+            assert_eq!(core.tree.l0.len(), 1, "{mode:?}");
+            assert!(
+                Arc::ptr_eq(
+                    core.tree.l0[0].sst.pinned().unwrap(),
+                    l0[0].sst.pinned().unwrap()
+                ),
+                "{mode:?}: the remaining L0 SST keeps its pin"
+            );
+            let moved = &core.tree.compacted[1].sst_views()[0];
+            assert_eq!(moved.sst.id, l0[2].sst.id);
+            assert!(
+                Arc::ptr_eq(moved.sst.pinned().unwrap(), l0[2].sst.pinned().unwrap()),
+                "{mode:?}: the trivially moved SST keeps its L0 pin"
+            );
+            let rewritten = &core.tree.compacted[0].sst_views()[0];
+            assert_eq!(
+                rewritten.sst.pinned().is_some(),
+                rewritten_pinned,
+                "{mode:?}"
+            );
+        }
     }
 }

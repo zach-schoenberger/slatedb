@@ -169,6 +169,10 @@ harness = false
 name = "memtable_seek"
 harness = false
 
+[[bench]]
+name = "pinned_metadata_get"
+harness = false
+
 [lints]
 workspace = true
 

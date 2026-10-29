@@ -1228,7 +1228,11 @@ pub enum MetadataPinning {
     #[default]
     None,
     /// Pin the filters and index of every L0 SST. Memory is bounded by the
-    /// number of L0 SSTs, which `Settings::l0_max_ssts` caps per tree.
+    /// number of L0 SSTs, which `Settings::l0_max_ssts` caps per tree. With
+    /// `CompactorOptions::enable_trivial_move`, an SST moved out of L0
+    /// without a rewrite keeps its pin, as in RocksDB, so memory can grow
+    /// past that bound; `slatedb.db.pinned_sst_count{level="l0"}` counts
+    /// these SSTs.
     L0,
     /// Pin the filters and index of every SST, in L0 and in sorted runs.
     /// Memory is the decoded metadata of the whole database.

@@ -22,7 +22,7 @@ The `metadata_pinning` setting keeps the decoded filters and index of an SST on 
 The setting has three values:
 
 - `None` (the default): nothing is pinned. Filters and indexes go through the block cache.
-- `L0`: the filters and index of every L0 SST are pinned. Memory is bounded by the number of L0 SSTs.
+- `L0`: the filters and index of every L0 SST are pinned. Memory is bounded by the number of L0 SSTs. With `enable_trivial_move`, an SST moved out of L0 without a rewrite keeps its pin until compaction rewrites it, as in RocksDB, so memory can exceed that bound.
 - `All`: the filters and index of every SST are pinned. Memory is the decoded metadata of the whole database.
 
 The pin is filled only from data that is already in memory. The writer fills it when it flushes an L0 SST. A read fills it the first time it reads the metadata of a pinned SST, through the block cache or object storage as today. No read is issued only to pin. Pinned memory lives outside the block cache. The `slatedb.db.pinned_sst_count` and `slatedb.db.pinned_sst_metadata_bytes` metrics report it. The same setting exists on `DbReaderOptions`.
