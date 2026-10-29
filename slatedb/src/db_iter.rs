@@ -467,26 +467,14 @@ fn apply_max_seq(
     }
 }
 
-pub(crate) fn apply_filters<T>(
-    iters: impl IntoIterator<Item = T>,
+pub(crate) fn apply_filters(
+    iters: impl IntoIterator<Item = Box<dyn RowEntryIterator + 'static>>,
     max_seq: Option<u64>,
-) -> Vec<Box<dyn RowEntryIterator>>
-where
-    T: RowEntryIterator + 'static,
-{
-    match max_seq {
-        Some(max_seq) => iters
-            .into_iter()
-            .map(|iter| {
-                Box::new(FilterIterator::new_with_max_seq(iter, Some(max_seq)))
-                    as Box<dyn RowEntryIterator + 'static>
-            })
-            .collect(),
-        None => iters
-            .into_iter()
-            .map(|iter| Box::new(iter) as Box<dyn RowEntryIterator + 'static>)
-            .collect(),
-    }
+) -> Vec<Box<dyn RowEntryIterator + 'static>> {
+    iters
+        .into_iter()
+        .map(|iter| apply_max_seq(iter, max_seq))
+        .collect()
 }
 
 /// See [`crate::Db::scan_prefix_by_recency`] for the full contract.
