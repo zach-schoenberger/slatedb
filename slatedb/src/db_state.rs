@@ -217,17 +217,42 @@ impl SsTableView {
         &self.effective_range
     }
 
+    /// Returns the part of `range` that this view keeps when a projection narrows its
+    /// sorted run, or `None` if the view keeps nothing.
+    ///
+    /// `next_view` is the next view in the same sorted run. It is `None` for the last
+    /// view of a run and for L0 views, which can overlap. The result covers these cases:
+    /// - No next view: the view's own effective range, cut to `range`.
+    /// - Next view: the keys from this view's start up to the start of the next view,
+    ///   cut to `range`.
+    /// - Shared boundary key: if this view also contains the first key of the next
+    ///   view, the result includes that key. Two adjacent SSTs can split the versions
+    ///   of one key, for example `[a, m]` followed by `[m, z]`.
+    /// - Gap before the next view: the result stays inside the visible range of this
+    ///   view. An incremental commit can leave a view `[a, g)` before a view that
+    ///   starts at `m`, and the result must not show `[g, m)` again.
+    ///
+    /// TODO: If every SST records `last_entry`, this function can return
+    /// `self.effective_range.intersect(range)` and no longer needs `next_view`.
     pub(crate) fn compacted_intersection(
         &self,
         next_view: Option<&SsTableView>,
         range: &BytesRange,
     ) -> Option<BytesRange> {
         if let Some(next_view) = next_view {
-            BytesRange::new(
-                self.compacted_effective_start_bound(),
-                Excluded(next_view.compacted_effective_start_key().clone()),
-            )
-            .intersect(range)
+            let next_key = next_view.compacted_effective_start_key();
+            let end = if self.effective_range.contains(next_key) {
+                Included(next_key.clone())
+            } else {
+                Excluded(next_key.clone())
+            };
+            let intersection =
+                BytesRange::new(self.compacted_effective_start_bound(), end).intersect(range)?;
+            // A new projection must preserve gaps from earlier projections.
+            match &self.visible_range {
+                Some(visible) => intersection.intersect(visible),
+                None => Some(intersection),
+            }
         } else {
             self.effective_range.intersect(range)
         }
@@ -665,12 +690,7 @@ impl SortedRun {
     ///
     /// The bound is normally the next view's start key, but becomes inclusive
     /// when adjacent views overlap on that boundary key.
-    fn table_end_bound(&self, idx: usize) -> Bound<Bytes> {
-        self.table_end_bound_ref(idx).cloned()
-    }
-
-    /// Borrowing form of [`Self::table_end_bound`].
-    fn table_end_bound_ref(&self, idx: usize) -> Bound<&Bytes> {
+    fn table_end_bound(&self, idx: usize) -> Bound<&Bytes> {
         let current_sst = &self.sst_views[idx];
         if idx + 1 < self.sst_views.len() {
             let next_start = self.sst_views[idx + 1].compacted_effective_start_key();
@@ -687,7 +707,7 @@ impl SortedRun {
     /// Whether the view at `idx` can hold `key`, bounded by the next view's
     /// start as in [`Self::table_end_bound`].
     fn point_intersects_table(&self, idx: usize, key: &[u8]) -> bool {
-        let end_bound = self.table_end_bound_ref(idx).map(Bytes::as_ref);
+        let end_bound = self.table_end_bound(idx).map(Bytes::as_ref);
         self.sst_views[idx].intersects_point(end_bound, key)
     }
 
@@ -739,7 +759,7 @@ impl SortedRun {
             Unbounded => views.len() - 1,
         };
 
-        if !views[max_idx].intersects_range(self.table_end_bound(max_idx), range) {
+        if !views[max_idx].intersects_range(self.table_end_bound(max_idx).cloned(), range) {
             return 0..0;
         }
 
@@ -754,13 +774,16 @@ impl SortedRun {
         };
 
         let mut min_idx = match start_candidate {
-            Some(idx) if views[idx].intersects_range(self.table_end_bound(idx), range) => idx,
+            Some(idx) if views[idx].intersects_range(self.table_end_bound(idx).cloned(), range) => {
+                idx
+            }
             Some(idx) => idx + 1,
             None => 0,
         };
 
         while min_idx > 0
-            && views[min_idx - 1].intersects_range(self.table_end_bound(min_idx - 1), range)
+            && views[min_idx - 1]
+                .intersects_range(self.table_end_bound(min_idx - 1).cloned(), range)
         {
             min_idx -= 1;
         }
