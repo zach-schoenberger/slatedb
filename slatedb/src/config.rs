@@ -855,6 +855,13 @@ pub struct Settings {
     #[serde(default)]
     pub object_store_max_retries: Option<u32>,
 
+    /// Which SSTs keep their decoded filters and index pinned in memory for
+    /// as long as the SST is live. See [`MetadataPinning`].
+    ///
+    /// Defaults to [`MetadataPinning::None`].
+    #[serde(default)]
+    pub metadata_pinning: MetadataPinning,
+
     /// The block format for SST files. This is only available in tests
     /// to verify backward compatibility between V1 and V2 formats.
     #[cfg(test)]
@@ -893,7 +900,8 @@ impl std::fmt::Debug for Settings {
             )
             .field("garbage_collector_options", &self.garbage_collector_options)
             .field("metric_level", &self.metric_level)
-            .field("default_ttl_millis", &self.default_ttl_millis);
+            .field("default_ttl_millis", &self.default_ttl_millis)
+            .field("metadata_pinning", &self.metadata_pinning);
         data.finish()
     }
 }
@@ -1125,6 +1133,7 @@ impl Default for Settings {
             metric_level: MetricLevel::default(),
             default_ttl_millis: None,
             object_store_max_retries: None,
+            metadata_pinning: MetadataPinning::None,
             #[cfg(test)]
             block_format: None,
         }
@@ -1174,6 +1183,13 @@ pub struct DbReaderOptions {
     /// Defaults to unbounded retries.
     #[serde(default)]
     pub object_store_max_retries: Option<u32>,
+
+    /// Which SSTs keep their decoded filters and index pinned in memory for
+    /// as long as the SST is live. See [`MetadataPinning`].
+    ///
+    /// Defaults to [`MetadataPinning::None`].
+    #[serde(default)]
+    pub metadata_pinning: MetadataPinning,
 }
 
 impl Default for DbReaderOptions {
@@ -1186,8 +1202,36 @@ impl Default for DbReaderOptions {
             skip_wal_replay: false,
             metric_level: None,
             object_store_max_retries: None,
+            metadata_pinning: MetadataPinning::None,
         }
     }
+}
+
+/// Which SSTs keep their decoded filters and index pinned in memory.
+///
+/// A pinned SST holds its decoded filters and index on its in-memory handle
+/// for as long as the SST is part of the database state. Reads of pinned
+/// metadata skip the block cache lookup, and point lookups check a pinned
+/// filter before they build the per-SST iterator. Pinned memory lives outside
+/// the block cache and is freed when the SST leaves the database state.
+///
+/// The pin is filled only from data that is already in memory: the writer
+/// fills it when it flushes an L0 SST, and a read fills it the first time it
+/// reads the metadata of a pinned SST. No read is issued only to pin.
+///
+/// This option models RocksDB's `PinningTier`: `None` is `kNone`, `L0` is
+/// `kFlushedAndSimilar`, and `All` is `kAll`.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+pub enum MetadataPinning {
+    /// Do not pin. Filters and indexes are read through the block cache.
+    #[default]
+    None,
+    /// Pin the filters and index of every L0 SST. Memory is bounded by the
+    /// number of L0 SSTs, which `Settings::l0_max_ssts` caps per tree.
+    L0,
+    /// Pin the filters and index of every SST, in L0 and in sorted runs.
+    /// Memory is the decoded metadata of the whole database.
+    All,
 }
 
 /// The compression algorithm to use for SSTables.

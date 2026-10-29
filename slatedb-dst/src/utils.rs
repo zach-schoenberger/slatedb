@@ -6,7 +6,7 @@ use rand::{Rng, RngExt};
 use slatedb::config::{
     CompactionWorkerOptions, CompactorOptions, CompressionCodec, DbReaderOptions, DurabilityLevel,
     GarbageCollectorDirectoryOptions, GarbageCollectorOptions, GarbageCollectorScheduleOptions,
-    ScanOptions, SizeTieredCompactionSchedulerOptions,
+    MetadataPinning, ScanOptions, SizeTieredCompactionSchedulerOptions,
 };
 use slatedb::{DbRand, IterationOrder, Settings};
 use tracing_subscriber::fmt::format::FmtSpan;
@@ -52,8 +52,10 @@ pub async fn build_settings(rand: &DbRand) -> Settings {
         } else {
             None
         };
+    let metadata_pinning = random_metadata_pinning(&mut *rng);
     let settings = Settings {
         flush_interval: Some(flush_interval),
+        metadata_pinning,
         manifest_poll_interval,
         manifest_update_timeout,
         min_filter_keys,
@@ -81,12 +83,23 @@ pub fn build_reader_options(rand: &DbRand) -> DbReaderOptions {
     let checkpoint_lifetime =
         rng.random_range(min_checkpoint_lifetime..Duration::from_secs(4 * 60 * 60));
     let max_memtable_bytes = rng.random_range((MIB_1 as u64)..=(MIB_500 as u64));
+    let metadata_pinning = random_metadata_pinning(&mut *rng);
     DbReaderOptions {
         manifest_poll_interval,
         checkpoint_lifetime,
         max_memtable_bytes,
+        metadata_pinning,
         ..DbReaderOptions::default()
     }
+}
+
+fn random_metadata_pinning(rng: &mut impl rand::Rng) -> MetadataPinning {
+    const MODES: [MetadataPinning; 3] = [
+        MetadataPinning::None,
+        MetadataPinning::L0,
+        MetadataPinning::All,
+    ];
+    MODES[rng.random_range(0..MODES.len())]
 }
 
 /// Builds randomized deterministic scan options for DST scenarios.

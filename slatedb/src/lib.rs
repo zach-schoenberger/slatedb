@@ -45,7 +45,7 @@ pub use compaction_filter::{
 pub use compaction_worker::CompactionWorker;
 pub use compactor::CompactorBuilder;
 pub use compactor_state::VersionedCompactions;
-pub use config::{Settings, SstBlockSize};
+pub use config::{MetadataPinning, Settings, SstBlockSize};
 pub use db::builder::{CloneSourceSpec, CompactionWorkerBuilder};
 pub use db::{Db, DbBuilder, DbReaderBuilder, DbStatus, SegmentPrefix, WriteHandle};
 pub use db_cache::stats as db_cache_stats;
@@ -152,6 +152,7 @@ mod oracle;
 mod partitioned_keyspace;
 mod paths;
 mod peeking_iterator;
+mod pinned_metadata;
 #[cfg(test)]
 mod proptest_util;
 mod read_trace;

@@ -9,7 +9,7 @@ use crate::merge_operator::{
     MergeOperatorIterator, MergeOperatorRequiredIterator, MergeOperatorType,
 };
 use crate::read_trace::ReadTrace;
-use crate::segment_iterator::{build_l0_point_iters, build_sr_point_iters, SegmentScanContext};
+use crate::segment_iterator::{build_point_iter, point_lookup_candidates, SegmentScanContext};
 use crate::types::{KeyValue, RowEntry, ValueDeletable};
 
 use async_trait::async_trait;
@@ -71,14 +71,21 @@ impl GetIterator {
     ///
     /// `init` calls can finish out of order. The stream yields sources in
     /// their original order.
+    ///
+    /// `iters` is pulled lazily, in order, as the walk needs sources: the
+    /// newest first, then up to `lookahead` at a time. A source the walk never
+    /// reaches is never built.
     fn with_lookahead(
         key: Bytes,
-        iters: Vec<Box<dyn RowEntryIterator + 'static>>,
+        iters: impl Iterator<Item = Result<Box<dyn RowEntryIterator + 'static>, SlateDBError>>
+            + Send
+            + 'static,
         lookahead: usize,
     ) -> Self {
         async fn init_source(
-            mut iter: Box<dyn RowEntryIterator + 'static>,
+            iter: Result<Box<dyn RowEntryIterator + 'static>, SlateDBError>,
         ) -> Result<Box<dyn RowEntryIterator + 'static>, SlateDBError> {
+            let mut iter = iter?;
             iter.init().await.map(|()| iter)
         }
 
@@ -107,7 +114,7 @@ impl GetIterator {
         mem_iters: impl IntoIterator<Item = Box<dyn RowEntryIterator + 'static>>,
         segment_iter: Box<dyn RowEntryIterator + 'static>,
     ) -> Self {
-        let iters = vec![write_batch_iter]
+        let iters: Vec<Box<dyn RowEntryIterator + 'static>> = vec![write_batch_iter]
             .into_iter()
             .chain(mem_iters)
             .chain(std::iter::once(segment_iter))
@@ -115,7 +122,7 @@ impl GetIterator {
 
         // Each source is in memory or is the segment chain.
         // No metadata fetches between these sources can overlap.
-        Self::with_lookahead(key, iters, 1)
+        Self::with_lookahead(key, iters.into_iter().map(Ok), 1)
     }
 
     /// Build a per-tree `GetIterator` over the L0 + sorted-run iterators
@@ -145,10 +152,20 @@ impl GetIterator {
         ctx: &SegmentScanContext,
         max_seq: Option<u64>,
     ) -> Result<Self, SlateDBError> {
-        let l0 = build_l0_point_iters(&tree.l0, ctx)?;
-        let sr = build_sr_point_iters(&key, &tree.compacted, ctx)?;
-        let iters = apply_filters(l0.into_iter().chain(sr), max_seq);
-        Ok(Self::with_lookahead(key, iters, ctx.max_parallel))
+        // Candidates are cheap to list; the per-SST iterators are built
+        // lazily as the walk pulls them, so a pinned filter is probed in walk
+        // order and a filter-negative pinned SST yields no source at all
+        // (RFC 0037).
+        let candidates = point_lookup_candidates(&key, tree);
+        let max_parallel = ctx.max_parallel;
+        let ctx = ctx.clone();
+        let probe_key = key.clone();
+        let iters = candidates.into_iter().filter_map(move |(view, level)| {
+            build_point_iter(&probe_key, view, level, &ctx)
+                .map(|iter| iter.map(|iter| apply_max_seq(iter, max_seq)))
+                .transpose()
+        });
+        Ok(Self::with_lookahead(key, iters, max_parallel))
     }
 }
 
@@ -440,6 +457,16 @@ impl DbIterator {
     }
 }
 
+fn apply_max_seq(
+    iter: Box<dyn RowEntryIterator + 'static>,
+    max_seq: Option<u64>,
+) -> Box<dyn RowEntryIterator + 'static> {
+    match max_seq {
+        Some(max_seq) => Box::new(FilterIterator::new_with_max_seq(iter, Some(max_seq))),
+        None => iter,
+    }
+}
+
 pub(crate) fn apply_filters<T>(
     iters: impl IntoIterator<Item = T>,
     max_seq: Option<u64>,
@@ -622,7 +649,8 @@ mod tests {
     #[tokio::test]
     async fn test_get_probes_absent_sources_concurrently() {
         let (record, iters) = probe_sources(8, &[]);
-        let mut iter = GetIterator::with_lookahead(Bytes::from_static(b"key"), iters, 4);
+        let mut iter =
+            GetIterator::with_lookahead(Bytes::from_static(b"key"), iters.into_iter().map(Ok), 4);
 
         assert_eq!(iter.next().await.unwrap(), None);
 
@@ -635,7 +663,8 @@ mod tests {
     #[tokio::test]
     async fn test_get_returns_newest_matching_source() {
         let (_, iters) = probe_sources(8, &[2, 3, 5]);
-        let mut iter = GetIterator::with_lookahead(Bytes::from_static(b"key"), iters, 4);
+        let mut iter =
+            GetIterator::with_lookahead(Bytes::from_static(b"key"), iters.into_iter().map(Ok), 4);
 
         // The first window initializes sources 2, 3, and 5.
         // The iterator must use source order, not `init` completion order.
@@ -650,7 +679,8 @@ mod tests {
     #[tokio::test]
     async fn test_get_hit_in_newest_source_probes_nothing_else() {
         let (record, iters) = probe_sources(8, &[0]);
-        let mut iter = GetIterator::with_lookahead(Bytes::from_static(b"key"), iters, 4);
+        let mut iter =
+            GetIterator::with_lookahead(Bytes::from_static(b"key"), iters.into_iter().map(Ok), 4);
 
         let entry = iter.next().await.unwrap().expect("newest source holds key");
         assert_eq!(entry.value.as_bytes(), Some(Bytes::from_static(b"0")));
@@ -665,7 +695,8 @@ mod tests {
     #[tokio::test]
     async fn test_get_hit_past_the_newest_source_bounds_overshoot() {
         let (record, iters) = probe_sources(8, &[1]);
-        let mut iter = GetIterator::with_lookahead(Bytes::from_static(b"key"), iters, 4);
+        let mut iter =
+            GetIterator::with_lookahead(Bytes::from_static(b"key"), iters.into_iter().map(Ok), 4);
 
         iter.next().await.unwrap().expect("source 1 holds key");
         assert_eq!(iter.next().await.unwrap(), None);
@@ -683,7 +714,8 @@ mod tests {
     #[tokio::test]
     async fn test_get_with_unit_lookahead_probes_one_source_at_a_time() {
         let (record, iters) = probe_sources(4, &[]);
-        let mut iter = GetIterator::with_lookahead(Bytes::from_static(b"key"), iters, 1);
+        let mut iter =
+            GetIterator::with_lookahead(Bytes::from_static(b"key"), iters.into_iter().map(Ok), 1);
 
         assert_eq!(iter.next().await.unwrap(), None);
 
@@ -718,7 +750,8 @@ mod tests {
         ));
         let (record, older_sources) = probe_sources(3, &[0, 1, 2]);
         sources.extend(older_sources);
-        let mut iter = GetIterator::with_lookahead(Bytes::from_static(b"key"), sources, 1);
+        let mut iter =
+            GetIterator::with_lookahead(Bytes::from_static(b"key"), sources.into_iter().map(Ok), 1);
 
         if merge {
             assert_eq!(iter.next().await.unwrap(), Some(newer_operand));

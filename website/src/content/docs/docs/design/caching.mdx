@@ -15,6 +15,18 @@ You can replace the cache with [`DbBuilder::with_db_cache`](https://docs.rs/slat
 
 [`FoyerHybridCache`](https://docs.rs/slatedb/latest/slatedb/db_cache/foyer_hybrid/struct.FoyerHybridCache.html) also belongs in this layer. It is a `DbCache` implementation, so it caches decoded SST entries, not raw object-store bytes. Its memory tier works like any other database cache. Its disk tier can still avoid remote I/O and decode work, but it adds a local disk read on a miss in memory. See [Configuring Foyer Cache](/docs/operations/foyer-cache) for tuning guidance.
 
+## Pinned Filters and Indexes
+
+The `metadata_pinning` setting keeps the decoded filters and index of an SST on its in-memory handle for as long as the SST is part of the database state. A read of pinned metadata does no cache lookup. A point lookup checks a pinned filter before it builds the per-SST iterator, so an SST that cannot contain the key costs a few hash probes and nothing else.
+
+The setting has three values:
+
+- `None` (the default): nothing is pinned. Filters and indexes go through the block cache.
+- `L0`: the filters and index of every L0 SST are pinned. Memory is bounded by the number of L0 SSTs.
+- `All`: the filters and index of every SST are pinned. Memory is the decoded metadata of the whole database.
+
+The pin is filled only from data that is already in memory. The writer fills it when it flushes an L0 SST. A read fills it the first time it reads the metadata of a pinned SST, through the block cache or object storage as today. No read is issued only to pin. Pinned memory lives outside the block cache. The `slatedb.db.pinned_sst_count` and `slatedb.db.pinned_sst_metadata_bytes` metrics report it. The same setting exists on `DbReaderOptions`.
+
 ## Object-Store Cache
 
 [`CachedObjectStore`](https://docs.rs/slatedb/latest/slatedb/cached_object_store/struct.CachedObjectStore.html) is a second cache layer for raw object-store bytes. It splits each object into fixed-size parts, stores those parts under a local root folder, and can serve later `GET` and `HEAD` requests from those local files when the needed parts are already present.

@@ -187,7 +187,7 @@ impl DbReaderInner {
     ) -> Result<Self, SlateDBError> {
         let checkpoint =
             Self::get_or_create_checkpoint(&mut manifest, mode, &options, rand.clone()).await?;
-        let (manifest_id, initial_manifest) = if let Some(checkpoint) = checkpoint.as_ref() {
+        let (manifest_id, mut initial_manifest) = if let Some(checkpoint) = checkpoint.as_ref() {
             (
                 checkpoint.manifest_id,
                 manifest_store.read_manifest(checkpoint.manifest_id).await?,
@@ -195,6 +195,9 @@ impl DbReaderInner {
         } else {
             (manifest.id(), manifest.manifest().clone())
         };
+        table_store
+            .pinner()
+            .carry_pins(None, &mut initial_manifest.core);
         let status_manager = DbStatusManager::new_with_initial_values(
             initial_manifest.core.last_l0_seq,
             VersionedManifest::from_manifest(manifest_id, initial_manifest.clone()),
@@ -453,9 +456,15 @@ impl DbReaderInner {
         &self,
         checkpoint: Option<Checkpoint>,
         manifest_id: u64,
-        manifest: Manifest,
+        mut manifest: Manifest,
     ) -> Result<ReaderState, SlateDBError> {
         let prior = self.state.read().clone();
+        // The handles in `manifest` were decoded from the manifest and carry
+        // no pins. Carry the pins of the SSTs that are still live over from
+        // the prior state (RFC 0037).
+        self.table_store
+            .pinner()
+            .carry_pins(Some(&prior.manifest.core), &mut manifest.core);
         let mut imm_memtable = VecDeque::new();
 
         for table in prior.imm_memtable.iter() {
@@ -3943,6 +3952,118 @@ mod tests {
         rx.changed().await.unwrap();
         assert!(rx.borrow().close_reason.is_some());
 
+        db.close().await.unwrap();
+    }
+}
+
+#[cfg(test)]
+mod pin_tests {
+    use super::*;
+    use crate::config::{MetadataPinning, Settings};
+    use crate::Db;
+    use object_store::memory::InMemory;
+    use object_store::path::Path;
+    use object_store::ObjectStore;
+    use std::time::Duration;
+
+    async fn put_and_flush(db: &Db, keys: &[&[u8]]) {
+        for key in keys {
+            db.put(key, b"value").await.unwrap();
+        }
+        db.flush_with_options(crate::config::FlushOptions {
+            flush_type: crate::config::FlushType::MemTable,
+        })
+        .await
+        .unwrap();
+    }
+
+    /// Pins on the reader survive a manifest refresh: the handles of the SSTs
+    /// that stay live keep their filled pins, and the new SST gets an empty
+    /// one (RFC 0037).
+    #[tokio::test]
+    async fn reader_carries_pins_across_manifest_refresh() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let path = Path::from("/tmp/test_reader_pins");
+        let db = Db::builder(path.clone(), Arc::clone(&object_store))
+            .with_settings(Settings {
+                flush_interval: None,
+                min_filter_keys: 0,
+                compactor_options: None,
+                ..Settings::default()
+            })
+            .build()
+            .await
+            .unwrap();
+        // Every SST spans the key "m", so no SST is pruned by key range and
+        // every lookup of "m" probes every L0 filter.
+        put_and_flush(&db, &[b"a", b"z"]).await;
+        put_and_flush(&db, &[b"b", b"y"]).await;
+
+        let reader = DbReader::open(
+            path.clone(),
+            Arc::clone(&object_store),
+            DbReaderMode::ManagedCheckpoint,
+            DbReaderOptions {
+                manifest_poll_interval: Duration::from_millis(20),
+                metadata_pinning: MetadataPinning::All,
+                ..DbReaderOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+        let pins = |reader: &DbReader| -> Vec<(SsTableId, bool, bool)> {
+            let state = reader.inner.state.read().clone();
+            state
+                .manifest
+                .core
+                .tree
+                .l0
+                .iter()
+                .map(|view| {
+                    let pin = view.sst.pinned().expect("every L0 SST is pinned");
+                    (view.sst.id, pin.filters().is_some(), pin.index().is_some())
+                })
+                .collect()
+        };
+        let before = pins(&reader);
+        assert_eq!(before.len(), 2);
+        assert!(before.iter().all(|(_, filters, index)| !filters && !index));
+
+        // A get of an absent key probes every L0 filter and fills each pin's
+        // filters. A hit in the newest SST then reads that SST's index and
+        // stops.
+        assert_eq!(reader.get(b"m").await.unwrap(), None);
+        assert_eq!(
+            reader.get(b"b").await.unwrap(),
+            Some(Bytes::from_static(b"value"))
+        );
+        let filled = pins(&reader);
+        assert!(filled.iter().all(|(_, filters, _)| *filters), "{filled:?}");
+        assert_eq!(
+            filled
+                .iter()
+                .map(|(_, _, index)| *index)
+                .collect::<Vec<_>>(),
+            [true, false]
+        );
+
+        put_and_flush(&db, &[b"c", b"x"]).await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while reader.manifest().l0().len() < 3 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "reader did not refresh"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        let after = pins(&reader);
+        assert_eq!(after.len(), 3);
+        assert_eq!(&after[1..], &filled[..]);
+        assert!(!after[0].1);
+        assert!(!after[0].2);
+
+        reader.close().await.unwrap();
         db.close().await.unwrap();
     }
 }

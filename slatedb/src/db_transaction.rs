@@ -2062,6 +2062,7 @@ mod tests {
             metric_level: MetricLevel::default(),
             default_ttl_millis: None,
             object_store_max_retries: None,
+            metadata_pinning: crate::config::MetadataPinning::None,
             block_format: None,
         }
     }

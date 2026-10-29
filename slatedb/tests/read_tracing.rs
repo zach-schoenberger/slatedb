@@ -13,7 +13,7 @@ use slatedb::config::{
 use slatedb::object_store::memory::InMemory;
 use slatedb::object_store::ObjectStore;
 use slatedb::size_tiered_compaction::SizeTieredCompactionSchedulerSupplier;
-use slatedb::{CompactorBuilder, Db, MergeOperator, MergeOperatorError};
+use slatedb::{CompactorBuilder, Db, MergeOperator, MergeOperatorError, MetadataPinning};
 use std::collections::HashMap;
 use std::io::{self, Write};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -70,6 +70,67 @@ async fn read_spans_work_with_fmt_subscriber_on_one_thread() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn read_spans_work_with_fmt_subscriber_on_multiple_threads() {
     run_read_tracing().await;
+}
+
+/// With `MetadataPinning::All`, the L0 SST that this writer flushed is
+/// pinned, so a get records `pinned = true` on its filter and index spans
+/// and no `cached` field (RFC 0037).
+#[tokio::test]
+async fn pinned_reads_record_the_pinned_field() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let db_dir = tempfile::tempdir().expect("failed to create database directory");
+    let path = db_dir.path().to_string_lossy().into_owned();
+    let db = Db::builder(path, store)
+        .with_settings(Settings {
+            metadata_pinning: MetadataPinning::All,
+            ..test_settings(false)
+        })
+        .build()
+        .await
+        .expect("failed to open database");
+    db.put(b"trace:pinned", b"pinned")
+        .await
+        .expect("failed to write key");
+    flush_memtable(&db).await;
+
+    let output = CapturedOutput::default();
+    let subscriber = FmtSubscriber::builder()
+        .with_writer(output.clone())
+        .with_ansi(false)
+        .without_time()
+        .with_max_level(tracing::Level::DEBUG)
+        .with_span_events(FmtSpan::NEW | FmtSpan::CLOSE)
+        .finish();
+    tracing::instrument::WithSubscriber::with_subscriber(
+        async {
+            let mark = output.mark();
+            let value = db
+                .get_key_value_with_options(b"trace:pinned", &read_options("pinned-get"))
+                .await
+                .expect("get failed")
+                .expect("key is missing");
+            assert_eq!(value.value, Bytes::from_static(b"pinned"));
+            let log = output.since(mark);
+            assert_root(&log, "pinned-get");
+            assert_sst_span(
+                &log,
+                "slatedb.read.read_filters",
+                "pinned-get",
+                "l0",
+                |fields| fields.get("pinned") == Some(&"true") && !fields.contains_key("cached"),
+            );
+            assert_sst_span(
+                &log,
+                "slatedb.read.read_index",
+                "pinned-get",
+                "l0",
+                |fields| fields.get("pinned") == Some(&"true") && !fields.contains_key("cached"),
+            );
+        },
+        subscriber,
+    )
+    .await;
+    db.close().await.expect("failed to close database");
 }
 
 async fn run_read_tracing() {

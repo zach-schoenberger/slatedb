@@ -152,6 +152,10 @@ impl DbInner {
         ));
 
         // state are mostly manifest, including IMM, L0, etc.
+        let mut manifest = manifest;
+        table_store
+            .pinner()
+            .carry_pins(None, &mut manifest.value.core);
         let db_state = DbState::new(manifest);
         let state = Arc::new(RwLock::new(db_state));
 
@@ -7954,6 +7958,7 @@ mod tests {
             metric_level: MetricLevel::default(),
             default_ttl_millis,
             object_store_max_retries: None,
+            metadata_pinning: crate::config::MetadataPinning::None,
             block_format: None,
         }
     }

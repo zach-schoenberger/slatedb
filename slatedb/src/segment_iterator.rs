@@ -14,7 +14,7 @@ use crate::manifest::{LsmTreeState, Segment};
 use crate::merge_iterator::MergeIterator;
 use crate::read_trace::{ReadTrace, SstTraceLevel};
 use crate::sorted_run_iterator::SortedRunIterator;
-use crate::sst_iter::{SstIterator, SstIteratorOptions, SstTracingContext};
+use crate::sst_iter::{FilterEvaluator, SstIterator, SstIteratorOptions, SstTracingContext};
 use crate::tablestore::TableStore;
 use crate::types::RowEntry;
 use crate::utils::build_concurrent;
@@ -322,57 +322,76 @@ pub(crate) fn build_segment_iter(
     }
 }
 
-pub(crate) fn build_l0_point_iters(
-    l0: &VecDeque<SsTableView>,
-    ctx: &SegmentScanContext,
-) -> Result<VecDeque<Box<dyn RowEntryIterator>>, SlateDBError> {
-    let mut iters = VecDeque::new();
-    let options = ctx.sst_iter_options.clone();
-    for sst in l0.iter().cloned() {
-        let iter = SstIterator::new_owned_with_stats(
-            ctx.range.clone(),
-            sst,
-            ctx.table_store.clone(),
-            options.clone(),
-            Some(SstTracingContext::new(
-                SstTraceLevel::L0,
-                ctx.read_trace.clone(),
-            )),
-            ctx.point_lookup_stats.clone(),
-        )?;
-        if let Some(iter) = iter {
-            iters.push_back(Box::new(iter) as Box<dyn RowEntryIterator>);
-        }
-    }
-    Ok(iters)
+/// The SSTs a point lookup of `key` consults, newest first: every L0 SST,
+/// then the SST that covers `key` in each sorted run.
+pub(crate) fn point_lookup_candidates(
+    key: &Bytes,
+    tree: &LsmTreeState,
+) -> Vec<(SsTableView, SstTraceLevel)> {
+    let l0 = tree.l0.iter().map(|sst| (sst.clone(), SstTraceLevel::L0));
+    let sr = tree.compacted.iter().flat_map(|sr| {
+        sr.tables_covering_point_key(key.as_ref())
+            .iter()
+            .map(move |view| (view.clone(), SstTraceLevel::SortedRun(sr.id)))
+    });
+    l0.chain(sr).collect()
 }
 
-pub(crate) fn build_sr_point_iters(
+/// Builds the point iterator for one candidate SST, or `None` when the SST
+/// cannot contain `key`.
+///
+/// When the SST's filters are pinned (RFC 0037), the filter is evaluated
+/// here, before any iterator exists. A filter-negative SST costs the probe
+/// and nothing else: no iterator, no cache lookup, no await. A positive SST
+/// gets an iterator that carries the evaluated filter, so its `init` reads
+/// the index directly. An SST without pinned filters takes today's path, and
+/// `FilterIterator::init` reads its filters.
+pub(crate) fn build_point_iter(
     key: &Bytes,
-    compacted: &[SortedRun],
+    view: SsTableView,
+    level: SstTraceLevel,
     ctx: &SegmentScanContext,
-) -> Result<VecDeque<Box<dyn RowEntryIterator>>, SlateDBError> {
-    let mut iters = VecDeque::new();
+) -> Result<Option<Box<dyn RowEntryIterator>>, SlateDBError> {
+    let Some(view_range) = view.calculate_view_range(ctx.range.clone()) else {
+        return Ok(None);
+    };
+    let tracing_context = Some(SstTracingContext::new(
+        level.clone(),
+        ctx.read_trace.clone(),
+    ));
     let options = ctx.sst_iter_options.clone();
-    for sr in compacted.iter() {
-        for handle in sr.tables_covering_point_key(key.as_ref()) {
-            let iter = SstIterator::new_owned_with_stats(
-                ctx.range.clone(),
-                handle.clone(),
-                ctx.table_store.clone(),
-                options.clone(),
-                Some(SstTracingContext::new(
-                    SstTraceLevel::SortedRun(sr.id),
-                    ctx.read_trace.clone(),
-                )),
-                ctx.point_lookup_stats.clone(),
-            )?;
-            if let Some(iter) = iter {
-                iters.push_back(Box::new(iter) as Box<dyn RowEntryIterator>);
-            }
-        }
+    let Some(filters) = ctx
+        .table_store
+        .pinned_filters(&view.sst, &ctx.read_trace, Some(&level))
+    else {
+        let iter = SstIterator::new_owned_in_view_range(
+            view,
+            view_range,
+            ctx.table_store.clone(),
+            options,
+            tracing_context,
+            ctx.point_lookup_stats.clone(),
+        )?;
+        return Ok(Some(Box::new(iter)));
+    };
+    let mut evaluator = FilterEvaluator::new_point(
+        key.clone(),
+        options.filter_context.clone(),
+        ctx.point_lookup_stats.clone(),
+    );
+    evaluator.evaluate(&filters, view.sst.id, Some(&level), &ctx.read_trace);
+    if evaluator.is_filtered_out() {
+        return Ok(None);
     }
-    Ok(iters)
+    let iter = SstIterator::with_evaluated_filter(
+        view,
+        view_range,
+        ctx.table_store.clone(),
+        options,
+        tracing_context,
+        evaluator,
+    )?;
+    Ok(Some(Box::new(iter)))
 }
 
 async fn build_l0_range_iters(
