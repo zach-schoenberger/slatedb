@@ -24,12 +24,20 @@ use slatedb::instrumented_object_store_stats::REQUEST_COUNT as OBJECT_STORE_REQU
 use slatedb::object_store::memory::InMemory;
 use slatedb::object_store::ObjectStore;
 use slatedb::size_tiered_compaction::SizeTieredCompactionSchedulerSupplier;
-use slatedb::{CompactorBuilder, Db, DbReader, MetadataPinning, SstBlockSize};
+use slatedb::{
+    BloomFilterPolicy, CompactorBuilder, Db, DbReader, FilterPolicy, FilterQuery, MetadataPinning,
+    RowEntry, SstBlockSize, ValueDeletable,
+};
 use slatedb_common::metrics::{DefaultMetricsRecorder, MetricValue};
 use tokio::runtime::Runtime;
 
 const SSTS: usize = 4;
 const KEYS_PER_SST: usize = 8;
+const FILTER_BITS_PER_KEY: u32 = 10;
+
+fn filter_policy() -> Arc<dyn FilterPolicy> {
+    Arc::new(BloomFilterPolicy::new(FILTER_BITS_PER_KEY))
+}
 
 /// Keys for one SST, as `k<digit>-<sst>`. Every SST spans `k0` to `k7`, so
 /// key-range pruning never excludes an SST and every candidate SST is
@@ -111,6 +119,7 @@ async fn open_db(path: &str, mode: MetadataPinning) -> (Db, Arc<DefaultMetricsRe
             ..Settings::default()
         })
         .with_metrics_recorder(recorder.clone())
+        .with_filter_policies(vec![filter_policy()])
         .with_db_cache_disabled()
         .build()
         .await
@@ -166,8 +175,43 @@ async fn run(mode: MetadataPinning) -> Run {
     run
 }
 
+/// The exact verdict and request counts below hold only if no SST's filter
+/// passes a key that SST does not hold. A false positive adds a positive
+/// verdict and a data-block read. When the walk drops a look-ahead source
+/// early, that source never records its false positive, so the counts cannot
+/// be corrected afterwards. The bloom filter is deterministic, with a fixed
+/// hash key and a fixed size for this layout, so check up front that this
+/// layout has no false positives. The check uses the same policy the DB
+/// writes with.
+fn assert_layout_has_no_filter_false_positives() {
+    let probes: Vec<Vec<u8>> = (0..SSTS).flat_map(sst_keys).chain(absent_keys()).collect();
+    for sst in 0..SSTS {
+        let held = sst_keys(sst);
+        let mut builder = filter_policy().builder();
+        for (seq, key) in held.iter().enumerate() {
+            builder.add_entry(&RowEntry {
+                key: Bytes::from(key.clone()),
+                value: ValueDeletable::Value(Bytes::from(key.clone())),
+                seq: seq as u64,
+                create_ts: None,
+                expire_ts: None,
+            });
+        }
+        let filter = builder.build();
+        for probe in probes.iter().filter(|probe| !held.contains(probe)) {
+            assert!(
+                !filter.might_match(&FilterQuery::point(Bytes::from(probe.clone()))),
+                "SST {sst}'s filter passes {:?}; choose keys without false positives",
+                String::from_utf8_lossy(probe),
+            );
+        }
+    }
+}
+
 #[tokio::test]
 async fn pinning_modes_agree_on_results_and_filter_verdicts() {
+    assert_layout_has_no_filter_false_positives();
+
     let none = run(MetadataPinning::None).await;
     let l0 = run(MetadataPinning::L0).await;
     let all = run(MetadataPinning::All).await;
@@ -185,9 +229,10 @@ async fn pinning_modes_agree_on_results_and_filter_verdicts() {
     assert_eq!(l0.results, none.results);
     assert_eq!(all.results, none.results);
 
-    // Each present key lives in exactly one SST, so every mode records one
-    // positive verdict per present key. Negative verdicts depend on how far
-    // the walk looks ahead, so they are only required to exist.
+    // Each present key lives in exactly one SST and no filter false-positives,
+    // so every mode records one positive verdict per present key. Negative
+    // verdicts depend on how far the walk looks ahead, so they are only
+    // required to exist.
     let present = (SSTS * KEYS_PER_SST) as u64;
     assert_eq!(none.verdicts.0, present);
     assert_eq!(l0.verdicts.0, present);
