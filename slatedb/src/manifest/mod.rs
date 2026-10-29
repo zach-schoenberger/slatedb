@@ -483,6 +483,13 @@ impl ManifestCore {
         std::iter::once(self.tree.as_ref()).chain(self.segments.iter().map(|s| s.tree.as_ref()))
     }
 
+    /// Mutable form of [`Self::trees`]. A tree that another state still
+    /// shares is cloned before it is returned.
+    pub(crate) fn trees_mut(&mut self) -> impl Iterator<Item = &mut LsmTreeState> {
+        std::iter::once(Arc::make_mut(&mut self.tree))
+            .chain(self.segments.iter_mut().map(|s| Arc::make_mut(&mut s.tree)))
+    }
+
     /// Iterate every tree paired with its segment prefix: the empty-prefix
     /// root tree (RFC-0024 compatibility encoding) first, then each named
     /// segment in `segments` order. Use [`trees`] when only the LSM state

@@ -34,7 +34,7 @@ pub use clock::SystemClock;
 pub use config::{
     CloseOptions, CompactionWorkerOptions, CompactorOptions, DurabilityLevel, FlushOptions,
     FlushType, GarbageCollectorDirectoryOptions, GarbageCollectorOptions,
-    GarbageCollectorScheduleOptions, IsolationLevel, IterationOrder, MergeOptions,
+    GarbageCollectorScheduleOptions, IsolationLevel, IterationOrder, MergeOptions, MetadataPinning,
     ObjectStoreCacheOptions, PreloadLevel, PutOptions, ReadOptions, ReaderMode, ReaderOptions,
     ScanOptions, SstBlockSize, TracingOptions, Ttl, WriteOptions,
 };

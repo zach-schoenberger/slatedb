@@ -68,6 +68,36 @@ func TestReaderOptionsCarryTheObjectStoreCache(t *testing.T) {
 	}
 }
 
+// Every MetadataPinning variant crosses the FFI boundary and opens a reader
+// that serves a key from an SST.
+func TestReaderOptionsCarryMetadataPinning(t *testing.T) {
+	store := newMemoryStore(t)
+	dbHandle := openTestDB(t, store, nil)
+	if _, err := dbHandle.db.Put([]byte("k"), []byte("v")); err != nil {
+		t.Fatalf("Put(): %v", err)
+	}
+	if err := dbHandle.db.FlushWithOptions(slatedb.FlushOptions{FlushType: slatedb.FlushTypeMemTable}); err != nil {
+		t.Fatalf("FlushWithOptions(): %v", err)
+	}
+	for _, pinning := range []slatedb.MetadataPinning{
+		slatedb.MetadataPinningNone, slatedb.MetadataPinningL0, slatedb.MetadataPinningAll,
+	} {
+		reader := openTestReader(t, store, func(t *testing.T, builder *slatedb.DbReaderBuilder) {
+			t.Helper()
+			opts := slatedb.ReaderOptions{
+				ManifestPollIntervalMs: 100, CheckpointLifetimeMs: 600_000, MaxMemtableBytes: 64 << 20,
+				MetadataPinning: &pinning,
+			}
+			if err := builder.WithOptions(opts); err != nil {
+				t.Fatalf("WithOptions(pinning %d): %v", pinning, err)
+			}
+		})
+		if got, err := reader.reader.Get([]byte("k")); err != nil || valueOf(got) != "v" {
+			t.Fatalf("Get() with pinning %d = %q, %v", pinning, valueOf(got), err)
+		}
+	}
+}
+
 // A zero MaxOpenFileHandles, the Go zero value, is refused as an invalid
 // option instead of panicking inside the engine's file handle cache.
 func TestZeroMaxOpenFileHandlesIsInvalid(t *testing.T) {

@@ -156,6 +156,7 @@ use crate::manifest::ManifestCore;
 use crate::memtable_flusher::MemtableFlusher;
 use crate::merge_operator::MergeOperatorType;
 use crate::paths::PathResolver;
+use crate::pinned_metadata::MetadataPinner;
 use crate::retrying_object_store::RetryingObjectStore;
 use crate::tablestore::{TableStore, TableStoreKind};
 use crate::utils::ObjectStoreType;
@@ -671,15 +672,21 @@ impl<P: Into<Path>> DbBuilder<P> {
                 db_cache.db_cache_id,
             )) as Arc<dyn DbCache>
         });
-        let table_store = Arc::new(TableStore::new_with_fp_registry(
-            retrying_main_object_store.clone(),
-            sst_format.clone(),
-            path_resolver.clone(),
-            self.fp_registry.clone(),
-            db_cache.clone(),
-            TableStoreKind::Main,
-            self.block_cache_policy.clone(),
-        ));
+        let table_store = Arc::new(
+            TableStore::new_with_fp_registry(
+                retrying_main_object_store.clone(),
+                sst_format.clone(),
+                path_resolver.clone(),
+                self.fp_registry.clone(),
+                db_cache.clone(),
+                TableStoreKind::Main,
+                self.block_cache_policy.clone(),
+            )
+            .with_metadata_pinner(MetadataPinner::new(
+                self.settings.metadata_pinning,
+                &recorder,
+            )),
+        );
         let wal_store = Arc::new(WalTableStore::new_with_fp_registry(
             wal_object_store,
             sst_format.clone(),
@@ -2131,15 +2138,21 @@ impl<P: Into<Path>> DbReaderBuilder<P> {
         };
         let path_resolver = PathResolver::new_with_external_ssts(path.clone(), external_ssts);
         let fp_registry = Arc::new(FailPointRegistry::new());
-        let table_store = Arc::new(TableStore::new_with_fp_registry(
-            retrying_object_store,
-            sst_format.clone(),
-            path_resolver.clone(),
-            Arc::clone(&fp_registry),
-            wrapped_cache,
-            TableStoreKind::Reader,
-            BlockCachePolicy::default(),
-        ));
+        let table_store = Arc::new(
+            TableStore::new_with_fp_registry(
+                retrying_object_store,
+                sst_format.clone(),
+                path_resolver.clone(),
+                Arc::clone(&fp_registry),
+                wrapped_cache,
+                TableStoreKind::Reader,
+                BlockCachePolicy::default(),
+            )
+            .with_metadata_pinner(MetadataPinner::new(
+                self.options.metadata_pinning,
+                &recorder,
+            )),
+        );
         let wal_store = Arc::new(WalTableStore::new_with_fp_registry(
             wal_object_store,
             sst_format,

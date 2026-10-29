@@ -196,7 +196,7 @@ enum FilterState {
     Negative,
 }
 
-struct FilterEvaluator {
+pub(crate) struct FilterEvaluator {
     query: FilterQuery,
     db_stats: Option<DbStats>,
     state: FilterState,
@@ -205,7 +205,11 @@ struct FilterEvaluator {
 }
 
 impl FilterEvaluator {
-    fn new_point(key: Bytes, context: Option<FilterContext>, db_stats: Option<DbStats>) -> Self {
+    pub(crate) fn new_point(
+        key: Bytes,
+        context: Option<FilterContext>,
+        db_stats: Option<DbStats>,
+    ) -> Self {
         Self {
             query: FilterQuery::point(key).with_context(context),
             db_stats,
@@ -249,7 +253,7 @@ impl FilterEvaluator {
     /// All filters must agree the query might match for the read to proceed.
     /// If any filter says the query is absent, the SST is skipped.
     /// If no filters are provided, the state is set to `NoFilter`.
-    fn evaluate(
+    pub(crate) fn evaluate(
         &mut self,
         filters: &[NamedFilter],
         sst_id: SsTableId,
@@ -323,8 +327,13 @@ impl FilterEvaluator {
         }
     }
 
-    fn is_filtered_out(&self) -> bool {
+    pub(crate) fn is_filtered_out(&self) -> bool {
         self.state == FilterState::Negative
+    }
+
+    /// Whether [`Self::evaluate`] already ran.
+    fn is_checked(&self) -> bool {
+        self.state != FilterState::NotChecked
     }
 
     fn notify_key_found(&mut self, key: &[u8]) {
@@ -930,11 +939,16 @@ impl<'a> FilterIterator<'a> {
 impl RowEntryIterator for FilterIterator<'_> {
     async fn init(&mut self) -> Result<(), SlateDBError> {
         if !self.initialized {
-            let filters = self.read_filters().await?;
-            let sst_id = self.inner.view().table_as_ref().sst.id;
-            let read_trace = self.inner.read_trace();
-            self.filter
-                .evaluate(&filters, sst_id, self.inner.sst_level(), &read_trace);
+            // The filter is already evaluated when the SST's filters were
+            // pinned and the caller checked them before building this
+            // iterator (RFC 0037).
+            if !self.filter.is_checked() {
+                let filters = self.read_filters().await?;
+                let sst_id = self.inner.view().table_as_ref().sst.id;
+                let read_trace = self.inner.read_trace();
+                self.filter
+                    .evaluate(&filters, sst_id, self.inner.sst_level(), &read_trace);
+            }
 
             if self.is_filtered_out() {
                 return Ok(());
@@ -1060,6 +1074,39 @@ impl<'a> SstIterator<'a> {
         let internal =
             InternalSstIterator::new_owned(range, table, table_store, options, tracing_context)?;
         Ok(internal.map(|iter| Self::from_internal(iter, db_stats.clone())))
+    }
+
+    /// Like [`Self::new_owned_with_stats`], for a view range the caller
+    /// already computed with `SsTableView::calculate_view_range`.
+    pub(crate) fn new_owned_in_view_range(
+        table: SsTableView,
+        view_range: BytesRange,
+        table_store: Arc<TableStore>,
+        options: SstIteratorOptions,
+        tracing_context: Option<SstTracingContext>,
+        db_stats: Option<DbStats>,
+    ) -> Result<Self, SlateDBError> {
+        let view = SstView::Owned(Box::new(table), view_range);
+        let internal = InternalSstIterator::new(view, table_store, options, tracing_context)?;
+        Ok(Self::from_internal(internal, db_stats))
+    }
+
+    /// Builds an iterator whose filter the caller already evaluated against
+    /// pinned filters (RFC 0037). `init` skips the filter read and goes
+    /// straight to the index when the evaluator is positive.
+    pub(crate) fn with_evaluated_filter(
+        table: SsTableView,
+        view_range: BytesRange,
+        table_store: Arc<TableStore>,
+        options: SstIteratorOptions,
+        tracing_context: Option<SstTracingContext>,
+        evaluator: FilterEvaluator,
+    ) -> Result<Self, SlateDBError> {
+        let view = SstView::Owned(Box::new(table), view_range);
+        let internal = InternalSstIterator::new(view, table_store, options, tracing_context)?;
+        Ok(Self {
+            delegate: SstIteratorDelegate::Filter(FilterIterator::new(internal, evaluator)),
+        })
     }
 
     #[allow(dead_code)]

@@ -12330,6 +12330,9 @@ type ReaderOptions struct {
 	ObjectStoreMaxRetries *uint32
 	// The reader's object-store cache. `None` is the engine's default.
 	ObjectStoreCacheOptions *ObjectStoreCacheOptions
+	// Which SSTs keep their decoded filters and index pinned in memory.
+	// `None` is the engine's default, [`MetadataPinning::None`].
+	MetadataPinning *MetadataPinning
 }
 
 func (r *ReaderOptions) Destroy() {
@@ -12339,6 +12342,7 @@ func (r *ReaderOptions) Destroy() {
 	FfiDestroyerBool{}.Destroy(r.SkipWalReplay)
 	FfiDestroyerOptionalUint32{}.Destroy(r.ObjectStoreMaxRetries)
 	FfiDestroyerOptionalObjectStoreCacheOptions{}.Destroy(r.ObjectStoreCacheOptions)
+	FfiDestroyerOptionalMetadataPinning{}.Destroy(r.MetadataPinning)
 }
 
 type FfiConverterReaderOptions struct{}
@@ -12357,6 +12361,7 @@ func (c FfiConverterReaderOptions) Read(reader io.Reader) ReaderOptions {
 		FfiConverterBoolINSTANCE.Read(reader),
 		FfiConverterOptionalUint32INSTANCE.Read(reader),
 		FfiConverterOptionalObjectStoreCacheOptionsINSTANCE.Read(reader),
+		FfiConverterOptionalMetadataPinningINSTANCE.Read(reader),
 	}
 }
 
@@ -12375,6 +12380,7 @@ func (c FfiConverterReaderOptions) Write(writer io.Writer, value ReaderOptions) 
 	FfiConverterBoolINSTANCE.Write(writer, value.SkipWalReplay)
 	FfiConverterOptionalUint32INSTANCE.Write(writer, value.ObjectStoreMaxRetries)
 	FfiConverterOptionalObjectStoreCacheOptionsINSTANCE.Write(writer, value.ObjectStoreCacheOptions)
+	FfiConverterOptionalMetadataPinningINSTANCE.Write(writer, value.MetadataPinning)
 }
 
 type FfiDestroyerReaderOptions struct{}
@@ -14423,6 +14429,49 @@ func (_ FfiDestroyerMergeOperatorCallbackError) Destroy(value *MergeOperatorCall
 	}
 }
 
+// Which SSTs keep their decoded filters and index pinned in memory, outside
+// the block cache, for as long as the SST is live. Models RocksDB's
+// `PinningTier`.
+type MetadataPinning uint
+
+const (
+	// Pin nothing. Filters and indexes are read through the block cache.
+	MetadataPinningNone MetadataPinning = 1
+	// Pin the filters and index of every L0 SST.
+	MetadataPinningL0 MetadataPinning = 2
+	// Pin the filters and index of every SST.
+	MetadataPinningAll MetadataPinning = 3
+)
+
+type FfiConverterMetadataPinning struct{}
+
+var FfiConverterMetadataPinningINSTANCE = FfiConverterMetadataPinning{}
+
+func (c FfiConverterMetadataPinning) Lift(rb RustBufferI) MetadataPinning {
+	return LiftFromRustBuffer[MetadataPinning](c, rb)
+}
+
+func (c FfiConverterMetadataPinning) Lower(value MetadataPinning) C.RustBuffer {
+	return LowerIntoRustBuffer[MetadataPinning](c, value)
+}
+
+func (c FfiConverterMetadataPinning) LowerExternal(value MetadataPinning) ExternalCRustBuffer {
+	return RustBufferFromC(LowerIntoRustBuffer[MetadataPinning](c, value))
+}
+func (FfiConverterMetadataPinning) Read(reader io.Reader) MetadataPinning {
+	id := readInt32(reader)
+	return MetadataPinning(id)
+}
+
+func (FfiConverterMetadataPinning) Write(writer io.Writer, value MetadataPinning) {
+	writeInt32(writer, int32(value))
+}
+
+type FfiDestroyerMetadataPinning struct{}
+
+func (_ FfiDestroyerMetadataPinning) Destroy(value MetadataPinning) {
+}
+
 // Value stored in a metric snapshot.
 type MetricValue interface {
 	Destroy()
@@ -16211,6 +16260,47 @@ type FfiDestroyerOptionalIterationOrder struct{}
 func (_ FfiDestroyerOptionalIterationOrder) Destroy(value *IterationOrder) {
 	if value != nil {
 		FfiDestroyerIterationOrder{}.Destroy(*value)
+	}
+}
+
+type FfiConverterOptionalMetadataPinning struct{}
+
+var FfiConverterOptionalMetadataPinningINSTANCE = FfiConverterOptionalMetadataPinning{}
+
+func (c FfiConverterOptionalMetadataPinning) Lift(rb RustBufferI) *MetadataPinning {
+	return LiftFromRustBuffer[*MetadataPinning](c, rb)
+}
+
+func (_ FfiConverterOptionalMetadataPinning) Read(reader io.Reader) *MetadataPinning {
+	if readInt8(reader) == 0 {
+		return nil
+	}
+	temp := FfiConverterMetadataPinningINSTANCE.Read(reader)
+	return &temp
+}
+
+func (c FfiConverterOptionalMetadataPinning) Lower(value *MetadataPinning) C.RustBuffer {
+	return LowerIntoRustBuffer[*MetadataPinning](c, value)
+}
+
+func (c FfiConverterOptionalMetadataPinning) LowerExternal(value *MetadataPinning) ExternalCRustBuffer {
+	return RustBufferFromC(LowerIntoRustBuffer[*MetadataPinning](c, value))
+}
+
+func (_ FfiConverterOptionalMetadataPinning) Write(writer io.Writer, value *MetadataPinning) {
+	if value == nil {
+		writeInt8(writer, 0)
+	} else {
+		writeInt8(writer, 1)
+		FfiConverterMetadataPinningINSTANCE.Write(writer, *value)
+	}
+}
+
+type FfiDestroyerOptionalMetadataPinning struct{}
+
+func (_ FfiDestroyerOptionalMetadataPinning) Destroy(value *MetadataPinning) {
+	if value != nil {
+		FfiDestroyerMetadataPinning{}.Destroy(*value)
 	}
 }
 

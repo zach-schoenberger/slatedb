@@ -224,6 +224,10 @@ pub struct ReaderOptions {
     /// The reader's object-store cache. `None` is the engine's default.
     #[uniffi(default = None)]
     pub object_store_cache_options: Option<ObjectStoreCacheOptions>,
+    /// Which SSTs keep their decoded filters and index pinned in memory.
+    /// `None` is the engine's default, [`MetadataPinning::None`].
+    #[uniffi(default = None)]
+    pub metadata_pinning: Option<MetadataPinning>,
 }
 
 impl Default for ReaderOptions {
@@ -235,6 +239,30 @@ impl Default for ReaderOptions {
             skip_wal_replay: false,
             object_store_max_retries: None,
             object_store_cache_options: None,
+            metadata_pinning: None,
+        }
+    }
+}
+
+/// Which SSTs keep their decoded filters and index pinned in memory, outside
+/// the block cache, for as long as the SST is live. Models RocksDB's
+/// `PinningTier`.
+#[derive(Clone, Copy, Debug, uniffi::Enum)]
+pub enum MetadataPinning {
+    /// Pin nothing. Filters and indexes are read through the block cache.
+    None,
+    /// Pin the filters and index of every L0 SST.
+    L0,
+    /// Pin the filters and index of every SST.
+    All,
+}
+
+impl From<MetadataPinning> for slatedb::config::MetadataPinning {
+    fn from(value: MetadataPinning) -> Self {
+        match value {
+            MetadataPinning::None => Self::None,
+            MetadataPinning::L0 => Self::L0,
+            MetadataPinning::All => Self::All,
         }
     }
 }
@@ -362,6 +390,7 @@ impl TryFrom<ReaderOptions> for slatedb::config::DbReaderOptions {
             skip_wal_replay: value.skip_wal_replay,
             object_store_max_retries: value.object_store_max_retries,
             object_store_cache_options,
+            metadata_pinning: value.metadata_pinning.map(Into::into).unwrap_or_default(),
             ..Default::default()
         })
     }
@@ -862,7 +891,7 @@ impl TryFrom<CompactionWorkerOptions> for slatedb::config::CompactionWorkerOptio
 mod tests {
     use super::{
         CloseOptions, CompactionWorkerOptions, CompactorOptions, FlushType,
-        GarbageCollectorOptions, ReaderOptions,
+        GarbageCollectorOptions, MetadataPinning, ReaderOptions,
     };
     use crate::types::CompressionCodec;
     use std::collections::HashMap;
@@ -953,6 +982,37 @@ mod tests {
         .unwrap();
 
         assert_eq!(reader.object_store_max_retries, Some(5));
+    }
+
+    #[test]
+    fn reader_metadata_pinning_defaults_to_the_engines() {
+        let reader: slatedb::config::DbReaderOptions = ReaderOptions::default().try_into().unwrap();
+
+        assert_eq!(
+            reader.metadata_pinning,
+            slatedb::config::DbReaderOptions::default().metadata_pinning
+        );
+    }
+
+    #[test]
+    fn reader_metadata_pinning_threads_through() {
+        for (binding, engine) in [
+            (
+                MetadataPinning::None,
+                slatedb::config::MetadataPinning::None,
+            ),
+            (MetadataPinning::L0, slatedb::config::MetadataPinning::L0),
+            (MetadataPinning::All, slatedb::config::MetadataPinning::All),
+        ] {
+            let reader: slatedb::config::DbReaderOptions = ReaderOptions {
+                metadata_pinning: Some(binding),
+                ..ReaderOptions::default()
+            }
+            .try_into()
+            .unwrap();
+
+            assert_eq!(reader.metadata_pinning, engine);
+        }
     }
 
     #[test]

@@ -40,6 +40,18 @@ pub const SST_FILTER_NEGATIVE_COUNT: &str = db_stat_name!("sst_filter_negative_c
 ///   write_amp = (`WAL_FLUSH_BYTES` + `L0_FLUSH_BYTES` + `compactor::stats::BYTES_COMPACTED`)
 ///               / `MEMTABLE_WRITE_BYTES`
 pub const MEMTABLE_WRITE_BYTES: &str = db_stat_name!("memtable_write_bytes");
+/// Bytes of decoded SST metadata pinned in memory (RFC 0037), labeled by
+/// `level` and `component`.
+pub const PINNED_SST_METADATA_BYTES: &str = db_stat_name!("pinned_sst_metadata_bytes");
+/// Number of SSTs whose pin (RFC 0037) holds their filters, their index, or
+/// both, labeled by `level`. An SST whose pin is still empty is not counted.
+pub const PINNED_SST_COUNT: &str = db_stat_name!("pinned_sst_count");
+pub const PIN_LEVEL_LABEL: &str = "level";
+pub const PIN_LEVEL_L0: &str = "l0";
+pub const PIN_LEVEL_SORTED_RUN: &str = "sorted_run";
+pub const PIN_COMPONENT_LABEL: &str = "component";
+pub const PIN_COMPONENT_FILTER: &str = "filter";
+pub const PIN_COMPONENT_INDEX: &str = "index";
 
 /// Label key distinguishing filter metrics by query kind. Value is one of
 /// [`FILTER_KIND_POINT`], [`FILTER_KIND_PREFIX`] or [`FILTER_KIND_RANGE`].

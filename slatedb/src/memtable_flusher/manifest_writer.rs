@@ -923,7 +923,7 @@ impl ManifestWriterHandler {
     fn merge_remote_manifest(&self, remote_dirty: DirtyObject<Manifest>) {
         let manifest = {
             let mut wguard_state = self.db.state.write();
-            wguard_state.merge_remote_manifest(remote_dirty);
+            wguard_state.merge_remote_manifest(remote_dirty, self.db.table_store.pinner());
             wguard_state.state().manifest.clone()
         };
         self.update_stats_for_manifest(&manifest);

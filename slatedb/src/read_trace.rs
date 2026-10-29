@@ -77,6 +77,7 @@ impl ReadTrace {
                 sst_id = sst_id.as_str(),
                 sst_level = sst_level.as_str(),
                 cached = tracing::field::Empty,
+                pinned = tracing::field::Empty,
             )
         } else {
             tracing::Span::none()
@@ -121,6 +122,7 @@ impl ReadTrace {
                 sst_id = sst_id.as_str(),
                 sst_level = sst_level.as_str(),
                 cached = tracing::field::Empty,
+                pinned = tracing::field::Empty,
             )
         } else {
             tracing::Span::none()

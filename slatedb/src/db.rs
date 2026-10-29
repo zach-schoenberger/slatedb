@@ -177,6 +177,10 @@ impl DbInner {
         ));
 
         // state are mostly manifest, including IMM, L0, etc.
+        let mut manifest = manifest;
+        table_store
+            .pinner()
+            .carry_pins(None, &mut manifest.value.core);
         let max_l0_sst_count = Arc::new(AtomicUsize::new(
             manifest
                 .value
@@ -8241,6 +8245,7 @@ mod tests {
             metric_level: MetricLevel::default(),
             default_ttl_millis,
             object_store_max_retries: None,
+            metadata_pinning: crate::config::MetadataPinning::None,
             block_format: None,
         }
     }

@@ -4,6 +4,7 @@ use crate::config::CompressionCodec;
 use crate::error::SlateDBError;
 use crate::manifest::{Manifest, ManifestCore};
 use crate::mem_table::{ImmutableMemtable, KVTable, WritableKVTable};
+use crate::pinned_metadata::{MetadataPinner, PinnedSstMetadata};
 use crate::reader::DbStateReader;
 use bytes::Bytes;
 use rand::RngExt;
@@ -18,7 +19,7 @@ use std::sync::Arc;
 use ulid::Ulid;
 
 /// A handle to an SSTable — the physical SST on storage.
-#[derive(Clone, PartialEq, Serialize)]
+#[derive(Clone, Serialize)]
 pub struct SsTableHandle {
     /// The unique identifier for this compacted SSTable.
     pub id: SsTableId,
@@ -28,6 +29,20 @@ pub struct SsTableHandle {
 
     /// Metadata information about this SSTable.
     pub info: SsTableInfo,
+
+    /// The pinned filters and index of this SST (RFC 0037). Runtime only:
+    /// `None` when the SST is not selected for pinning, shared by every clone
+    /// of this handle, and not part of equality or serialization.
+    #[serde(skip)]
+    pinned: Option<Arc<PinnedSstMetadata>>,
+}
+
+impl PartialEq for SsTableHandle {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+            && self.format_version == other.format_version
+            && self.info == other.info
+    }
 }
 
 impl Debug for SsTableHandle {
@@ -42,7 +57,22 @@ impl SsTableHandle {
             id,
             format_version,
             info,
+            pinned: None,
         }
+    }
+
+    /// The pin of this SST, if it has one.
+    pub(crate) fn pinned(&self) -> Option<&Arc<PinnedSstMetadata>> {
+        self.pinned.as_ref()
+    }
+
+    pub(crate) fn set_pinned(&mut self, pinned: Option<Arc<PinnedSstMetadata>>) {
+        self.pinned = pinned;
+    }
+
+    pub(crate) fn with_pinned(mut self, pinned: Option<Arc<PinnedSstMetadata>>) -> Self {
+        self.pinned = pinned;
+        self
     }
 
     /// Returns an estimate of the SST's on-disk size in bytes.
@@ -935,8 +965,12 @@ impl DbState {
         let _ = std::mem::replace(&mut self.memtable, memtable);
     }
 
-    pub(crate) fn merge_remote_manifest(&mut self, remote_manifest: DirtyObject<Manifest>) {
-        self.modify(|modifier| modifier.merge_remote_manifest(remote_manifest));
+    pub(crate) fn merge_remote_manifest(
+        &mut self,
+        remote_manifest: DirtyObject<Manifest>,
+        pinner: &MetadataPinner,
+    ) {
+        self.modify(|modifier| modifier.merge_remote_manifest(remote_manifest, pinner));
     }
 
     pub(crate) fn modify<F, R>(&mut self, fun: F) -> R
@@ -962,7 +996,11 @@ impl<'a> StateModifier<'a> {
         Self { db_state, state }
     }
 
-    pub(crate) fn merge_remote_manifest(&mut self, mut remote_manifest: DirtyObject<Manifest>) {
+    pub(crate) fn merge_remote_manifest(
+        &mut self,
+        mut remote_manifest: DirtyObject<Manifest>,
+        pinner: &MetadataPinner,
+    ) {
         let my_db_state = self.state.core();
         let remote = &remote_manifest.value.core;
         let tree = my_db_state.tree.merge_from_compactor(&remote.tree);
@@ -984,6 +1022,10 @@ impl<'a> StateModifier<'a> {
             wal_object_store_uri: my_db_state.wal_object_store_uri.clone(),
         };
         remote_manifest.value.prune_external_sst_ids();
+        // The sorted runs were decoded from the compactor's manifest and
+        // carry no pins yet. The L0 views are clones of this state's own
+        // views and already share their pins.
+        pinner.carry_pins(Some(my_db_state), &mut remote_manifest.value.core);
         self.state.manifest = remote_manifest;
     }
 
@@ -1001,6 +1043,7 @@ mod tests {
     use crate::format::sst::SST_FORMAT_VERSION_LATEST;
     use crate::manifest::store::test_utils::new_dirty_manifest;
     use crate::manifest::{LsmTreeState, Segment};
+    use crate::pinned_metadata::MetadataPinner;
     use crate::proptest_util::arbitrary;
     use crate::seq_tracker::{FindOption, SequenceTracker, TrackedSeq};
     use crate::test_utils;
@@ -1037,7 +1080,7 @@ mod tests {
             .push(checkpoint.clone());
 
         // when:
-        db_state.merge_remote_manifest(updated_state);
+        db_state.merge_remote_manifest(updated_state, &MetadataPinner::disabled());
 
         // then:
         assert_eq!(vec![checkpoint], db_state.state.core().checkpoints);
@@ -1055,7 +1098,7 @@ mod tests {
             sst_ids: vec![stale_id],
         }];
 
-        db_state.merge_remote_manifest(remote);
+        db_state.merge_remote_manifest(remote, &MetadataPinner::disabled());
 
         let external = &db_state.state.manifest.value.external_dbs;
         assert_eq!(external.len(), 1, "detach metadata must be retained");
@@ -1082,7 +1125,7 @@ mod tests {
             Some(last_compacted.id);
 
         // when:
-        db_state.merge_remote_manifest(compactor_state.clone());
+        db_state.merge_remote_manifest(compactor_state.clone(), &MetadataPinner::disabled());
 
         // then:
         let expected: Vec<SsTableId> = compactor_state
@@ -1112,7 +1155,7 @@ mod tests {
         let l0s = db_state.state.core().tree.l0.clone();
 
         // when:
-        db_state.merge_remote_manifest(new_dirty_manifest());
+        db_state.merge_remote_manifest(new_dirty_manifest(), &MetadataPinner::disabled());
 
         // then:
         let expected: Vec<SsTableId> = l0s.iter().map(|l0| l0.sst.id).collect();
@@ -1163,7 +1206,7 @@ mod tests {
         remote_state.value.core.segments = vec![];
         remote_state.value.core.segment_extractor_name = None;
 
-        db_state.merge_remote_manifest(remote_state);
+        db_state.merge_remote_manifest(remote_state, &MetadataPinner::disabled());
 
         // The writer is the source of truth for segment config and for L0,
         // so the local segment (with its L0) must survive the merge.
@@ -1222,7 +1265,7 @@ mod tests {
             }),
         }];
 
-        db_state.merge_remote_manifest(remote_state);
+        db_state.merge_remote_manifest(remote_state, &MetadataPinner::disabled());
 
         let merged = db_state.state.core();
         assert_eq!(merged.segments.len(), 1);
@@ -1255,7 +1298,7 @@ mod tests {
         remote_state.value.core = db_state.state.core().clone();
         remote_state.value.core.sequence_tracker = SequenceTracker::new();
 
-        db_state.merge_remote_manifest(remote_state);
+        db_state.merge_remote_manifest(remote_state, &MetadataPinner::disabled());
 
         // The local tracker should be preserved as-is.
         let tracker = &db_state.state.core().sequence_tracker;
@@ -1908,5 +1951,118 @@ mod tests {
 
             assert_eq!(super::max_l0_overlap(&l0), naive);
         });
+    }
+}
+
+#[cfg(test)]
+mod pin_tests {
+    use super::*;
+    use crate::config::MetadataPinning;
+    use crate::format::sst::SST_FORMAT_VERSION_LATEST;
+    use crate::manifest::store::test_utils::new_dirty_manifest;
+    use crate::pinned_metadata::PinLevel;
+    use slatedb_common::metrics::MetricsRecorderHelper;
+
+    #[test]
+    fn sst_handle_equality_and_serialization_ignore_the_pin() {
+        let id = SsTableId::from(Ulid::from_parts(7, 0));
+        let plain = SsTableHandle::new(id, SST_FORMAT_VERSION_LATEST, SsTableInfo::default());
+        let pinner = MetadataPinner::new(MetadataPinning::All, &MetricsRecorderHelper::noop());
+        let pinned = plain.clone().with_pinned(pinner.new_pin(PinLevel::L0));
+        assert!(pinned.pinned().is_some());
+
+        assert_eq!(plain, pinned);
+        assert_eq!(
+            serde_json::to_string(&plain).unwrap(),
+            serde_json::to_string(&pinned).unwrap()
+        );
+    }
+
+    #[test]
+    fn cloned_handles_share_the_pin() {
+        let id = SsTableId::from(Ulid::from_parts(8, 0));
+        let pinner = MetadataPinner::new(MetadataPinning::All, &MetricsRecorderHelper::noop());
+        let handle = SsTableHandle::new(id, SST_FORMAT_VERSION_LATEST, SsTableInfo::default())
+            .with_pinned(pinner.new_pin(PinLevel::L0));
+        let view = SsTableView::identity(handle.clone());
+        assert!(Arc::ptr_eq(
+            handle.pinned().unwrap(),
+            view.sst.pinned().unwrap()
+        ));
+    }
+
+    fn handle(id: u64) -> SsTableHandle {
+        SsTableHandle::new(
+            SsTableId::from(Ulid::from_parts(id, 0)),
+            SST_FORMAT_VERSION_LATEST,
+            SsTableInfo::default(),
+        )
+    }
+
+    /// Strips the pin, as decoding the compactor's manifest does.
+    fn decoded(view: &SsTableView) -> SsTableView {
+        let mut view = view.clone();
+        view.sst.set_pinned(None);
+        view
+    }
+
+    /// The writer adopts the compactor's sorted runs. Its own L0 views keep
+    /// their pins, a trivially moved L0 SST keeps its L0 pin in the run, and a
+    /// rewritten SST gets a fresh pin only when the mode pins sorted runs.
+    #[test]
+    fn merge_remote_manifest_carries_the_writers_pins() {
+        for (mode, rewritten_pinned) in [(MetadataPinning::L0, false), (MetadataPinning::All, true)]
+        {
+            let pinner = MetadataPinner::new(mode, &MetricsRecorderHelper::noop());
+            let mut db_state = DbState::new(new_dirty_manifest(), ByteBufferManager::unbounded());
+            // Three flushed L0 SSTs, pinned as the writer pins them, newest
+            // first.
+            let l0: Vec<SsTableView> = [2, 1, 0]
+                .into_iter()
+                .map(|id| {
+                    SsTableView::identity(handle(id).with_pinned(pinner.new_pin(PinLevel::L0)))
+                })
+                .collect();
+            db_state.modify(|modifier| {
+                Arc::make_mut(&mut modifier.state.manifest.value.core.tree).l0 =
+                    l0.iter().cloned().collect();
+            });
+
+            // The compactor absorbed SSTs 0 and 1: SST 0 by a trivial move,
+            // SST 1 by a rewrite into SST 10. Its manifest still lists SST 2.
+            let mut remote = new_dirty_manifest();
+            remote.value.core = db_state.state.core().clone();
+            let tree = Arc::make_mut(&mut remote.value.core.tree);
+            tree.l0 = [decoded(&l0[0])].into_iter().collect();
+            tree.compacted = vec![
+                SortedRun::new(1, [SsTableView::identity(handle(10))]),
+                SortedRun::new(0, [decoded(&l0[2])]),
+            ];
+            tree.last_compacted_l0_sst_view_id = Some(l0[1].id);
+
+            db_state.merge_remote_manifest(remote, &pinner);
+
+            let core = db_state.state.core();
+            assert_eq!(core.tree.l0.len(), 1, "{mode:?}");
+            assert!(
+                Arc::ptr_eq(
+                    core.tree.l0[0].sst.pinned().unwrap(),
+                    l0[0].sst.pinned().unwrap()
+                ),
+                "{mode:?}: the remaining L0 SST keeps its pin"
+            );
+            let moved = &core.tree.compacted[1].sst_views()[0];
+            assert_eq!(moved.sst.id, l0[2].sst.id);
+            assert!(
+                Arc::ptr_eq(moved.sst.pinned().unwrap(), l0[2].sst.pinned().unwrap()),
+                "{mode:?}: the trivially moved SST keeps its L0 pin"
+            );
+            let rewritten = &core.tree.compacted[0].sst_views()[0];
+            assert_eq!(
+                rewritten.sst.pinned().is_some(),
+                rewritten_pinned,
+                "{mode:?}"
+            );
+        }
     }
 }

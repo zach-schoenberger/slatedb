@@ -30,6 +30,7 @@ use crate::object_store_tag::ObjectStoreCallTag;
 pub(crate) use crate::object_store_tag::TableStoreKind;
 use crate::partitioned_keyspace::partitions_covering_range;
 use crate::paths::PathResolver;
+use crate::pinned_metadata::{MetadataPinner, PinLevel, PinnedSstMetadata};
 use crate::read_trace::{ReadTrace, SstTraceLevel};
 use crate::sst_builder::EncodedSsTableBuilder;
 #[cfg(test)]
@@ -53,6 +54,8 @@ pub(crate) struct TableStore {
     cache: Option<Arc<dyn DbCache>>,
     /// Selects which components to insert into the cache.
     block_cache_policy: BlockCachePolicy,
+    /// Selects which SSTs keep their filters and index pinned (RFC 0037).
+    pinner: MetadataPinner,
     /// Which component owns this store. Tagged on compacted-SST calls.
     kind: TableStoreKind,
 }
@@ -62,6 +65,10 @@ fn record_read_cached(span: &tracing::Span, lookup: CacheLookup) {
         CacheLookup::Hit => span.record("cached", true),
         CacheLookup::Miss => span.record("cached", false),
     };
+}
+
+fn record_read_pinned(span: &tracing::Span) {
+    span.record("pinned", true);
 }
 
 fn record_read_block_cache_counts(span: &tracing::Span, cache_hits: usize, cache_misses: usize) {
@@ -106,12 +113,13 @@ impl TableStore {
             cache,
             block_cache_policy,
             kind,
+            pinner: MetadataPinner::disabled(),
         }
     }
 
-    /// Returns a store that shares this store's object store and cache, and
-    /// also resolves `external_ssts` to the paths of the databases that own
-    /// them.
+    /// Returns a store that shares this store's object store, cache and
+    /// pinner, and also resolves `external_ssts` to the paths of the databases
+    /// that own them.
     pub(crate) fn with_external_ssts(&self, external_ssts: HashMap<SsTableId, Path>) -> Self {
         Self {
             object_store: self.object_store.clone(),
@@ -121,7 +129,37 @@ impl TableStore {
             cache: self.cache.clone(),
             block_cache_policy: self.block_cache_policy.clone(),
             kind: self.kind,
+            pinner: self.pinner.clone(),
         }
+    }
+
+    /// Sets the pinner that selects which SSTs keep their filters and index
+    /// pinned in memory (RFC 0037).
+    pub(crate) fn with_metadata_pinner(mut self, pinner: MetadataPinner) -> Self {
+        self.pinner = pinner;
+        self
+    }
+
+    pub(crate) fn pinner(&self) -> &MetadataPinner {
+        &self.pinner
+    }
+
+    /// The pin for an SST that this store just wrote, filled with the
+    /// filters and index the writer built in memory. `None` unless this is
+    /// the main store, whose writes are L0 flushes, and the pinner selects
+    /// L0.
+    fn pin_written_sst(
+        &self,
+        filters: &Arc<[NamedFilter]>,
+        index: &SsTableIndexOwned,
+    ) -> Option<Arc<PinnedSstMetadata>> {
+        if self.kind != TableStoreKind::Main {
+            return None;
+        }
+        let pin = self.pinner.new_pin(PinLevel::L0)?;
+        pin.set_filters(Arc::clone(filters));
+        pin.set_index(Arc::new(index.clone()));
+        Some(pin)
     }
 
     /// Gracefully close the block cache, flushing in-memory entries to disk.
@@ -188,11 +226,11 @@ impl TableStore {
         .await?;
 
         self.cache_on_sst_write(*id, encoded_sst).await;
-        Ok(SsTableHandle::new(
-            *id,
-            encoded_sst.format_version,
-            encoded_sst.info.clone(),
-        ))
+        let pin = self.pin_written_sst(&encoded_sst.filters, &encoded_sst.index);
+        Ok(
+            SsTableHandle::new(*id, encoded_sst.format_version, encoded_sst.info.clone())
+                .with_pinned(pin),
+        )
     }
 
     /// Targets a write of the SST inserts into the block cache.
@@ -442,7 +480,52 @@ impl TableStore {
         read.instrument(span).await
     }
 
+    /// Returns the filters of an SSTable when its handle holds them pinned
+    /// (RFC 0037). This is synchronous: no cache lookup and no await. It
+    /// opens the same read-filter span as [`Self::read_filters`], with
+    /// `pinned = true`.
+    ///
+    /// Returns `None` when the SST has no filter, has no pin, or its pin is
+    /// not filled yet. The caller then reads through [`Self::read_filters`].
+    pub(crate) fn pinned_filters(
+        &self,
+        handle: &SsTableHandle,
+        trace: &ReadTrace,
+        sst_level: Option<&SstTraceLevel>,
+    ) -> Option<Arc<[NamedFilter]>> {
+        if self.sst_format.filter_policies.is_empty() || handle.info.filter_len == 0 {
+            return None;
+        }
+        let filters = handle.pinned()?.filters()?;
+        let span = trace.new_read_filter_span(handle.id, sst_level);
+        let _guard = span.enter();
+        record_read_pinned(&span);
+        Some(filters)
+    }
+
     async fn read_filters_inner(
+        &self,
+        handle: &SsTableHandle,
+        cache_blocks: bool,
+        segment: Option<Bytes>,
+        span: tracing::Span,
+    ) -> Result<Arc<[NamedFilter]>, SlateDBError> {
+        if let Some(pin) = handle.pinned() {
+            if let Some(filters) = pin.filters() {
+                record_read_pinned(&span);
+                return Ok(filters);
+            }
+        }
+        let filters = self
+            .read_filters_unpinned(handle, cache_blocks, segment, span)
+            .await?;
+        if let Some(pin) = handle.pinned() {
+            pin.set_filters(Arc::clone(&filters));
+        }
+        Ok(filters)
+    }
+
+    async fn read_filters_unpinned(
         &self,
         handle: &SsTableHandle,
         cache_blocks: bool,
@@ -562,6 +645,28 @@ impl TableStore {
     }
 
     async fn read_index_inner(
+        &self,
+        handle: &SsTableHandle,
+        cache_blocks: bool,
+        segment: Option<Bytes>,
+        span: tracing::Span,
+    ) -> Result<Arc<SsTableIndexOwned>, SlateDBError> {
+        if let Some(pin) = handle.pinned() {
+            if let Some(index) = pin.index() {
+                record_read_pinned(&span);
+                return Ok(index);
+            }
+        }
+        let index = self
+            .read_index_unpinned(handle, cache_blocks, segment, span)
+            .await?;
+        if let Some(pin) = handle.pinned() {
+            pin.set_index(Arc::clone(&index));
+        }
+        Ok(index)
+    }
+
+    async fn read_index_unpinned(
         &self,
         handle: &SsTableHandle,
         cache_blocks: bool,
@@ -1226,8 +1331,12 @@ impl EncodedSsTableWriter {
                 .cache_on_sst_write(self.id, &encoded_sst)
                 .await;
             self.upload_guard.disarm();
+            let pin = self
+                .table_store
+                .pin_written_sst(&encoded_sst.filters, &encoded_sst.index);
             Ok((
-                SsTableHandle::new(self.id, encoded_sst.format_version, encoded_sst.info),
+                SsTableHandle::new(self.id, encoded_sst.format_version, encoded_sst.info)
+                    .with_pinned(pin),
                 self.bytes_written as u64,
             ))
         }
@@ -3955,5 +4064,240 @@ mod tests {
                 "compacted writes should carry the segment hint"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod pin_tests {
+    use super::*;
+    use crate::block_cache_policy::BlockCachePolicy;
+    use crate::config::MetadataPinning;
+    use crate::db_cache::test_utils::TestCache;
+    use crate::db_cache::{DbCache, SplitCache};
+    use crate::db_stats::{
+        PINNED_SST_COUNT, PINNED_SST_METADATA_BYTES, PIN_COMPONENT_FILTER, PIN_COMPONENT_INDEX,
+        PIN_COMPONENT_LABEL, PIN_LEVEL_LABEL, PIN_LEVEL_SORTED_RUN,
+    };
+    use crate::format::sst::SsTableFormat;
+    use crate::read_trace::ReadTrace;
+    use crate::types::RowEntry;
+    use object_store::{memory::InMemory, path::Path, ObjectStore};
+    use slatedb_common::metrics::{
+        DefaultMetricsRecorder, MetricLevel, MetricValue, MetricsRecorderHelper,
+    };
+    use ulid::Ulid;
+
+    const ROOT: &str = "/root";
+
+    fn format() -> SsTableFormat {
+        SsTableFormat {
+            min_filter_keys: 1,
+            ..SsTableFormat::default()
+        }
+    }
+
+    fn store(
+        object_store: Arc<dyn ObjectStore>,
+        cache: Option<Arc<dyn DbCache>>,
+        kind: TableStoreKind,
+        mode: MetadataPinning,
+        recorder: &Arc<DefaultMetricsRecorder>,
+    ) -> TableStore {
+        let helper = MetricsRecorderHelper::new(recorder.clone(), MetricLevel::default());
+        TableStore::new(
+            object_store,
+            format(),
+            Path::from(ROOT),
+            cache,
+            kind,
+            BlockCachePolicy::default(),
+        )
+        .with_metadata_pinner(MetadataPinner::new(mode, &helper))
+    }
+
+    async fn write_sst(writer: &TableStore) -> SsTableHandle {
+        let mut builder = writer.table_builder();
+        builder
+            .add(RowEntry::new_value(b"key1", b"value1", 0))
+            .await
+            .unwrap();
+        builder
+            .add(RowEntry::new_value(b"key2", b"value2", 0))
+            .await
+            .unwrap();
+        let id = SsTableId::from(Ulid::new());
+        writer
+            .write_sst(&id, &builder.build().await.unwrap(), Some(Bytes::new()))
+            .await
+            .unwrap()
+    }
+
+    fn up_down(recorder: &DefaultMetricsRecorder, name: &str, labels: &[(&str, &str)]) -> i64 {
+        recorder
+            .snapshot()
+            .by_name_and_labels(name, labels)
+            .map(|m| match m.value {
+                MetricValue::UpDownCounter(v) => v,
+                ref other => panic!("expected up-down counter, got {other:?}"),
+            })
+            .unwrap_or(0)
+    }
+
+    #[tokio::test]
+    async fn write_sst_pins_l0_only_on_the_main_store() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let recorder = Arc::new(DefaultMetricsRecorder::new());
+        for (kind, mode, expect_pin) in [
+            (TableStoreKind::Main, MetadataPinning::L0, true),
+            (TableStoreKind::Main, MetadataPinning::All, true),
+            (TableStoreKind::Main, MetadataPinning::None, false),
+            (TableStoreKind::Reader, MetadataPinning::All, false),
+            (TableStoreKind::Compactor, MetadataPinning::All, false),
+        ] {
+            let writer = store(object_store.clone(), None, kind, mode, &recorder);
+            let handle = write_sst(&writer).await;
+            match handle.pinned() {
+                Some(pin) => {
+                    assert!(expect_pin, "{kind:?} {mode:?}");
+                    assert!(pin.filters().is_some());
+                    assert!(pin.index().is_some());
+                }
+                None => assert!(!expect_pin, "{kind:?} {mode:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn read_fills_the_pin_and_later_reads_use_it() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let recorder = Arc::new(DefaultMetricsRecorder::new());
+        let writer = store(
+            object_store.clone(),
+            None,
+            TableStoreKind::Main,
+            MetadataPinning::None,
+            &recorder,
+        );
+        let mut handle = write_sst(&writer).await;
+        assert!(handle.pinned().is_none());
+
+        let meta_cache = Arc::new(TestCache::new());
+        let cache = Arc::new(
+            SplitCache::new()
+                .with_meta_cache(Some(meta_cache.clone()))
+                .build(),
+        );
+        let reader = store(
+            object_store.clone(),
+            Some(cache),
+            TableStoreKind::Reader,
+            MetadataPinning::All,
+            &recorder,
+        );
+        handle.set_pinned(reader.pinner().new_pin(PinLevel::SortedRun));
+        let trace = ReadTrace::none();
+        assert!(reader.pinned_filters(&handle, &trace, None).is_none());
+        let sorted_run = [(PIN_LEVEL_LABEL, PIN_LEVEL_SORTED_RUN)];
+        assert_eq!(up_down(&recorder, PINNED_SST_COUNT, &sorted_run), 0);
+
+        let filters = reader
+            .read_filters(&handle, true, Some(Bytes::new()), &trace, None)
+            .await
+            .unwrap();
+        let index = reader
+            .read_index(&handle, true, Some(Bytes::new()), &trace, None)
+            .await
+            .unwrap();
+        let pin = handle.pinned().unwrap();
+        assert!(Arc::ptr_eq(&pin.filters().unwrap(), &filters));
+        assert!(Arc::ptr_eq(&pin.index().unwrap(), &index));
+        assert!(reader.pinned_filters(&handle, &trace, None).is_some());
+
+        let filter_bytes: i64 = filters.iter().map(|f| f.filter.size() as i64).sum();
+        assert_eq!(up_down(&recorder, PINNED_SST_COUNT, &sorted_run), 1);
+        assert_eq!(
+            up_down(
+                &recorder,
+                PINNED_SST_METADATA_BYTES,
+                &[
+                    (PIN_LEVEL_LABEL, PIN_LEVEL_SORTED_RUN),
+                    (PIN_COMPONENT_LABEL, PIN_COMPONENT_FILTER)
+                ]
+            ),
+            filter_bytes
+        );
+        assert_eq!(
+            up_down(
+                &recorder,
+                PINNED_SST_METADATA_BYTES,
+                &[
+                    (PIN_LEVEL_LABEL, PIN_LEVEL_SORTED_RUN),
+                    (PIN_COMPONENT_LABEL, PIN_COMPONENT_INDEX)
+                ]
+            ),
+            index.size() as i64
+        );
+
+        // Remove every other copy. The pinned copy must serve the next reads.
+        meta_cache
+            .remove(&(handle.id, handle.info.filter_offset).into())
+            .await;
+        meta_cache
+            .remove(&(handle.id, handle.info.index_offset).into())
+            .await;
+        object_store.delete(&reader.path(&handle.id)).await.unwrap();
+
+        let again = reader
+            .read_filters(&handle, true, Some(Bytes::new()), &trace, None)
+            .await
+            .unwrap();
+        assert!(Arc::ptr_eq(&again, &filters));
+        let again = reader
+            .read_index(&handle, true, Some(Bytes::new()), &trace, None)
+            .await
+            .unwrap();
+        assert!(Arc::ptr_eq(&again, &index));
+
+        drop(filters);
+        drop(index);
+        drop(handle);
+        assert_eq!(up_down(&recorder, PINNED_SST_COUNT, &sorted_run), 0);
+        assert_eq!(
+            up_down(
+                &recorder,
+                PINNED_SST_METADATA_BYTES,
+                &[
+                    (PIN_LEVEL_LABEL, PIN_LEVEL_SORTED_RUN),
+                    (PIN_COMPONENT_LABEL, PIN_COMPONENT_FILTER)
+                ]
+            ),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn pinned_filters_is_none_for_an_sst_without_a_filter() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let recorder = Arc::new(DefaultMetricsRecorder::new());
+        let no_filters = SsTableFormat {
+            min_filter_keys: 100,
+            ..SsTableFormat::default()
+        };
+        let helper = MetricsRecorderHelper::new(recorder.clone(), MetricLevel::default());
+        let writer = TableStore::new(
+            object_store,
+            no_filters,
+            Path::from(ROOT),
+            None,
+            TableStoreKind::Main,
+            BlockCachePolicy::default(),
+        )
+        .with_metadata_pinner(MetadataPinner::new(MetadataPinning::All, &helper));
+        let handle = write_sst(&writer).await;
+        assert_eq!(handle.info.filter_len, 0);
+        assert!(handle.pinned().is_some());
+        assert!(writer
+            .pinned_filters(&handle, &ReadTrace::none(), None)
+            .is_none());
     }
 }
