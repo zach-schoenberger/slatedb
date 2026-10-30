@@ -465,18 +465,18 @@ impl TableStore {
     }
 
     /// Returns the filters of an SSTable when its handle holds them pinned
-    /// (RFC 0037). This is synchronous: no cache lookup and no await. It
-    /// opens the same read-filter span as [`Self::read_filters`], with
-    /// `pinned = true`.
+    /// (RFC 0037), borrowed from the handle. This is synchronous: no cache
+    /// lookup, no await and no reference-count change. It opens the same
+    /// read-filter span as [`Self::read_filters`], with `pinned = true`.
     ///
     /// Returns `None` when the SST has no filter, has no pin, or its pin is
     /// not filled yet. The caller then reads through [`Self::read_filters`].
-    pub(crate) fn pinned_filters(
+    pub(crate) fn pinned_filters<'a>(
         &self,
-        handle: &SsTableHandle,
+        handle: &'a SsTableHandle,
         trace: &ReadTrace,
         sst_level: Option<&SstTraceLevel>,
-    ) -> Option<Arc<[NamedFilter]>> {
+    ) -> Option<&'a [NamedFilter]> {
         if self.sst_format.filter_policies.is_empty() || handle.info.filter_len == 0 {
             return None;
         }
@@ -484,7 +484,7 @@ impl TableStore {
         let span = trace.new_read_filter_span(handle.id, sst_level);
         let _guard = span.enter();
         record_read_pinned(&span);
-        Some(filters)
+        Some(&**filters)
     }
 
     async fn read_filters_inner(
@@ -497,7 +497,7 @@ impl TableStore {
         if let Some(pin) = handle.pinned() {
             if let Some(filters) = pin.filters() {
                 record_read_pinned(&span);
-                return Ok(filters);
+                return Ok(Arc::clone(filters));
             }
         }
         let filters = self
@@ -4192,7 +4192,7 @@ mod pin_tests {
             .await
             .unwrap();
         let pin = handle.pinned().unwrap();
-        assert!(Arc::ptr_eq(&pin.filters().unwrap(), &filters));
+        assert!(Arc::ptr_eq(pin.filters().unwrap(), &filters));
         assert!(Arc::ptr_eq(&pin.index().unwrap(), &index));
         assert!(reader.pinned_filters(&handle, &trace, None).is_some());
 

@@ -9,7 +9,7 @@ use crate::merge_operator::{
     MergeOperatorIterator, MergeOperatorRequiredIterator, MergeOperatorType,
 };
 use crate::read_trace::ReadTrace;
-use crate::segment_iterator::{build_point_iter, point_lookup_candidates, SegmentScanContext};
+use crate::segment_iterator::{PointLookupSources, SegmentScanContext};
 use crate::types::{KeyValue, RowEntry, ValueDeletable};
 
 use async_trait::async_trait;
@@ -18,6 +18,7 @@ use futures::stream::{self, BoxStream, StreamExt};
 use parking_lot::Mutex;
 use std::collections::VecDeque;
 use std::ops::RangeBounds;
+use std::sync::Arc;
 use tracing::Instrument;
 
 /// [`DbIteratorRangeTracker`] records the *requested* scan range of a
@@ -148,23 +149,16 @@ impl GetIterator {
     /// and stops the search.
     pub(crate) fn from_lsm_tree(
         key: Bytes,
-        tree: &LsmTreeState,
-        ctx: &SegmentScanContext,
+        tree: Arc<LsmTreeState>,
+        ctx: SegmentScanContext,
         max_seq: Option<u64>,
     ) -> Result<Self, SlateDBError> {
-        // Candidates are cheap to list; the per-SST iterators are built
-        // lazily as the walk pulls them, so a pinned filter is probed in walk
-        // order and a filter-negative pinned SST yields no source at all
-        // (RFC 0037).
-        let candidates = point_lookup_candidates(&key, tree);
+        // The per-SST iterators are built lazily as the walk pulls them, so a
+        // pinned filter is probed in walk order and a filter-negative pinned
+        // SST yields no source at all (RFC 0037).
         let max_parallel = ctx.max_parallel;
-        let ctx = ctx.clone();
-        let probe_key = key.clone();
-        let iters = candidates.into_iter().filter_map(move |(view, level)| {
-            build_point_iter(&probe_key, view, level, &ctx)
-                .map(|iter| iter.map(|iter| apply_max_seq(iter, max_seq)))
-                .transpose()
-        });
+        let iters = PointLookupSources::new(key.clone(), tree, ctx)
+            .map(move |iter| iter.map(|iter| apply_max_seq(iter, max_seq)));
         Ok(Self::with_lookahead(key, iters, max_parallel))
     }
 }

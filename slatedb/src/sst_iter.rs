@@ -263,10 +263,43 @@ impl FilterEvaluator {
         if self.state != FilterState::NotChecked {
             return;
         }
+        self.state = self.check(filters, sst_id, sst_level, read_trace);
+    }
 
+    /// Evaluates `filters` for one SST and leaves `self` unchanged, so one
+    /// evaluator can serve as the template for every SST of a point lookup.
+    ///
+    /// Returns `None` when the filters rule the SST out. Otherwise returns a
+    /// new evaluator holding the result, for the SST's iterator. Only that
+    /// case copies the query and stats, so a filter-negative SST changes no
+    /// reference count that other readers share.
+    pub(crate) fn evaluate_for(
+        &self,
+        filters: &[NamedFilter],
+        sst_id: SsTableId,
+        sst_level: Option<&SstTraceLevel>,
+        read_trace: &ReadTrace,
+    ) -> Option<Self> {
+        let state = self.check(filters, sst_id, sst_level, read_trace);
+        (state != FilterState::Negative).then(|| Self {
+            query: self.query.clone(),
+            db_stats: self.db_stats.clone(),
+            state,
+            found_key: false,
+            false_positive_recorded: false,
+        })
+    }
+
+    /// Runs the filters and records the positive or negative stat.
+    fn check(
+        &self,
+        filters: &[NamedFilter],
+        sst_id: SsTableId,
+        sst_level: Option<&SstTraceLevel>,
+        read_trace: &ReadTrace,
+    ) -> FilterState {
         if filters.is_empty() {
-            self.state = FilterState::NoFilter;
-            return;
+            return FilterState::NoFilter;
         }
 
         // AND logic: if any filter says the key is NOT present, filter it out.
@@ -280,12 +313,12 @@ impl FilterEvaluator {
             if let Some(stats) = &self.db_stats {
                 self.positives_counter(stats).increment(1);
             }
-            self.state = FilterState::Positive;
+            FilterState::Positive
         } else {
             if let Some(stats) = &self.db_stats {
                 self.negatives_counter(stats).increment(1);
             }
-            self.state = FilterState::Negative;
+            FilterState::Negative
         }
     }
 

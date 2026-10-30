@@ -2,6 +2,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures::future::try_join;
 use std::collections::VecDeque;
+use std::ops::Range;
 use std::sync::Arc;
 
 use crate::bytes_range::BytesRange;
@@ -20,10 +21,10 @@ use crate::types::RowEntry;
 use crate::utils::build_concurrent;
 
 /// Inputs needed to construct a per-segment iterator. The scan path's
-/// [`SegmentMergeIterator`] holds an unbound template and clones it with the
-/// selected segment in [`Self::for_segment`] before building each child. The
-/// get path binds its single selected segment before constructing its L0 and
-/// sorted-run point iterators.
+/// [`SegmentMergeIterator`] holds an unbound template and binds a clone of it
+/// to the selected segment in [`Self::for_segment`] before building each
+/// child. The get path moves its context into its single selected segment
+/// before constructing its L0 and sorted-run point iterators.
 #[derive(Clone)]
 pub(crate) struct SegmentScanContext {
     pub(crate) table_store: Arc<TableStore>,
@@ -39,11 +40,11 @@ pub(crate) struct SegmentScanContext {
 }
 
 impl SegmentScanContext {
-    /// Returns a context whose SST options carry the selected segment.
-    fn for_segment(&self, segment: &Bytes) -> Self {
-        let mut context = self.clone();
-        context.sst_iter_options.segment = Some(segment.clone());
-        context
+    /// Returns this context with its SST options carrying the selected
+    /// segment.
+    fn for_segment(mut self, segment: &Bytes) -> Self {
+        self.sst_iter_options.segment = Some(segment.clone());
+        self
     }
 }
 
@@ -216,7 +217,7 @@ impl SegmentMergeIterator {
                 .context
                 .as_ref()
                 .expect("Pending children require a SegmentScanContext");
-            let context = context.for_segment(&prefix);
+            let context = context.clone().for_segment(&prefix);
             let RangeTreeIterators { l0, sr } = RangeTreeIterators::build(&tree, &context).await?;
             let iters: VecDeque<Box<dyn RowEntryIterator>> = l0.into_iter().chain(sr).collect();
             let merge = MergeIterator::new_with_order(iters, context.sst_iter_options.order)?;
@@ -304,14 +305,14 @@ pub(crate) fn build_segment_iter(
     context: SegmentScanContext,
     max_seq: Option<u64>,
 ) -> Result<Box<dyn RowEntryIterator>, SlateDBError> {
-    if let Some(point_key) = context.range.as_point() {
+    if let Some(point_key) = context.range.as_point().cloned() {
         match segments.last() {
             Some(segment) => {
                 let context = context.for_segment(&segment.prefix);
                 Ok(Box::new(GetIterator::from_lsm_tree(
-                    point_key.clone(),
-                    &segment.tree,
-                    &context,
+                    point_key,
+                    Arc::clone(&segment.tree),
+                    context,
                     max_seq,
                 )?))
             }
@@ -322,19 +323,73 @@ pub(crate) fn build_segment_iter(
     }
 }
 
-/// The SSTs a point lookup of `key` consults, newest first: every L0 SST,
-/// then the SST that covers `key` in each sorted run.
-pub(crate) fn point_lookup_candidates(
-    key: &Bytes,
-    tree: &LsmTreeState,
-) -> Vec<(SsTableView, SstTraceLevel)> {
-    let l0 = tree.l0.iter().map(|sst| (sst.clone(), SstTraceLevel::L0));
-    let sr = tree.compacted.iter().flat_map(|sr| {
-        sr.tables_covering_point_key(key.as_ref())
-            .iter()
-            .map(move |view| (view.clone(), SstTraceLevel::SortedRun(sr.id)))
-    });
-    l0.chain(sr).collect()
+/// The per-SST sources of a point lookup of `key`, newest first: every L0
+/// SST, then the SSTs that cover `key` in each sorted run. Yields a source
+/// only for an SST that might hold `key`; see [`build_point_iter`].
+///
+/// Sources are built lazily, as the walk pulls them, so a pinned filter is
+/// probed in walk order. The tree is held by `Arc` and walked by position:
+/// a candidate's view is borrowed, and cloned only when its SST gets a
+/// source. Cloning a view bumps reference counts that every concurrent
+/// reader of the same SST shares, so under high get volume a clone per
+/// candidate, rather than per source, caps throughput.
+pub(crate) struct PointLookupSources {
+    key: Bytes,
+    tree: Arc<LsmTreeState>,
+    ctx: SegmentScanContext,
+    /// Evaluates pinned filters for every candidate without being changed.
+    filter: FilterEvaluator,
+    next_l0: usize,
+    /// The next sorted run to search for `key`.
+    next_run: usize,
+    /// The covering views of sorted run `next_run - 1` not yet visited.
+    run_views: Range<usize>,
+}
+
+impl PointLookupSources {
+    pub(crate) fn new(key: Bytes, tree: Arc<LsmTreeState>, ctx: SegmentScanContext) -> Self {
+        let filter = FilterEvaluator::new_point(
+            key.clone(),
+            ctx.sst_iter_options.filter_context.clone(),
+            ctx.point_lookup_stats.clone(),
+        );
+        Self {
+            key,
+            tree,
+            ctx,
+            filter,
+            next_l0: 0,
+            next_run: 0,
+            run_views: 0..0,
+        }
+    }
+}
+
+impl Iterator for PointLookupSources {
+    type Item = Result<Box<dyn RowEntryIterator>, SlateDBError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let tree = &*self.tree;
+        loop {
+            let (view, level) = if let Some(view) = tree.l0.get(self.next_l0) {
+                self.next_l0 += 1;
+                (view, SstTraceLevel::L0)
+            } else if let Some(idx) = self.run_views.next() {
+                let run = &tree.compacted[self.next_run - 1];
+                (&run.sst_views()[idx], SstTraceLevel::SortedRun(run.id))
+            } else {
+                let run = tree.compacted.get(self.next_run)?;
+                self.next_run += 1;
+                self.run_views = run.point_table_idx_covering_key(&self.key);
+                continue;
+            };
+            match build_point_iter(&self.key, view, level, &self.ctx, &self.filter) {
+                Ok(None) => continue,
+                Ok(Some(iter)) => return Some(Ok(iter)),
+                Err(err) => return Some(Err(err)),
+            }
+        }
+    }
 }
 
 /// Builds the point iterator for one candidate SST, or `None` when the SST
@@ -342,55 +397,61 @@ pub(crate) fn point_lookup_candidates(
 ///
 /// When the SST's filters are pinned (RFC 0037), the filter is evaluated
 /// here, before any iterator exists. A filter-negative SST costs the probe
-/// and nothing else: no iterator, no cache lookup, no await. A positive SST
-/// gets an iterator that carries the evaluated filter, so its `init` reads
-/// the index directly. An SST without pinned filters takes today's path, and
-/// `FilterIterator::init` reads its filters.
-pub(crate) fn build_point_iter(
+/// and nothing else: no iterator, no cache lookup, no await, and no clone of
+/// the view or the context. A positive SST gets an iterator that carries the
+/// evaluated filter, so its `init` reads the index directly. An SST without
+/// pinned filters takes today's path, and `FilterIterator::init` reads its
+/// filters.
+fn build_point_iter(
     key: &Bytes,
-    view: SsTableView,
+    view: &SsTableView,
     level: SstTraceLevel,
     ctx: &SegmentScanContext,
+    filter: &FilterEvaluator,
 ) -> Result<Option<Box<dyn RowEntryIterator>>, SlateDBError> {
+    // Range first, so an SST outside `key`'s range records no filter stat.
+    if !view.contains_point(key) {
+        return Ok(None);
+    }
+    let evaluated = match ctx
+        .table_store
+        .pinned_filters(&view.sst, &ctx.read_trace, Some(&level))
+    {
+        Some(filters) => {
+            match filter.evaluate_for(filters, view.sst.id, Some(&level), &ctx.read_trace) {
+                Some(evaluated) => Some(evaluated),
+                None => return Ok(None),
+            }
+        }
+        None => None,
+    };
     let Some(view_range) = view.calculate_view_range(ctx.range.clone()) else {
         return Ok(None);
     };
+    let view = view.clone();
     let tracing_context = Some(SstTracingContext::new(
         level.clone(),
         ctx.read_trace.clone(),
     ));
     let options = ctx.sst_iter_options.clone();
-    let Some(filters) = ctx
-        .table_store
-        .pinned_filters(&view.sst, &ctx.read_trace, Some(&level))
-    else {
-        let iter = SstIterator::new_owned_in_view_range(
+    let iter = match evaluated {
+        Some(evaluator) => SstIterator::with_evaluated_filter(
+            view,
+            view_range,
+            ctx.table_store.clone(),
+            options,
+            tracing_context,
+            evaluator,
+        )?,
+        None => SstIterator::new_owned_in_view_range(
             view,
             view_range,
             ctx.table_store.clone(),
             options,
             tracing_context,
             ctx.point_lookup_stats.clone(),
-        )?;
-        return Ok(Some(Box::new(iter)));
+        )?,
     };
-    let mut evaluator = FilterEvaluator::new_point(
-        key.clone(),
-        options.filter_context.clone(),
-        ctx.point_lookup_stats.clone(),
-    );
-    evaluator.evaluate(&filters, view.sst.id, Some(&level), &ctx.read_trace);
-    if evaluator.is_filtered_out() {
-        return Ok(None);
-    }
-    let iter = SstIterator::with_evaluated_filter(
-        view,
-        view_range,
-        ctx.table_store.clone(),
-        options,
-        tracing_context,
-        evaluator,
-    )?;
     Ok(Some(Box::new(iter)))
 }
 

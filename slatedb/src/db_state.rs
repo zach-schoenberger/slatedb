@@ -288,6 +288,19 @@ impl SsTableView {
         Some(range)
     }
 
+    /// Whether a point lookup of `key` reads this view. Equivalent to
+    /// `calculate_view_range(key..=key).is_some()`, but borrows: it clones no
+    /// key bytes, so it touches no reference count shared with other readers.
+    pub(crate) fn contains_point(&self, key: &[u8]) -> bool {
+        if let Some(visible_range) = &self.visible_range {
+            return visible_range.contains(key);
+        }
+        if self.sst.info.last_entry.is_some() {
+            return self.effective_range.contains(key);
+        }
+        true
+    }
+
     /// Returns an estimate of the underlying SST's on-disk size in bytes.
     pub fn estimate_size(&self) -> u64 {
         self.sst.estimate_size()
@@ -694,7 +707,7 @@ impl SortedRun {
     ///
     /// This uses the binary-search candidate as the upper bound, then walks
     /// backward only across immediately overlapping views.
-    fn point_table_idx_covering_key(&self, key: &[u8]) -> Range<usize> {
+    pub(crate) fn point_table_idx_covering_key(&self, key: &[u8]) -> Range<usize> {
         let Some(max_idx) = self.find_last_sst_with_range_covering_key(key) else {
             return 0..0;
         };
@@ -778,6 +791,7 @@ impl SortedRun {
     }
 
     /// Returns the SST views that may contain entries for the point key `key`.
+    #[cfg(test)]
     pub(crate) fn tables_covering_point_key(&self, key: &[u8]) -> &[SsTableView] {
         let matching_range = self.point_table_idx_covering_key(key);
         &self.sst_views[matching_range]
@@ -1420,6 +1434,39 @@ mod tests {
         let sst_id = SsTableId::new(ulid::Ulid::new());
         let handle = SsTableHandle::new(sst_id, SST_FORMAT_VERSION_LATEST, sst_info);
         SsTableView::identity(handle)
+    }
+
+    #[test]
+    fn contains_point_matches_calculate_view_range() {
+        let bounded = create_compacted_sst_view_with_bounds(b"c", Some(b"m"));
+        let open_ended = create_compacted_sst_view_with_bounds(b"c", None);
+        let project = |range: BytesRange| {
+            SsTableView::new_projected(ulid::Ulid::new(), bounded.sst.clone(), Some(range))
+        };
+        let views = [
+            project(BytesRange::from_ref("c".."h")),
+            project(BytesRange::from_ref("e"..="k")),
+            project(BytesRange::from_ref("d"..)),
+            bounded.clone(),
+            open_ended,
+        ];
+        let keys: [&[u8]; 11] = [
+            b"", b"a", b"c", b"c\0", b"d", b"e", b"h", b"k", b"m", b"n", b"z",
+        ];
+        for view in &views {
+            for key in keys {
+                let expected = view
+                    .calculate_view_range(BytesRange::from_slice(key..=key))
+                    .is_some();
+                assert_eq!(
+                    view.contains_point(key),
+                    expected,
+                    "view {:?} key {:?}",
+                    view.visible_range,
+                    key
+                );
+            }
+        }
     }
 
     #[test]

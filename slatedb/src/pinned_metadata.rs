@@ -118,8 +118,10 @@ impl PinnedSstMetadata {
         }
     }
 
-    pub(crate) fn filters(&self) -> Option<Arc<[NamedFilter]>> {
-        self.filters.get().cloned()
+    /// The pinned filters, borrowed. Clone the `Arc` only to keep them past
+    /// the handle: cloning touches a reference count every reader shares.
+    pub(crate) fn filters(&self) -> Option<&Arc<[NamedFilter]>> {
+        self.filters.get()
     }
 
     pub(crate) fn index(&self) -> Option<Arc<SsTableIndexOwned>> {
