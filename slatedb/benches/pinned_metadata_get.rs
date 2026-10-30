@@ -9,6 +9,14 @@
 //! the lookups after a warm-up pass, so every unpinned filter and index read
 //! is a cache hit and the benchmark measures CPU, not I/O.
 //!
+//! Lookups run at several concurrency levels on a multi-threaded runtime, to
+//! model a service under high get volume: `1` is single-request latency,
+//! `cores` saturates every worker, and `4 x cores` adds queueing on top. Each
+//! sample times a batch of gets by wall clock, so criterion reports
+//! throughput (gets/s) and the time per get is amortized across workers.
+//! Concurrency exposes contention on shared state (block cache shards,
+//! refcounts, the reader's state) that a sequential loop hides.
+//!
 //! - `absent`: keys inside every SST's range that no SST holds. Every
 //!   candidate SST is a filter negative.
 //! - `present_in_sorted_run`: keys that only the sorted run holds. Every L0
@@ -16,11 +24,10 @@
 //!
 //! Run: cargo bench -p slatedb --bench pinned_metadata_get
 
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use object_store::memory::InMemory;
 use object_store::ObjectStore;
 use pprof::criterion::{Output, PProfProfiler};
@@ -30,7 +37,7 @@ use slatedb::config::{
 };
 use slatedb::size_tiered_compaction::SizeTieredCompactionSchedulerSupplier;
 use slatedb::{CompactorBuilder, Db, DbReader, MetadataPinning};
-use tokio::runtime::Runtime;
+use tokio::runtime::Builder;
 
 const PATH: &str = "/bench/pinned_metadata_get";
 const RUN_KEYS: usize = 50_000;
@@ -162,10 +169,54 @@ async fn open_reader(store: Arc<dyn ObjectStore>, mode: MetadataPinning) -> DbRe
     reader
 }
 
+/// Issues `gets` lookups split across `concurrency` tasks and returns the
+/// wall-clock time for the whole batch.
+async fn concurrent_gets(
+    reader: Arc<DbReader>,
+    keys: Arc<Vec<Vec<u8>>>,
+    present: bool,
+    concurrency: usize,
+    gets: u64,
+) -> Duration {
+    let concurrency_u64 = concurrency as u64;
+    #[allow(clippy::disallowed_types)]
+    let start = std::time::Instant::now();
+    let tasks: Vec<_> = (0..concurrency)
+        .map(|task| {
+            let reader = reader.clone();
+            let keys = keys.clone();
+            let task_gets =
+                gets / concurrency_u64 + u64::from((task as u64) < gets % concurrency_u64);
+            // Spread starting points so tasks do not walk the keys in lockstep.
+            let offset = task * LOOKUP_KEYS / concurrency;
+            tokio::spawn(async move {
+                for n in 0..task_gets as usize {
+                    let key = &keys[(offset + n) % LOOKUP_KEYS];
+                    let found = reader.get(key).await.expect("get failed");
+                    assert_eq!(found.is_some(), present);
+                }
+            })
+        })
+        .collect();
+    for task in tasks {
+        task.await.expect("get task panicked");
+    }
+    start.elapsed()
+}
+
 fn bench_pinned_gets(c: &mut Criterion) {
-    let runtime = Runtime::new().expect("failed to create runtime");
+    let cores = std::thread::available_parallelism()
+        .expect("failed to read available parallelism")
+        .get();
+    let runtime = Builder::new_multi_thread()
+        .worker_threads(cores)
+        .enable_all()
+        .build()
+        .expect("failed to create runtime");
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     runtime.block_on(populate(store.clone()));
+
+    let concurrency_levels = [1, cores, 4 * cores];
 
     let modes = [
         MetadataPinning::None,
@@ -177,22 +228,28 @@ fn bench_pinned_gets(c: &mut Criterion) {
         ("present_in_sorted_run", present_key, true),
     ];
     for (name, key, present) in lookups {
-        let keys: Vec<Vec<u8>> = (0..LOOKUP_KEYS).map(key).collect();
+        let keys: Arc<Vec<Vec<u8>>> = Arc::new((0..LOOKUP_KEYS).map(key).collect());
         let mut group = c.benchmark_group(format!("pinned_metadata_get/{name}"));
+        group.throughput(Throughput::Elements(1));
         for mode in modes {
-            let reader = runtime.block_on(open_reader(store.clone(), mode));
-            let next = AtomicUsize::new(0);
-            group.bench_with_input(
-                BenchmarkId::from_parameter(format!("{mode:?}")),
-                &mode,
-                |b, _| {
-                    b.to_async(&runtime).iter(|| async {
-                        let i = next.fetch_add(1, Ordering::Relaxed) % LOOKUP_KEYS;
-                        let found = reader.get(&keys[i]).await.expect("get failed");
-                        assert_eq!(found.is_some(), present);
-                    })
-                },
-            );
+            let reader = Arc::new(runtime.block_on(open_reader(store.clone(), mode)));
+            for concurrency in concurrency_levels {
+                group.bench_with_input(
+                    BenchmarkId::new(format!("{mode:?}"), concurrency),
+                    &concurrency,
+                    |b, &concurrency| {
+                        b.to_async(&runtime).iter_custom(|gets| {
+                            concurrent_gets(
+                                reader.clone(),
+                                keys.clone(),
+                                present,
+                                concurrency,
+                                gets,
+                            )
+                        })
+                    },
+                );
+            }
             runtime
                 .block_on(reader.close())
                 .expect("failed to close reader");
