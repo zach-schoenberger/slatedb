@@ -216,7 +216,10 @@ fn run_seed_once(
         // explicit memtable flushes will trigger real compaction during the run.
         settings.l0_sst_size_bytes = 1024;
         settings.l0_max_ssts = 4;
-        settings.max_unflushed_bytes = 64 * 1024;
+        // The write buffer manager rejects capacities below 1 MiB
+        // (MIN_WRITE_BUFFER_SIZE); the tiny L0 settings above, not this
+        // value, are what drive compaction.
+        settings.max_unflushed_bytes = 1024 * 1024;
         settings.manifest_poll_interval = Duration::from_millis(10);
         // Disable since we're using the standalone compactor actor.
         settings.compactor_options = None;

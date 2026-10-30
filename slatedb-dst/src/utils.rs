@@ -93,7 +93,7 @@ pub fn build_reader_options(rand: &DbRand) -> DbReaderOptions {
     }
 }
 
-fn random_metadata_pinning(rng: &mut impl rand::Rng) -> MetadataPinning {
+fn random_metadata_pinning(rng: &mut impl Rng) -> MetadataPinning {
     const MODES: [MetadataPinning; 3] = [
         MetadataPinning::None,
         MetadataPinning::L0,

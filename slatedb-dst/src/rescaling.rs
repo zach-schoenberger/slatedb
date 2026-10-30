@@ -327,7 +327,10 @@ async fn run_harness_phase(
         let mut settings = build_settings(ctx.rand()).await;
         settings.l0_sst_size_bytes = 1024;
         settings.l0_max_ssts = 4;
-        settings.max_unflushed_bytes = 64 * 1024;
+        // The write buffer manager rejects capacities below 1 MiB
+        // (MIN_WRITE_BUFFER_SIZE); the tiny L0 settings above, not this
+        // value, are what drive compaction.
+        settings.max_unflushed_bytes = 1024 * 1024;
         settings.manifest_poll_interval = Duration::from_millis(10);
         settings
             .garbage_collector_options
